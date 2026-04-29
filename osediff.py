@@ -1,11 +1,13 @@
 import os
 import sys
 sys.path.append(os.getcwd())
+import json
 import yaml
 import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors.torch import load_file
 from transformers import AutoTokenizer, CLIPTextModel
 from diffusers import DDPMScheduler
 from models.autoencoder_kl import AutoencoderKL
@@ -15,7 +17,23 @@ from peft import LoraConfig
 from my_utils.vaehook import VAEHook, perfcount
 
 def initialize_vae(args):
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
+    vae_dir = os.path.join(args.pretrained_model_name_or_path, "vae")
+    with open(os.path.join(vae_dir, "config.json"), "r") as f:
+        vae_config = json.load(f)
+    vae = AutoencoderKL(
+        in_channels=vae_config.get("in_channels", 3),
+        out_channels=vae_config.get("out_channels", 3),
+        down_block_types=tuple(vae_config["down_block_types"]),
+        up_block_types=tuple(vae_config["up_block_types"]),
+        block_out_channels=tuple(vae_config["block_out_channels"]),
+        layers_per_block=vae_config.get("layers_per_block", 2),
+        act_fn=vae_config.get("act_fn", "silu"),
+        latent_channels=vae_config.get("latent_channels", 4),
+        norm_num_groups=vae_config.get("norm_num_groups", 32),
+        sample_size=vae_config.get("sample_size", 768),
+    )
+    vae_state = load_file(os.path.join(vae_dir, "diffusion_pytorch_model.safetensors"))
+    vae.load_state_dict(vae_state)
     vae.requires_grad_(False)
     vae.train()
     
@@ -37,7 +55,22 @@ def initialize_vae(args):
 
 
 def initialize_unet(args, return_lora_module_names=False, pretrained_model_name_or_path=None):
-    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
+    unet_dir = os.path.join(args.pretrained_model_name_or_path, "unet")
+    with open(os.path.join(unet_dir, "config.json"), "r") as f:
+        unet_config = json.load(f)
+    unet = UNet2DConditionModel(
+        in_channels=unet_config.get("in_channels", 4),
+        out_channels=unet_config.get("out_channels", 4),
+        down_block_types=tuple(unet_config["down_block_types"]),
+        up_block_types=tuple(unet_config["up_block_types"]),
+        block_out_channels=tuple(unet_config["block_out_channels"]),
+        layers_per_block=unet_config.get("layers_per_block", 2),
+        cross_attention_dim=unet_config.get("cross_attention_dim", 1024),
+        attention_head_dim=unet_config.get("attention_head_dim"),
+        sample_size=unet_config.get("sample_size", 64),
+        use_linear_projection=unet_config.get("use_linear_projection", False),
+    )
+    unet.load_state_dict(load_file(os.path.join(unet_dir, "diffusion_pytorch_model.safetensors")))
     unet.requires_grad_(False)
     unet.train()
 
@@ -155,8 +188,38 @@ class OSEDiff_reg(torch.nn.Module):
             weight_dtype = torch.bfloat16
         self.weight_dtype = weight_dtype
 
-        self.vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
-        self.unet_fix = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
+        vae_dir = os.path.join(args.pretrained_model_name_or_path, "vae")
+        with open(os.path.join(vae_dir, "config.json"), "r") as f:
+            vae_config = json.load(f)
+        self.vae = AutoencoderKL(
+            in_channels=vae_config.get("in_channels", 3),
+            out_channels=vae_config.get("out_channels", 3),
+            down_block_types=tuple(vae_config["down_block_types"]),
+            up_block_types=tuple(vae_config["up_block_types"]),
+            block_out_channels=tuple(vae_config["block_out_channels"]),
+            layers_per_block=vae_config.get("layers_per_block", 2),
+            act_fn=vae_config.get("act_fn", "silu"),
+            latent_channels=vae_config.get("latent_channels", 4),
+            norm_num_groups=vae_config.get("norm_num_groups", 32),
+            sample_size=vae_config.get("sample_size", 768),
+        )
+        self.vae.load_state_dict(load_file(os.path.join(vae_dir, "diffusion_pytorch_model.safetensors")))
+        unet_dir = os.path.join(args.pretrained_model_name_or_path, "unet")
+        with open(os.path.join(unet_dir, "config.json"), "r") as f:
+            unet_config = json.load(f)
+        self.unet_fix = UNet2DConditionModel(
+            in_channels=unet_config.get("in_channels", 4),
+            out_channels=unet_config.get("out_channels", 4),
+            down_block_types=tuple(unet_config["down_block_types"]),
+            up_block_types=tuple(unet_config["up_block_types"]),
+            block_out_channels=tuple(unet_config["block_out_channels"]),
+            layers_per_block=unet_config.get("layers_per_block", 2),
+            cross_attention_dim=unet_config.get("cross_attention_dim", 1024),
+            attention_head_dim=unet_config.get("attention_head_dim"),
+            sample_size=unet_config.get("sample_size", 64),
+            use_linear_projection=unet_config.get("use_linear_projection", False),
+        )
+        self.unet_fix.load_state_dict(load_file(os.path.join(unet_dir, "diffusion_pytorch_model.safetensors")))
         self.unet_update, self.lora_unet_modules_encoder, self.lora_unet_modules_decoder, self.lora_unet_others =\
                 initialize_unet(args)
 
@@ -252,8 +315,38 @@ class OSEDiff_test(torch.nn.Module):
         self.text_encoder = CLIPTextModel.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="text_encoder")
         self.noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
         self.noise_scheduler.set_timesteps(1, device="cuda")
-        self.vae = AutoencoderKL.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="vae")
-        self.unet = UNet2DConditionModel.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="unet")
+        vae_dir = os.path.join(self.args.pretrained_model_name_or_path, "vae")
+        with open(os.path.join(vae_dir, "config.json"), "r") as f:
+            vae_config = json.load(f)
+        self.vae = AutoencoderKL(
+            in_channels=vae_config.get("in_channels", 3),
+            out_channels=vae_config.get("out_channels", 3),
+            down_block_types=tuple(vae_config["down_block_types"]),
+            up_block_types=tuple(vae_config["up_block_types"]),
+            block_out_channels=tuple(vae_config["block_out_channels"]),
+            layers_per_block=vae_config.get("layers_per_block", 2),
+            act_fn=vae_config.get("act_fn", "silu"),
+            latent_channels=vae_config.get("latent_channels", 4),
+            norm_num_groups=vae_config.get("norm_num_groups", 32),
+            sample_size=vae_config.get("sample_size", 768),
+        )
+        self.vae.load_state_dict(load_file(os.path.join(vae_dir, "diffusion_pytorch_model.safetensors")))
+        unet_dir = os.path.join(self.args.pretrained_model_name_or_path, "unet")
+        with open(os.path.join(unet_dir, "config.json"), "r") as f:
+            unet_config = json.load(f)
+        self.unet = UNet2DConditionModel(
+            in_channels=unet_config.get("in_channels", 4),
+            out_channels=unet_config.get("out_channels", 4),
+            down_block_types=tuple(unet_config["down_block_types"]),
+            up_block_types=tuple(unet_config["up_block_types"]),
+            block_out_channels=tuple(unet_config["block_out_channels"]),
+            layers_per_block=unet_config.get("layers_per_block", 2),
+            cross_attention_dim=unet_config.get("cross_attention_dim", 1024),
+            attention_head_dim=unet_config.get("attention_head_dim"),
+            sample_size=unet_config.get("sample_size", 64),
+            use_linear_projection=unet_config.get("use_linear_projection", False),
+        )
+        self.unet.load_state_dict(load_file(os.path.join(unet_dir, "diffusion_pytorch_model.safetensors")))
 
         # vae tile
         self._init_tiled_vae(encoder_tile_size=args.vae_encoder_tiled_size, decoder_tile_size=args.vae_decoder_tiled_size)
@@ -457,8 +550,38 @@ class OSEDiff_inference_time(torch.nn.Module):
         self.text_encoder = CLIPTextModel.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="text_encoder")
         self.noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
         self.noise_scheduler.set_timesteps(1, device="cuda")
-        self.vae = AutoencoderKL.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="vae")
-        self.unet = UNet2DConditionModel.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="unet")
+        vae_dir = os.path.join(self.args.pretrained_model_name_or_path, "vae")
+        with open(os.path.join(vae_dir, "config.json"), "r") as f:
+            vae_config = json.load(f)
+        self.vae = AutoencoderKL(
+            in_channels=vae_config.get("in_channels", 3),
+            out_channels=vae_config.get("out_channels", 3),
+            down_block_types=tuple(vae_config["down_block_types"]),
+            up_block_types=tuple(vae_config["up_block_types"]),
+            block_out_channels=tuple(vae_config["block_out_channels"]),
+            layers_per_block=vae_config.get("layers_per_block", 2),
+            act_fn=vae_config.get("act_fn", "silu"),
+            latent_channels=vae_config.get("latent_channels", 4),
+            norm_num_groups=vae_config.get("norm_num_groups", 32),
+            sample_size=vae_config.get("sample_size", 768),
+        )
+        self.vae.load_state_dict(load_file(os.path.join(vae_dir, "diffusion_pytorch_model.safetensors")))
+        unet_dir = os.path.join(self.args.pretrained_model_name_or_path, "unet")
+        with open(os.path.join(unet_dir, "config.json"), "r") as f:
+            unet_config = json.load(f)
+        self.unet = UNet2DConditionModel(
+            in_channels=unet_config.get("in_channels", 4),
+            out_channels=unet_config.get("out_channels", 4),
+            down_block_types=tuple(unet_config["down_block_types"]),
+            up_block_types=tuple(unet_config["up_block_types"]),
+            block_out_channels=tuple(unet_config["block_out_channels"]),
+            layers_per_block=unet_config.get("layers_per_block", 2),
+            cross_attention_dim=unet_config.get("cross_attention_dim", 1024),
+            attention_head_dim=unet_config.get("attention_head_dim"),
+            sample_size=unet_config.get("sample_size", 64),
+            use_linear_projection=unet_config.get("use_linear_projection", False),
+        )
+        self.unet.load_state_dict(load_file(os.path.join(unet_dir, "diffusion_pytorch_model.safetensors")))
 
         self.weight_dtype = torch.float32
         if args.mixed_precision == "fp16":

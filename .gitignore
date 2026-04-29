@@ -3,3 +3,4 @@ preset/
 *.tmp
 __pycache__/
 *.pyc
+*.md
