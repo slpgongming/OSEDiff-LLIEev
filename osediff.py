@@ -161,7 +161,43 @@ class OSEDiff_gen(torch.nn.Module):
 
         return output_image, x_denoised, prompt_embeds, neg_prompt_embeds
 
-    def save_model(self, outf):
+    def load_ckpt(self, checkpoint):
+        lora_conf_encoder = LoraConfig(
+            r=checkpoint["rank_unet"],
+            init_lora_weights="gaussian",
+            target_modules=checkpoint["unet_lora_encoder_modules"]
+        )
+        lora_conf_decoder = LoraConfig(
+            r=checkpoint["rank_unet"],
+            init_lora_weights="gaussian",
+            target_modules=checkpoint["unet_lora_decoder_modules"]
+        )
+        lora_conf_others = LoraConfig(
+            r=checkpoint["rank_unet"],
+            init_lora_weights="gaussian",
+            target_modules=checkpoint["unet_lora_others_modules"]
+        )
+        self.unet.add_adapter(lora_conf_encoder, adapter_name="default_encoder")
+        self.unet.add_adapter(lora_conf_decoder, adapter_name="default_decoder")
+        self.unet.add_adapter(lora_conf_others, adapter_name="default_others")
+        for n, p in self.unet.named_parameters():
+            if "lora" in n or "conv_in" in n:
+                p.data.copy_(checkpoint["state_dict_unet"][n])
+        self.unet.set_adapter(["default_encoder", "default_decoder", "default_others"])
+
+        vae_lora_conf_encoder = LoraConfig(
+            r=checkpoint["rank_vae"],
+            init_lora_weights="gaussian",
+            target_modules=checkpoint["vae_lora_encoder_modules"]
+        )
+        self.vae.add_adapter(vae_lora_conf_encoder, adapter_name="default_encoder")
+        for n, p in self.vae.named_parameters():
+            if "lora" in n:
+                p.data.copy_(checkpoint["state_dict_vae"][n])
+        self.vae.set_adapter(['default_encoder'])
+
+    def save_model(self, outf, optimizer=None, lr_scheduler=None, global_step=0,
+                   epoch=0, optimizer_reg=None, lr_scheduler_reg=None, additional_info=None):
         sd = {}
         sd["vae_lora_encoder_modules"] = self.lora_vae_modules_encoder
         sd["unet_lora_encoder_modules"], sd["unet_lora_decoder_modules"], sd["unet_lora_others_modules"] =\
@@ -170,6 +206,18 @@ class OSEDiff_gen(torch.nn.Module):
         sd["rank_vae"] = self.lora_rank_vae
         sd["state_dict_unet"] = {k: v for k, v in self.unet.state_dict().items() if "lora" in k or "conv_in" in k}
         sd["state_dict_vae"] = {k: v for k, v in self.vae.state_dict().items() if "lora" in k}
+        sd["global_step"] = global_step
+        sd["epoch"] = epoch
+        if optimizer is not None:
+            sd["optimizer_state_dict"] = optimizer.state_dict()
+        if lr_scheduler is not None:
+            sd["lr_scheduler_state_dict"] = lr_scheduler.state_dict()
+        if optimizer_reg is not None:
+            sd["optimizer_reg_state_dict"] = optimizer_reg.state_dict()
+        if lr_scheduler_reg is not None:
+            sd["lr_scheduler_reg_state_dict"] = lr_scheduler_reg.state_dict()
+        if additional_info is not None:
+            sd["additional_info"] = additional_info
         torch.save(sd, outf)
 
 class OSEDiff_reg(torch.nn.Module):
@@ -222,6 +270,7 @@ class OSEDiff_reg(torch.nn.Module):
         self.unet_fix.load_state_dict(load_file(os.path.join(unet_dir, "diffusion_pytorch_model.safetensors")))
         self.unet_update, self.lora_unet_modules_encoder, self.lora_unet_modules_decoder, self.lora_unet_others =\
                 initialize_unet(args)
+        self.lora_rank_unet = args.lora_rank
 
         self.text_encoder.to(accelerator.device, dtype=weight_dtype)
         self.unet_fix.to(accelerator.device, dtype=weight_dtype)
@@ -237,6 +286,30 @@ class OSEDiff_reg(torch.nn.Module):
         for n, _p in self.unet_update.named_parameters():
             if "lora" in n:
                 _p.requires_grad = True
+
+    def load_ckpt(self, checkpoint):
+        lora_conf_encoder = LoraConfig(
+            r=checkpoint["rank_unet"],
+            init_lora_weights="gaussian",
+            target_modules=checkpoint["unet_lora_encoder_modules"]
+        )
+        lora_conf_decoder = LoraConfig(
+            r=checkpoint["rank_unet"],
+            init_lora_weights="gaussian",
+            target_modules=checkpoint["unet_lora_decoder_modules"]
+        )
+        lora_conf_others = LoraConfig(
+            r=checkpoint["rank_unet"],
+            init_lora_weights="gaussian",
+            target_modules=checkpoint["unet_lora_others_modules"]
+        )
+        self.unet_update.add_adapter(lora_conf_encoder, adapter_name="default_encoder")
+        self.unet_update.add_adapter(lora_conf_decoder, adapter_name="default_decoder")
+        self.unet_update.add_adapter(lora_conf_others, adapter_name="default_others")
+        for n, p in self.unet_update.named_parameters():
+            if "lora" in n:
+                p.data.copy_(checkpoint["state_dict_reg"][n])
+        self.unet_update.set_adapter(["default_encoder", "default_decoder", "default_others"])
 
     def diff_loss(self, latents, prompt_embeds, args):
 

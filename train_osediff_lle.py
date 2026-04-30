@@ -123,12 +123,31 @@ def parse_args(input_args=None):
     # --- LoRA ---
     parser.add_argument("--lora_rank", default=4, type=int)
 
+    # --- Resume training ---
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+        help="Path to a checkpoint to resume training from. "
+             "If 'latest', will use the last checkpoint in output_dir/checkpoints/")
+    parser.add_argument("--resume_ignore_mismatch", action="store_true",
+        help="Ignore mismatched parameters when resuming (useful when changing batch size etc.)")
+
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
         args = parser.parse_args()
 
     return args
+
+
+def find_latest_checkpoint(checkpoint_dir):
+    """Find the latest checkpoint in the checkpoint directory."""
+    if not os.path.exists(checkpoint_dir):
+        return None
+    checkpoints = [f for f in os.listdir(checkpoint_dir) if f.startswith("model_") and f.endswith(".pkl")]
+    if not checkpoints:
+        return None
+    # Sort by step number
+    checkpoints.sort(key=lambda x: int(x.replace("model_", "").replace(".pkl", "")))
+    return os.path.join(checkpoint_dir, checkpoints[-1])
 
 
 def main(args):
@@ -158,6 +177,19 @@ def main(args):
     if accelerator.is_main_process:
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "eval"), exist_ok=True)
+
+    # --- Determine checkpoint path ---
+    resume_checkpoint_path = None
+    if args.resume_from_checkpoint is not None:
+        if args.resume_from_checkpoint == "latest":
+            resume_checkpoint_path = find_latest_checkpoint(
+                os.path.join(args.output_dir, "checkpoints")
+            )
+            if resume_checkpoint_path is None:
+                if accelerator.is_main_process:
+                    print("[WARNING] No checkpoint found. Starting from scratch.")
+        else:
+            resume_checkpoint_path = args.resume_from_checkpoint
 
     # --- Initialize models ---
     model_gen = OSEDiff_gen(args)
@@ -260,13 +292,79 @@ def main(args):
         tracker_config = dict(vars(args))
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
-    progress_bar = tqdm(range(0, args.max_train_steps), initial=0, desc="Steps",
+    # --- Load checkpoint if resuming ---
+    start_epoch = 0
+    if resume_checkpoint_path is not None:
+        if accelerator.is_main_process:
+            print(f"[INFO] Loading checkpoint from: {resume_checkpoint_path}")
+        checkpoint = torch.load(resume_checkpoint_path, map_location="cpu")
+
+        # Load model_gen weights
+        accelerator.unwrap_model(model_gen).load_ckpt(checkpoint)
+
+        # Load model_reg weights
+        # Get reg state dict from additional_info if available
+        reg_checkpoint = checkpoint.copy()
+        if "additional_info" in checkpoint and "reg_checkpoint" in checkpoint["additional_info"]:
+            reg_checkpoint.update(checkpoint["additional_info"]["reg_checkpoint"])
+        accelerator.unwrap_model(model_reg).load_ckpt(reg_checkpoint)
+
+        # Load optimizer and scheduler states
+        if "optimizer_state_dict" in checkpoint and not args.resume_ignore_mismatch:
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                if accelerator.is_main_process:
+                    print("[INFO] Optimizer state loaded.")
+            except Exception as e:
+                if accelerator.is_main_process:
+                    print(f"[WARNING] Failed to load optimizer state: {e}")
+
+        if "lr_scheduler_state_dict" in checkpoint and not args.resume_ignore_mismatch:
+            try:
+                lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
+                if accelerator.is_main_process:
+                    print("[INFO] LR Scheduler state loaded.")
+            except Exception as e:
+                if accelerator.is_main_process:
+                    print(f"[WARNING] Failed to load scheduler state: {e}")
+
+        if "lr_scheduler_reg_state_dict" in checkpoint and not args.resume_ignore_mismatch:
+            try:
+                lr_scheduler_reg.load_state_dict(checkpoint["lr_scheduler_reg_state_dict"])
+                if accelerator.is_main_process:
+                    print("[INFO] Reg LR Scheduler state loaded.")
+            except Exception as e:
+                if accelerator.is_main_process:
+                    print(f"[WARNING] Failed to load reg scheduler state: {e}")
+
+        if "optimizer_reg_state_dict" in checkpoint and not args.resume_ignore_mismatch:
+            try:
+                optimizer_reg.load_state_dict(checkpoint["optimizer_reg_state_dict"])
+                if accelerator.is_main_process:
+                    print("[INFO] Reg Optimizer state loaded.")
+            except Exception as e:
+                if accelerator.is_main_process:
+                    print(f"[WARNING] Failed to load reg optimizer state: {e}")
+
+        # Get starting step and epoch
+        start_epoch = checkpoint.get("epoch", 0)
+        global_step = checkpoint.get("global_step", 0)
+
+        if accelerator.is_main_process:
+            print(f"[INFO] Resuming from epoch {start_epoch}, step {global_step}")
+
+    # Initialize step tracking for non-resume case
+    if 'global_step' not in dir():
+        global_step = 0
+    if 'start_epoch' not in dir():
+        start_epoch = 0
+
+    # Initialize progress bar AFTER checkpoint loading to show correct step
+    progress_bar = tqdm(range(0, args.max_train_steps), initial=global_step, desc="Steps",
         disable=not accelerator.is_local_main_process)
 
-    global_step = 0
-
     # --- Training loop ---
-    for epoch in range(0, args.num_training_epochs):
+    for epoch in range(start_epoch, args.num_training_epochs):
         for step, batch in enumerate(dl_train):
             m_acc = [model_gen, model_reg]
             with accelerator.accumulate(*m_acc):
@@ -348,7 +446,22 @@ def main(args):
 
                     if global_step % args.checkpointing_steps == 1:
                         outf = os.path.join(args.output_dir, "checkpoints", f"model_{global_step}.pkl")
-                        accelerator.unwrap_model(model_gen).save_model(outf)
+                        # Save reg state dict first
+                        reg_checkpoint = {
+                            "state_dict_reg": {
+                                k: v for k, v in accelerator.unwrap_model(model_reg).unet_update.state_dict().items() if "lora" in k
+                            }
+                        }
+                        accelerator.unwrap_model(model_gen).save_model(
+                            outf,
+                            optimizer=optimizer,
+                            lr_scheduler=lr_scheduler,
+                            lr_scheduler_reg=lr_scheduler_reg,
+                            optimizer_reg=optimizer_reg,
+                            global_step=global_step,
+                            epoch=epoch,
+                            additional_info={"reg_checkpoint": reg_checkpoint}
+                        )
                         print(f"\n[Saved] {outf}")
 
                     accelerator.log(logs, step=global_step)
@@ -363,7 +476,22 @@ def main(args):
     # --- Final save ---
     if accelerator.is_main_process:
         final_path = os.path.join(args.output_dir, "checkpoints", f"model_final.pkl")
-        accelerator.unwrap_model(model_gen).save_model(final_path)
+        # Save reg state dict first
+        reg_checkpoint = {
+            "state_dict_reg": {
+                k: v for k, v in accelerator.unwrap_model(model_reg).unet_update.state_dict().items() if "lora" in k
+            }
+        }
+        accelerator.unwrap_model(model_gen).save_model(
+            final_path,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            lr_scheduler_reg=lr_scheduler_reg,
+            optimizer_reg=optimizer_reg,
+            global_step=global_step,
+            epoch=epoch,
+            additional_info={"reg_checkpoint": reg_checkpoint}
+        )
         print(f"\n[Final model saved] {final_path}")
 
     accelerator.end_training()
