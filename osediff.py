@@ -162,39 +162,17 @@ class OSEDiff_gen(torch.nn.Module):
         return output_image, x_denoised, prompt_embeds, neg_prompt_embeds
 
     def load_ckpt(self, checkpoint):
-        lora_conf_encoder = LoraConfig(
-            r=checkpoint["rank_unet"],
-            init_lora_weights="gaussian",
-            target_modules=checkpoint["unet_lora_encoder_modules"]
-        )
-        lora_conf_decoder = LoraConfig(
-            r=checkpoint["rank_unet"],
-            init_lora_weights="gaussian",
-            target_modules=checkpoint["unet_lora_decoder_modules"]
-        )
-        lora_conf_others = LoraConfig(
-            r=checkpoint["rank_unet"],
-            init_lora_weights="gaussian",
-            target_modules=checkpoint["unet_lora_others_modules"]
-        )
-        self.unet.add_adapter(lora_conf_encoder, adapter_name="default_encoder")
-        self.unet.add_adapter(lora_conf_decoder, adapter_name="default_decoder")
-        self.unet.add_adapter(lora_conf_others, adapter_name="default_others")
+        # Load UNet LoRA weights
         for n, p in self.unet.named_parameters():
             if "lora" in n or "conv_in" in n:
-                p.data.copy_(checkpoint["state_dict_unet"][n])
-        self.unet.set_adapter(["default_encoder", "default_decoder", "default_others"])
+                if n in checkpoint["state_dict_unet"]:
+                    p.data.copy_(checkpoint["state_dict_unet"][n])
 
-        vae_lora_conf_encoder = LoraConfig(
-            r=checkpoint["rank_vae"],
-            init_lora_weights="gaussian",
-            target_modules=checkpoint["vae_lora_encoder_modules"]
-        )
-        self.vae.add_adapter(vae_lora_conf_encoder, adapter_name="default_encoder")
+        # Load VAE LoRA weights
         for n, p in self.vae.named_parameters():
             if "lora" in n:
-                p.data.copy_(checkpoint["state_dict_vae"][n])
-        self.vae.set_adapter(['default_encoder'])
+                if n in checkpoint["state_dict_vae"]:
+                    p.data.copy_(checkpoint["state_dict_vae"][n])
 
     def save_model(self, outf, optimizer=None, lr_scheduler=None, global_step=0,
                    epoch=0, optimizer_reg=None, lr_scheduler_reg=None, additional_info=None):
@@ -288,28 +266,11 @@ class OSEDiff_reg(torch.nn.Module):
                 _p.requires_grad = True
 
     def load_ckpt(self, checkpoint):
-        lora_conf_encoder = LoraConfig(
-            r=checkpoint["rank_unet"],
-            init_lora_weights="gaussian",
-            target_modules=checkpoint["unet_lora_encoder_modules"]
-        )
-        lora_conf_decoder = LoraConfig(
-            r=checkpoint["rank_unet"],
-            init_lora_weights="gaussian",
-            target_modules=checkpoint["unet_lora_decoder_modules"]
-        )
-        lora_conf_others = LoraConfig(
-            r=checkpoint["rank_unet"],
-            init_lora_weights="gaussian",
-            target_modules=checkpoint["unet_lora_others_modules"]
-        )
-        self.unet_update.add_adapter(lora_conf_encoder, adapter_name="default_encoder")
-        self.unet_update.add_adapter(lora_conf_decoder, adapter_name="default_decoder")
-        self.unet_update.add_adapter(lora_conf_others, adapter_name="default_others")
+        # Load UNet LoRA weights (adapters already exist from __init__)
         for n, p in self.unet_update.named_parameters():
             if "lora" in n:
-                p.data.copy_(checkpoint["state_dict_reg"][n])
-        self.unet_update.set_adapter(["default_encoder", "default_decoder", "default_others"])
+                if n in checkpoint["state_dict_reg"]:
+                    p.data.copy_(checkpoint["state_dict_reg"][n])
 
     def diff_loss(self, latents, prompt_embeds, args):
 
