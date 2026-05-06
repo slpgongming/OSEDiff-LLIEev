@@ -3,6 +3,7 @@ import gc
 import lpips
 import clip
 import argparse
+import logging
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -123,6 +124,11 @@ def parse_args(input_args=None):
     # --- LoRA ---
     parser.add_argument("--lora_rank", default=4, type=int)
 
+    # --- Timestep control ---
+    parser.add_argument("--max_train_timestep", default=200, type=int,
+        help="Maximum timestep for training sampling. Smaller values (e.g. 200) avoid alpha~0 regime. "
+             "t will be randomly sampled from [0, max_train_timestep] during training.")
+
     # --- Resume training ---
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
         help="Path to a checkpoint to resume training from. "
@@ -164,6 +170,25 @@ def main(args):
         kwargs_handlers=[ddp_kwargs],
     )
 
+    # --- File logging (always write to output_dir/train.log) ---
+    log_file = os.path.join(args.output_dir, "train.log")
+    os.makedirs(args.output_dir, exist_ok=True)
+    file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+
+    # Console handler (root logger + tqdm output)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
     if accelerator.is_local_main_process:
         transformers.utils.logging.set_verbosity_warning()
         diffusers.utils.logging.set_verbosity_info()
@@ -187,7 +212,7 @@ def main(args):
             )
             if resume_checkpoint_path is None:
                 if accelerator.is_main_process:
-                    print("[WARNING] No checkpoint found. Starting from scratch.")
+                    logging.warning("[WARNING] No checkpoint found. Starting from scratch.")
         else:
             resume_checkpoint_path = args.resume_from_checkpoint
 
@@ -291,12 +316,18 @@ def main(args):
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
+        logging.info("=" * 60)
+        logging.info("Training config:")
+        for k, v in sorted(vars(args).items()):
+            logging.info(f"  {k}: {v}")
+        logging.info(f"max_train_timestep: {getattr(args, 'max_train_timestep', 200)}")
+        logging.info("=" * 60)
 
     # --- Load checkpoint if resuming ---
     start_epoch = 0
     if resume_checkpoint_path is not None:
         if accelerator.is_main_process:
-            print(f"[INFO] Loading checkpoint from: {resume_checkpoint_path}")
+            logging.info(f"[INFO] Loading checkpoint from: {resume_checkpoint_path}")
         checkpoint = torch.load(resume_checkpoint_path, map_location="cpu")
 
         # Load model_gen weights
@@ -311,47 +342,39 @@ def main(args):
 
         # Load optimizer and scheduler states
         if "optimizer_state_dict" in checkpoint and not args.resume_ignore_mismatch:
-            try:
-                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                if accelerator.is_main_process:
-                    print("[INFO] Optimizer state loaded.")
-            except Exception as e:
-                if accelerator.is_main_process:
-                    print(f"[WARNING] Failed to load optimizer state: {e}")
+                try:
+                    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                    logging.info("[INFO] Optimizer state loaded.")
+                except Exception as e:
+                    logging.warning(f"[WARNING] Failed to load optimizer state: {e}")
 
         if "lr_scheduler_state_dict" in checkpoint and not args.resume_ignore_mismatch:
-            try:
-                lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
-                if accelerator.is_main_process:
-                    print("[INFO] LR Scheduler state loaded.")
-            except Exception as e:
-                if accelerator.is_main_process:
-                    print(f"[WARNING] Failed to load scheduler state: {e}")
+                try:
+                    lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
+                    logging.info("[INFO] LR Scheduler state loaded.")
+                except Exception as e:
+                    logging.warning(f"[WARNING] Failed to load scheduler state: {e}")
 
         if "lr_scheduler_reg_state_dict" in checkpoint and not args.resume_ignore_mismatch:
-            try:
-                lr_scheduler_reg.load_state_dict(checkpoint["lr_scheduler_reg_state_dict"])
-                if accelerator.is_main_process:
-                    print("[INFO] Reg LR Scheduler state loaded.")
-            except Exception as e:
-                if accelerator.is_main_process:
-                    print(f"[WARNING] Failed to load reg scheduler state: {e}")
+                try:
+                    lr_scheduler_reg.load_state_dict(checkpoint["lr_scheduler_reg_state_dict"])
+                    logging.info("[INFO] Reg LR Scheduler state loaded.")
+                except Exception as e:
+                    logging.warning(f"[WARNING] Failed to load reg scheduler state: {e}")
 
         if "optimizer_reg_state_dict" in checkpoint and not args.resume_ignore_mismatch:
-            try:
-                optimizer_reg.load_state_dict(checkpoint["optimizer_reg_state_dict"])
-                if accelerator.is_main_process:
-                    print("[INFO] Reg Optimizer state loaded.")
-            except Exception as e:
-                if accelerator.is_main_process:
-                    print(f"[WARNING] Failed to load reg optimizer state: {e}")
+                try:
+                    optimizer_reg.load_state_dict(checkpoint["optimizer_reg_state_dict"])
+                    logging.info("[INFO] Reg Optimizer state loaded.")
+                except Exception as e:
+                    logging.warning(f"[WARNING] Failed to load reg optimizer state: {e}")
 
         # Get starting step and epoch
         start_epoch = checkpoint.get("epoch", 0)
         global_step = checkpoint.get("global_step", 0)
 
         if accelerator.is_main_process:
-            print(f"[INFO] Resuming from epoch {start_epoch}, step {global_step}")
+            logging.info(f"[INFO] Resuming from epoch {start_epoch}, step {global_step}")
 
     # Initialize step tracking for non-resume case
     if 'global_step' not in dir():
@@ -364,7 +387,12 @@ def main(args):
         disable=not accelerator.is_local_main_process)
 
     # --- Training loop ---
+    epoch_loss_sum = 0.0
+    epoch_loss_count = 0
     for epoch in range(start_epoch, args.num_training_epochs):
+        logging.info(f"--- Epoch {epoch} started ---")
+        epoch_loss_sum = 0.0
+        epoch_loss_count = 0
         for step, batch in enumerate(dl_train):
             m_acc = [model_gen, model_reg]
             with accelerator.accumulate(*m_acc):
@@ -462,9 +490,20 @@ def main(args):
                             epoch=epoch,
                             additional_info={"reg_checkpoint": reg_checkpoint}
                         )
-                        print(f"\n[Saved] {outf}")
+                        logging.info(f"[Checkpoint] Step={global_step} | loss={loss.item():.6f} | Saved: {outf}")
 
                     accelerator.log(logs, step=global_step)
+
+                    # Write step-level loss to log file every 10 steps
+                    if global_step % 10 == 0:
+                        logging.info(
+                            f"step={global_step} | loss={loss.item():.6f} | "
+                            f"loss_l2={loss_l2.item():.6f} | loss_lpips={loss_lpips.item():.6f} | "
+                            f"loss_kl={loss_kl.item():.6f} | loss_d={loss_d.item():.6f} | "
+                            f"lr={lr_scheduler.get_last_lr()[0]:.2e}"
+                        )
+                    epoch_loss_sum += loss.item()
+                    epoch_loss_count += 1
 
             # Safety: prevent infinite loop in debug
             if global_step >= args.max_train_steps:
@@ -472,6 +511,9 @@ def main(args):
 
         if global_step >= args.max_train_steps:
             break
+
+        avg_epoch_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count > 0 else 0
+        logging.info(f"--- Epoch {epoch} finished, steps so far: {global_step}, avg_loss={avg_epoch_loss:.6f} ---")
 
     # --- Final save ---
     if accelerator.is_main_process:
@@ -492,7 +534,7 @@ def main(args):
             epoch=epoch,
             additional_info={"reg_checkpoint": reg_checkpoint}
         )
-        print(f"\n[Final model saved] {final_path}")
+        logging.info(f"[Final] Training complete. Model saved: {final_path}")
 
     accelerator.end_training()
 

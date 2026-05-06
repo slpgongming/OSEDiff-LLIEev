@@ -155,8 +155,14 @@ class OSEDiff_gen(torch.nn.Module):
         prompt_embeds = self.encode_prompt(batch["prompt"])
         neg_prompt_embeds = self.encode_prompt(batch["neg_prompt"])
 
-        model_pred = self.unet(encoded_control, self.timesteps, encoder_hidden_states=prompt_embeds.to(torch.float32),).sample
-        x_denoised = self.noise_scheduler.step(model_pred, self.timesteps, encoded_control, return_dict=True).prev_sample
+        # Random small timestep sampling for stable training
+        # Sample from [0, args.max_train_timestep] instead of the full [0, 999] range
+        # Use scalar (1,) to avoid DDPMScheduler.step() batch-size mismatch error
+        max_t = getattr(args, 'max_train_timestep', 200)
+        timesteps = torch.randint(0, max_t + 1, (1,), device=c_t.device).long()
+
+        model_pred = self.unet(encoded_control, timesteps, encoder_hidden_states=prompt_embeds.to(torch.float32),).sample
+        x_denoised = self.noise_scheduler.step(model_pred, timesteps, encoded_control, return_dict=True).prev_sample
         output_image = (self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
 
         return output_image, x_denoised, prompt_embeds, neg_prompt_embeds
@@ -427,6 +433,11 @@ class OSEDiff_test(torch.nn.Module):
                 p.data.copy_(model["state_dict_vae"][n])
         self.vae.set_adapter(['default_encoder'])
 
+        lora_sum_unet = sum(p.abs().sum().item() for n, p in self.unet.named_parameters() if "lora" in n)
+        lora_sum_vae = sum(p.abs().sum().item() for n, p in self.vae.named_parameters() if "lora" in n)
+        print(f"[DEBUG] UNet LoRA weight abs-sum: {lora_sum_unet:.6f}")
+        print(f"[DEBUG] VAE LoRA weight abs-sum: {lora_sum_vae:.6f}")
+
     def encode_prompt(self, prompt_batch):
         prompt_embeds_list = []
         with torch.no_grad():
@@ -447,13 +458,16 @@ class OSEDiff_test(torch.nn.Module):
     def forward(self, lq, prompt):
 
         prompt_embeds = self.encode_prompt([prompt])
-        lq_latent = self.vae.encode(lq.to(self.weight_dtype)).latent_dist.sample() * self.vae.config.scaling_factor
+        print(f"[DEBUG] prompt_embeds dtype={prompt_embeds.dtype}, device={prompt_embeds.device}, shape={prompt_embeds.shape}")
+        lq_latent = self.vae.encode(lq.to(self.weight_dtype).to(self.device)).latent_dist.sample() * self.vae.config.scaling_factor
+        print(f"[DEBUG] lq_latent dtype={lq_latent.dtype}, mean={lq_latent.mean().item():.6f}, std={lq_latent.std().item():.6f}")
         ## add tile function
         _, _, h, w = lq_latent.size()
         tile_size, tile_overlap = (self.args.latent_tiled_size, self.args.latent_tiled_overlap)
         if h * w <= tile_size * tile_size:
             print(f"[Tiled Latent]: the input size is tiny and unnecessary to tile.")
             model_pred = self.unet(lq_latent, self.timesteps, encoder_hidden_states=prompt_embeds).sample
+            print(f"[DEBUG] model_pred dtype={model_pred.dtype}, mean={model_pred.mean().item():.6f}, std={model_pred.std().item():.6f}")
         else:
             print(f"[Tiled Latent]: the input size is {lq.shape[-2]}x{lq.shape[-1]}, need to tiled")
             tile_weights = self._gaussian_weights(tile_size, tile_size, 1)
@@ -529,9 +543,12 @@ class OSEDiff_test(torch.nn.Module):
             # Average overlapping areas with more than 1 contributor
             noise_pred /= contributors
             model_pred = noise_pred
+            print(f"[DEBUG] (tiled) model_pred dtype={model_pred.dtype}, mean={model_pred.mean().item():.6f}, std={model_pred.std().item():.6f}")
 
         x_denoised = self.noise_scheduler.step(model_pred, self.timesteps, lq_latent, return_dict=True).prev_sample
-        output_image = (self.vae.decode(x_denoised.to(self.weight_dtype) / self.vae.config.scaling_factor).sample).clamp(-1, 1)
+        print(f"[DEBUG] x_denoised mean={x_denoised.mean().item():.6f}, std={x_denoised.std().item():.6f}, diff_from_input={torch.abs(x_denoised - lq_latent).mean().item():.6f}")
+        output_image = (self.vae.decode(x_denoised.to(self.weight_dtype).to(self.device) / self.vae.config.scaling_factor).sample).clamp(-1, 1)
+        print(f"[DEBUG] output_image mean={output_image.mean().item():.6f}, std={output_image.std().item():.6f}")
 
         return output_image
 
@@ -659,6 +676,11 @@ class OSEDiff_inference_time(torch.nn.Module):
                 p.data.copy_(model["state_dict_vae"][n])
         self.vae.set_adapter(['default_encoder'])
 
+        lora_sum_unet = sum(p.abs().sum().item() for n, p in self.unet.named_parameters() if "lora" in n)
+        lora_sum_vae = sum(p.abs().sum().item() for n, p in self.vae.named_parameters() if "lora" in n)
+        print(f"[DEBUG] UNet LoRA weight abs-sum: {lora_sum_unet:.6f}")
+        print(f"[DEBUG] VAE LoRA weight abs-sum: {lora_sum_vae:.6f}")
+
     def encode_prompt(self, prompt_batch):
         prompt_embeds_list = []
         with torch.no_grad():
@@ -678,9 +700,9 @@ class OSEDiff_inference_time(torch.nn.Module):
     def forward(self, lq, prompt):
 
         prompt_embeds = self.encode_prompt([prompt])
-        lq_latent = self.vae.encode(lq.to(self.weight_dtype)).latent_dist.sample() * self.vae.config.scaling_factor
+        lq_latent = self.vae.encode(lq.to(self.weight_dtype).to(self.device)).latent_dist.sample() * self.vae.config.scaling_factor
         model_pred = self.unet(lq_latent, self.timesteps, encoder_hidden_states=prompt_embeds).sample
         x_denoised = self.noise_scheduler.step(model_pred, self.timesteps, lq_latent, return_dict=True).prev_sample
-        output_image = (self.vae.decode(x_denoised.to(self.weight_dtype) / self.vae.config.scaling_factor).sample).clamp(-1, 1)
+        output_image = (self.vae.decode(x_denoised.to(self.weight_dtype).to(self.device) / self.vae.config.scaling_factor).sample).clamp(-1, 1)
 
         return output_image
