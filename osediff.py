@@ -445,9 +445,8 @@ class OSEDiff_test(torch.nn.Module):
     # @perfcount
     @torch.no_grad()
     def forward(self, lq, prompt):
-
         prompt_embeds = self.encode_prompt([prompt])
-        lq_latent = self.vae.encode(lq.to(self.weight_dtype)).latent_dist.sample() * self.vae.config.scaling_factor
+        lq_latent = self.vae.encode(lq.to(self.device, self.weight_dtype)).latent_dist.sample() * self.vae.config.scaling_factor
         ## add tile function
         _, _, h, w = lq_latent.size()
         tile_size, tile_overlap = (self.args.latent_tiled_size, self.args.latent_tiled_overlap)
@@ -678,7 +677,7 @@ class OSEDiff_inference_time(torch.nn.Module):
     def forward(self, lq, prompt):
 
         prompt_embeds = self.encode_prompt([prompt])
-        lq_latent = self.vae.encode(lq.to(self.weight_dtype)).latent_dist.sample() * self.vae.config.scaling_factor
+        lq_latent = self.vae.encode(lq.to(self.device, self.weight_dtype)).latent_dist.sample() * self.vae.config.scaling_factor
         model_pred = self.unet(lq_latent, self.timesteps, encoder_hidden_states=prompt_embeds).sample
         x_denoised = self.noise_scheduler.step(model_pred, self.timesteps, lq_latent, return_dict=True).prev_sample
         output_image = (self.vae.decode(x_denoised.to(self.weight_dtype) / self.vae.config.scaling_factor).sample).clamp(-1, 1)
