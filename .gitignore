@@ -5,4 +5,5 @@ __pycache__/
 *.pyc
 *.md
 checkpoints/
-output_lle
+output_lle/
+references/
