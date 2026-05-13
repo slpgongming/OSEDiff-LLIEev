@@ -4,3 +4,5 @@ preset/
 __pycache__/
 *.pyc
 *.md
+checkpoints/
+output_lle
