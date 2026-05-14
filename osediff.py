@@ -156,10 +156,21 @@ class OSEDiff_gen(torch.nn.Module):
         neg_prompt_embeds = self.encode_prompt(batch["neg_prompt"])
 
         # Random small timestep sampling for stable training
-        # Sample from [0, args.max_train_timestep] instead of the full [0, 999] range
+        # Support three modes for args.train_timestep_range:
+        #   [(low, high, weight), ...]  — pick a bucket by weight, then sample uniformly inside
         # Use scalar (1,) to avoid DDPMScheduler.step() batch-size mismatch error
-        max_t = getattr(args, 'max_train_timestep', 200)
-        timesteps = torch.randint(0, max_t + 1, (1,), device=c_t.device).long()
+        ranges = getattr(args, 'train_timestep_range', [(0, 200, 1.0)])
+        if len(ranges) == 1:
+            low, high, _ = ranges[0]
+            timesteps = torch.randint(low, high + 1, (1,), device=c_t.device).long()
+        else:
+            lows  = torch.tensor([r[0] for r in ranges], dtype=torch.float32, device=c_t.device)
+            highs = torch.tensor([r[1] for r in ranges], dtype=torch.float32, device=c_t.device)
+            weights = torch.tensor([r[2] for r in ranges], dtype=torch.float32, device=c_t.device)
+            weights = weights / weights.sum()
+            bucket_idx = torch.multinomial(weights, 1, replacement=True).item()
+            low, high = lows[bucket_idx].item(), highs[bucket_idx].item()
+            timesteps = torch.randint(int(low), int(high) + 1, (1,), device=c_t.device).long()
 
         model_pred = self.unet(encoded_control, timesteps, encoder_hidden_states=prompt_embeds.to(torch.float32),).sample
         x_denoised = self.noise_scheduler.step(model_pred, timesteps, encoded_control, return_dict=True).prev_sample

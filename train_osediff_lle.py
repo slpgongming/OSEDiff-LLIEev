@@ -45,6 +45,58 @@ def parse_str_list(arg):
     return arg.split(',')
 
 
+def parse_train_timestep_range(arg):
+    """
+    Parse the --train_timestep_range argument into a list of (low, high, weight) tuples.
+
+    Supported formats:
+      - Single value:          "100"       → [(0, 100, 1.0)]
+      - Simple range:          "0,200"     → [(0, 200, 1.0)]
+      - Weighted ranges:        "0,0.5;100,0.3;200,0.2"
+                                 → [(0, 100, 0.5), (100, 200, 0.2), (200, 200, 0.3)]
+      - Weighted ranges (short): "0,0.5;200,0.5"  → [(0, 200, 0.5), (200, 200, 0.5)]
+      - Mixed:                  "0,999"     → [(0, 999, 1.0)]  (full range)
+
+    Returns a list of (low, high, weight) tuples where low/high are ints and weight is float.
+    """
+    arg = arg.strip()
+    if ';' in arg:
+        parts = arg.split(';')
+        ranges = []
+        total_weight = 0.0
+        for p in parts:
+            p = p.strip()
+            if ',' not in p:
+                raise argparse.ArgumentTypeError(
+                    f"Weighted range '{p}' must contain a comma (e.g. '0,0.5')."
+                )
+            val_str, weight_str = p.rsplit(',', 1)
+            val = int(val_str.strip())
+            weight = float(weight_str.strip())
+            if weight < 0:
+                raise argparse.ArgumentTypeError(f"Weight must be non-negative, got {weight}.")
+            low = 0 if val == 0 else val
+            high = val
+            ranges.append((low, high, weight))
+            total_weight += weight
+        if total_weight <= 0:
+            raise argparse.ArgumentTypeError("Total weight must be positive.")
+        return ranges
+    else:
+        vals = [v.strip() for v in arg.split(',')]
+        if len(vals) == 1:
+            high = int(vals[0])
+            return [(0, high, 1.0)]
+        elif len(vals) == 2:
+            low = int(vals[0])
+            high = int(vals[1])
+            return [(low, high, 1.0)]
+        else:
+            raise argparse.ArgumentTypeError(
+                f"Range format expects at most 2 values (low,high), got {len(vals)}: '{arg}'."
+            )
+
+
 def parse_args(input_args=None):
     """
     Parses command-line arguments for low-light enhancement training.
@@ -125,9 +177,18 @@ def parse_args(input_args=None):
     parser.add_argument("--lora_rank", default=4, type=int)
 
     # --- Timestep control ---
-    parser.add_argument("--max_train_timestep", default=200, type=int,
-        help="Maximum timestep for training sampling. Smaller values (e.g. 200) avoid alpha~0 regime. "
-             "t will be randomly sampled from [0, max_train_timestep] during training.")
+    parser.add_argument("--train_timestep_range", default="0,200", type=parse_train_timestep_range,
+        help="Timestep range(s) for training sampling. Three modes are supported:\n"
+             "  1. Single value:   '100'          → sample uniformly from [0, 100]\n"
+             "  2. Simple range:   '0,200'         → sample uniformly from [0, 200]\n"
+             "  3. Weighted ranges: '0,0.5;100,0.3;200,0.2'\n"
+             "                       → first pick a bucket by weight, then sample uniformly inside it.\n"
+             "  Note: 999 is the scheduler's max timestep (alpha→0 regime). Using smaller values\n"
+             "         avoids the numerically unstable region near alpha=0.\n"
+             "Examples:\n"
+             "  --train_timestep_range '100'           (fixed range [0,100])\n"
+             "  --train_timestep_range '0,200'         (uniform range [0,200])\n"
+             "  --train_timestep_range '0,0.5;200,0.5' (50%% weight for [0,200], 50%% for t=200)")
 
     # --- Resume training ---
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
@@ -320,7 +381,7 @@ def main(args):
         logging.info("Training config:")
         for k, v in sorted(vars(args).items()):
             logging.info(f"  {k}: {v}")
-        logging.info(f"max_train_timestep: {getattr(args, 'max_train_timestep', 200)}")
+        logging.info(f"train_timestep_range: {args.train_timestep_range}")
         logging.info("=" * 60)
 
     # --- Load checkpoint if resuming ---

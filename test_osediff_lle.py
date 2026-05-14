@@ -160,7 +160,7 @@ if __name__ == "__main__":
         help='Path to trained OSEDiff-LLE checkpoint (.pkl)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument("--align_method", type=str, choices=['wavelet', 'adain', 'nofix'],
-        default='adain', help='Color correction method')
+        default='nofix', help='Color correction method')
     parser.add_argument('--fixed_prompt', type=str,
         default='high quality, bright, detailed photo',
         help='Fixed text prompt for generation')
