@@ -16,12 +16,13 @@ from peft import LoraConfig
 
 from my_utils.vaehook import VAEHook, perfcount
 
-def initialize_vae(args):
+def initialize_vae(args, vae_in_channels=None):
     vae_dir = os.path.join(args.pretrained_model_name_or_path, "vae")
     with open(os.path.join(vae_dir, "config.json"), "r") as f:
         vae_config = json.load(f)
+    in_channels = vae_in_channels if vae_in_channels is not None else vae_config.get("in_channels", 3)
     vae = AutoencoderKL(
-        in_channels=vae_config.get("in_channels", 3),
+        in_channels=in_channels,
         out_channels=vae_config.get("out_channels", 3),
         down_block_types=tuple(vae_config["down_block_types"]),
         up_block_types=tuple(vae_config["up_block_types"]),
@@ -33,7 +34,25 @@ def initialize_vae(args):
         sample_size=vae_config.get("sample_size", 768),
     )
     vae_state = load_file(os.path.join(vae_dir, "diffusion_pytorch_model.safetensors"))
-    vae.load_state_dict(vae_state)
+
+    # Expand encoder conv_in BEFORE loading: pretrained weights are for 3 channels,
+    # but we need to accept `in_channels` (e.g. 8 = 3 RGB + 5 voxel).
+    pretrained_in_ch = vae_config.get("in_channels", 3)
+    if in_channels != pretrained_in_ch:
+        conv_in_key = "encoder.conv_in.weight"
+        if conv_in_key in vae_state:
+            old_weight = vae_state[conv_in_key]  # [out_ch, pretrained_in_ch, k, k]
+            out_ch, _, k_h, k_w = old_weight.shape
+            mean_per_out = old_weight.mean(dim=1, keepdim=True)  # [out_ch, 1, k, k]
+            repeat_times = in_channels - pretrained_in_ch
+            new_channels_weight = mean_per_out.repeat(1, repeat_times, 1, 1)
+            expanded_weight = torch.cat([old_weight, new_channels_weight], dim=1)
+            vae_state[conv_in_key] = expanded_weight
+            print(f"[initialize_vae] Expanded conv_in: {pretrained_in_ch} -> {in_channels} channels "
+                  f"(new channels initialized from mean of original {pretrained_in_ch} channels)")
+
+    vae.load_state_dict(vae_state, strict=False)
+
     vae.requires_grad_(False)
     vae.train()
     
@@ -58,8 +77,10 @@ def initialize_unet(args, return_lora_module_names=False, pretrained_model_name_
     unet_dir = os.path.join(args.pretrained_model_name_or_path, "unet")
     with open(os.path.join(unet_dir, "config.json"), "r") as f:
         unet_config = json.load(f)
+    unet_in_channels = getattr(args, 'unet_in_channels', None)
+    in_channels = unet_in_channels if unet_in_channels is not None else unet_config.get("in_channels", 4)
     unet = UNet2DConditionModel(
-        in_channels=unet_config.get("in_channels", 4),
+        in_channels=in_channels,
         out_channels=unet_config.get("out_channels", 4),
         down_block_types=tuple(unet_config["down_block_types"]),
         up_block_types=tuple(unet_config["up_block_types"]),
@@ -70,7 +91,25 @@ def initialize_unet(args, return_lora_module_names=False, pretrained_model_name_
         sample_size=unet_config.get("sample_size", 64),
         use_linear_projection=unet_config.get("use_linear_projection", False),
     )
-    unet.load_state_dict(load_file(os.path.join(unet_dir, "diffusion_pytorch_model.safetensors")))
+    unet_state = load_file(os.path.join(unet_dir, "diffusion_pytorch_model.safetensors"))
+
+    # Expand conv_in BEFORE loading: pretrained conv_in is 4 channels (latent only),
+    # but we need `in_channels` (e.g. 9 = 4 latent + 5 voxel).
+    pretrained_unet_in_ch = unet_config.get("in_channels", 4)
+    if in_channels != pretrained_unet_in_ch:
+        conv_in_key = "conv_in.weight"
+        if conv_in_key in unet_state:
+            old_weight = unet_state[conv_in_key]  # [out_ch, 4, k, k]
+            out_ch, _, k_h, k_w = old_weight.shape
+            mean_per_out = old_weight.mean(dim=1, keepdim=True)  # [out_ch, 1, k, k]
+            repeat_times = in_channels - pretrained_unet_in_ch
+            new_channels_weight = mean_per_out.repeat(1, repeat_times, 1, 1)
+            expanded_weight = torch.cat([old_weight, new_channels_weight], dim=1)
+            unet_state[conv_in_key] = expanded_weight
+            print(f"[initialize_unet] Expanded conv_in: {pretrained_unet_in_ch} -> {in_channels} channels "
+                  f"(new channels initialized from mean of original {pretrained_unet_in_ch} channels)")
+
+    unet.load_state_dict(unet_state, strict=False)
     unet.requires_grad_(False)
     unet.train()
 
@@ -111,7 +150,8 @@ class OSEDiff_gen(torch.nn.Module):
         self.noise_scheduler.alphas_cumprod = self.noise_scheduler.alphas_cumprod.cuda()
         self.args = args
 
-        self.vae, self.lora_vae_modules_encoder = initialize_vae(self.args)
+        vae_in_channels = getattr(args, 'vae_in_channels', None)
+        self.vae, self.lora_vae_modules_encoder = initialize_vae(self.args, vae_in_channels=vae_in_channels)
         self.unet, self.lora_unet_modules_encoder, self.lora_unet_modules_decoder, self.lora_unet_others = initialize_unet(self.args)
         self.lora_rank_unet = self.args.lora_rank
         self.lora_rank_vae = self.args.lora_rank
@@ -231,22 +271,8 @@ class OSEDiff_reg(torch.nn.Module):
             weight_dtype = torch.bfloat16
         self.weight_dtype = weight_dtype
 
-        vae_dir = os.path.join(args.pretrained_model_name_or_path, "vae")
-        with open(os.path.join(vae_dir, "config.json"), "r") as f:
-            vae_config = json.load(f)
-        self.vae = AutoencoderKL(
-            in_channels=vae_config.get("in_channels", 3),
-            out_channels=vae_config.get("out_channels", 3),
-            down_block_types=tuple(vae_config["down_block_types"]),
-            up_block_types=tuple(vae_config["up_block_types"]),
-            block_out_channels=tuple(vae_config["block_out_channels"]),
-            layers_per_block=vae_config.get("layers_per_block", 2),
-            act_fn=vae_config.get("act_fn", "silu"),
-            latent_channels=vae_config.get("latent_channels", 4),
-            norm_num_groups=vae_config.get("norm_num_groups", 32),
-            sample_size=vae_config.get("sample_size", 768),
-        )
-        self.vae.load_state_dict(load_file(os.path.join(vae_dir, "diffusion_pytorch_model.safetensors")))
+        vae_in_channels = getattr(args, 'vae_in_channels', None)
+        self.vae, _ = initialize_vae(args, vae_in_channels=vae_in_channels)
         unet_dir = os.path.join(args.pretrained_model_name_or_path, "unet")
         with open(os.path.join(unet_dir, "config.json"), "r") as f:
             unet_config = json.load(f)
@@ -366,22 +392,8 @@ class OSEDiff_test(torch.nn.Module):
         self.text_encoder = CLIPTextModel.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="text_encoder")
         self.noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
         self.noise_scheduler.set_timesteps(1, device="cuda")
-        vae_dir = os.path.join(self.args.pretrained_model_name_or_path, "vae")
-        with open(os.path.join(vae_dir, "config.json"), "r") as f:
-            vae_config = json.load(f)
-        self.vae = AutoencoderKL(
-            in_channels=vae_config.get("in_channels", 3),
-            out_channels=vae_config.get("out_channels", 3),
-            down_block_types=tuple(vae_config["down_block_types"]),
-            up_block_types=tuple(vae_config["up_block_types"]),
-            block_out_channels=tuple(vae_config["block_out_channels"]),
-            layers_per_block=vae_config.get("layers_per_block", 2),
-            act_fn=vae_config.get("act_fn", "silu"),
-            latent_channels=vae_config.get("latent_channels", 4),
-            norm_num_groups=vae_config.get("norm_num_groups", 32),
-            sample_size=vae_config.get("sample_size", 768),
-        )
-        self.vae.load_state_dict(load_file(os.path.join(vae_dir, "diffusion_pytorch_model.safetensors")))
+        vae_in_channels = getattr(args, 'vae_in_channels', None)
+        self.vae, _ = initialize_vae(args, vae_in_channels=vae_in_channels)
         unet_dir = os.path.join(self.args.pretrained_model_name_or_path, "unet")
         with open(os.path.join(unet_dir, "config.json"), "r") as f:
             unet_config = json.load(f)
@@ -613,22 +625,8 @@ class OSEDiff_inference_time(torch.nn.Module):
         self.text_encoder = CLIPTextModel.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="text_encoder")
         self.noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
         self.noise_scheduler.set_timesteps(1, device="cuda")
-        vae_dir = os.path.join(self.args.pretrained_model_name_or_path, "vae")
-        with open(os.path.join(vae_dir, "config.json"), "r") as f:
-            vae_config = json.load(f)
-        self.vae = AutoencoderKL(
-            in_channels=vae_config.get("in_channels", 3),
-            out_channels=vae_config.get("out_channels", 3),
-            down_block_types=tuple(vae_config["down_block_types"]),
-            up_block_types=tuple(vae_config["up_block_types"]),
-            block_out_channels=tuple(vae_config["block_out_channels"]),
-            layers_per_block=vae_config.get("layers_per_block", 2),
-            act_fn=vae_config.get("act_fn", "silu"),
-            latent_channels=vae_config.get("latent_channels", 4),
-            norm_num_groups=vae_config.get("norm_num_groups", 32),
-            sample_size=vae_config.get("sample_size", 768),
-        )
-        self.vae.load_state_dict(load_file(os.path.join(vae_dir, "diffusion_pytorch_model.safetensors")))
+        vae_in_channels = getattr(args, 'vae_in_channels', None)
+        self.vae, _ = initialize_vae(args, vae_in_channels=vae_in_channels)
         unet_dir = os.path.join(self.args.pretrained_model_name_or_path, "unet")
         with open(os.path.join(unet_dir, "config.json"), "r") as f:
             unet_config = json.load(f)
