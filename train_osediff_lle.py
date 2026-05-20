@@ -375,7 +375,7 @@ def main(args):
 
     # --- Trackers ---
     if accelerator.is_main_process:
-        tracker_config = dict(vars(args))
+        tracker_config = {k: (str(v) if isinstance(v, (list, tuple)) else v) for k, v in vars(args).items()}
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
         logging.info("=" * 60)
         logging.info("Training config:")
