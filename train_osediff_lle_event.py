@@ -48,6 +48,16 @@ def parse_str_list(arg):
 def parse_train_timestep_range(arg):
     """
     Parse the --train_timestep_range argument into a list of (low, high, weight) tuples.
+
+    Supported formats:
+      - Single value:          "999"       → [(999, 999, 1.0)]  fixed timestep every step
+      - Simple range:          "0,200"     → [(0, 200, 1.0)]    random in [0,200] each step
+      - Weighted ranges:        "0,0.5;100,0.3;200,0.2"
+                                 → [(0, 100, 0.5), (100, 200, 0.2), (200, 200, 0.3)]
+      - Weighted ranges (short): "0,0.5;200,0.5"  → [(0, 200, 0.5), (200, 200, 0.5)]
+      - Mixed:                  "0,999"     → [(0, 999, 1.0)]  (full range)
+
+    Returns a list of (low, high, weight) tuples where low/high are ints and weight is float.
     """
     arg = arg.strip()
     if ';' in arg:
@@ -75,8 +85,8 @@ def parse_train_timestep_range(arg):
     else:
         vals = [v.strip() for v in arg.split(',')]
         if len(vals) == 1:
-            high = int(vals[0])
-            return [(0, high, 1.0)]
+            val = int(vals[0])
+            return [(val, val, 1.0)]  # low==high → fixed timestep
         elif len(vals) == 2:
             low = int(vals[0])
             high = int(vals[1])
@@ -168,7 +178,7 @@ def parse_args(input_args=None):
     parser.add_argument("--lora_rank", default=4, type=int)
 
     # --- Timestep control ---
-    parser.add_argument("--train_timestep_range", default="0,200", type=parse_train_timestep_range)
+    parser.add_argument("--train_timestep_range", default="999", type=parse_train_timestep_range)
 
     # --- Resume training ---
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)

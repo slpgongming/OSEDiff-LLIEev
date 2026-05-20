@@ -50,8 +50,8 @@ def parse_train_timestep_range(arg):
     Parse the --train_timestep_range argument into a list of (low, high, weight) tuples.
 
     Supported formats:
-      - Single value:          "100"       → [(0, 100, 1.0)]
-      - Simple range:          "0,200"     → [(0, 200, 1.0)]
+      - Single value:          "999"       → [(999, 999, 1.0)]  fixed timestep every step
+      - Simple range:          "0,200"     → [(0, 200, 1.0)]    random in [0,200] each step
       - Weighted ranges:        "0,0.5;100,0.3;200,0.2"
                                  → [(0, 100, 0.5), (100, 200, 0.2), (200, 200, 0.3)]
       - Weighted ranges (short): "0,0.5;200,0.5"  → [(0, 200, 0.5), (200, 200, 0.5)]
@@ -85,8 +85,8 @@ def parse_train_timestep_range(arg):
     else:
         vals = [v.strip() for v in arg.split(',')]
         if len(vals) == 1:
-            high = int(vals[0])
-            return [(0, high, 1.0)]
+            val = int(vals[0])
+            return [(val, val, 1.0)]  # low==high → fixed timestep
         elif len(vals) == 2:
             low = int(vals[0])
             high = int(vals[1])
@@ -177,7 +177,7 @@ def parse_args(input_args=None):
     parser.add_argument("--lora_rank", default=4, type=int)
 
     # --- Timestep control ---
-    parser.add_argument("--train_timestep_range", default="0,200", type=parse_train_timestep_range,
+    parser.add_argument("--train_timestep_range", default="999", type=parse_train_timestep_range,
         help="Timestep range(s) for training sampling. Three modes are supported:\n"
              "  1. Single value:   '100'          → sample uniformly from [0, 100]\n"
              "  2. Simple range:   '0,200'         → sample uniformly from [0, 200]\n"
@@ -186,7 +186,7 @@ def parse_args(input_args=None):
              "  Note: 999 is the scheduler's max timestep (alpha→0 regime). Using smaller values\n"
              "         avoids the numerically unstable region near alpha=0.\n"
              "Examples:\n"
-             "  --train_timestep_range '100'           (fixed range [0,100])\n"
+             "  --train_timestep_range '999'          (fixed timestep=999 every step)\n"
              "  --train_timestep_range '0,200'         (uniform range [0,200])\n"
              "  --train_timestep_range '0,0.5;200,0.5' (50%% weight for [0,200], 50%% for t=200)")
 
