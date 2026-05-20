@@ -71,15 +71,15 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
         in_channels: int = 3,
         out_channels: int = 3,
         down_block_types: Tuple[str] = ("DownEncoderBlock2D",),
-        up_block_types: Tuple[str] = ("UpDecoderBlock2D",),
-        block_out_channels: Tuple[int] = (64,),
+        up_block_types: Tuple[str] = ("UpDecoderBlock2D",), 
+        block_out_channels: Tuple[int] = (64,), # 每个块的输出通道数元组
         layers_per_block: int = 1,
         act_fn: str = "silu",
-        latent_channels: int = 4,
-        norm_num_groups: int = 32,
-        sample_size: int = 32,
-        scaling_factor: float = 0.18215,
-        force_upcast: float = True,
+        latent_channels: int = 4, # 潜在空间的通道数 (通常为4)
+        norm_num_groups: int = 32, # GroupNorm的分组数
+        sample_size: int = 32, # 输入图像的默认尺寸
+        scaling_factor: float = 0.18215, # 潜在空间的缩放因子，确保单位方差
+        force_upcast: float = True, # 是否强制使用float32精度处理高分辨率图像
     ):
         super().__init__()
 
@@ -92,7 +92,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
             layers_per_block=layers_per_block,
             act_fn=act_fn,
             norm_num_groups=norm_num_groups,
-            double_z=True,
+            double_z=True, # 输出2*latent_channels以预测均值和方差
         )
 
         # pass init params to Decoder

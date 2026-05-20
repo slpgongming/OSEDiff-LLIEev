@@ -180,6 +180,12 @@ if __name__ == "__main__":
     parser.add_argument("--latent_tiled_size", type=int, default=96)
     parser.add_argument("--latent_tiled_overlap", type=int, default=32)
 
+    # Timestep (must match training max_train_timestep)
+    parser.add_argument("--inference_timestep", type=int, default=999,
+        help="Timestep for single-step denoising during inference. "
+             "Should match the max_train_timestep used during training. "
+             "E.g. 999 for full-range, 200 for small-timestep training.")
+
     args = parser.parse_args()
 
     # Set random seed

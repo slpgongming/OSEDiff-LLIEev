@@ -344,7 +344,7 @@ class OSEDiff_test(torch.nn.Module):
         super().__init__()
 
         self.args = args
-        self.device =  torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="tokenizer")
         self.text_encoder = CLIPTextModel.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="text_encoder")
         self.noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
@@ -401,7 +401,9 @@ class OSEDiff_test(torch.nn.Module):
         self.unet.to("cuda", dtype=self.weight_dtype)
         self.vae.to("cuda", dtype=self.weight_dtype)
         self.text_encoder.to("cuda", dtype=self.weight_dtype)
-        self.timesteps = torch.tensor([999], device="cuda").long() 
+        inference_timestep = getattr(args, 'inference_timestep', 999)
+        self.timesteps = torch.tensor([inference_timestep], device="cuda").long()
+        print(f"[INFO] Inference timestep set to: {inference_timestep}")
         self.noise_scheduler.alphas_cumprod = self.noise_scheduler.alphas_cumprod.cuda()
 
         
@@ -632,7 +634,9 @@ class OSEDiff_inference_time(torch.nn.Module):
         self.unet.to("cuda", dtype=self.weight_dtype)
         self.vae.to("cuda", dtype=self.weight_dtype)
         self.text_encoder.to("cuda", dtype=self.weight_dtype)
-        self.timesteps = torch.tensor([999], device="cuda").long() 
+        inference_timestep = getattr(args, 'inference_timestep', 200)
+        self.timesteps = torch.tensor([inference_timestep], device="cuda").long()
+        print(f"[INFO] Inference timestep set to: {inference_timestep}")
         self.noise_scheduler.alphas_cumprod = self.noise_scheduler.alphas_cumprod.cuda()
 
         
