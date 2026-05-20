@@ -3,6 +3,7 @@ import gc
 import lpips
 import clip
 import argparse
+import logging
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -42,6 +43,58 @@ def parse_int_list(arg):
 
 def parse_str_list(arg):
     return arg.split(',')
+
+
+def parse_train_timestep_range(arg):
+    """
+    Parse the --train_timestep_range argument into a list of (low, high, weight) tuples.
+
+    Supported formats:
+      - Single value:          "100"       → [(0, 100, 1.0)]
+      - Simple range:          "0,200"     → [(0, 200, 1.0)]
+      - Weighted ranges:        "0,0.5;100,0.3;200,0.2"
+                                 → [(0, 100, 0.5), (100, 200, 0.2), (200, 200, 0.3)]
+      - Weighted ranges (short): "0,0.5;200,0.5"  → [(0, 200, 0.5), (200, 200, 0.5)]
+      - Mixed:                  "0,999"     → [(0, 999, 1.0)]  (full range)
+
+    Returns a list of (low, high, weight) tuples where low/high are ints and weight is float.
+    """
+    arg = arg.strip()
+    if ';' in arg:
+        parts = arg.split(';')
+        ranges = []
+        total_weight = 0.0
+        for p in parts:
+            p = p.strip()
+            if ',' not in p:
+                raise argparse.ArgumentTypeError(
+                    f"Weighted range '{p}' must contain a comma (e.g. '0,0.5')."
+                )
+            val_str, weight_str = p.rsplit(',', 1)
+            val = int(val_str.strip())
+            weight = float(weight_str.strip())
+            if weight < 0:
+                raise argparse.ArgumentTypeError(f"Weight must be non-negative, got {weight}.")
+            low = 0 if val == 0 else val
+            high = val
+            ranges.append((low, high, weight))
+            total_weight += weight
+        if total_weight <= 0:
+            raise argparse.ArgumentTypeError("Total weight must be positive.")
+        return ranges
+    else:
+        vals = [v.strip() for v in arg.split(',')]
+        if len(vals) == 1:
+            high = int(vals[0])
+            return [(0, high, 1.0)]
+        elif len(vals) == 2:
+            low = int(vals[0])
+            high = int(vals[1])
+            return [(low, high, 1.0)]
+        else:
+            raise argparse.ArgumentTypeError(
+                f"Range format expects at most 2 values (low,high), got {len(vals)}: '{arg}'."
+            )
 
 
 def parse_args(input_args=None):
@@ -123,6 +176,20 @@ def parse_args(input_args=None):
     # --- LoRA ---
     parser.add_argument("--lora_rank", default=4, type=int)
 
+    # --- Timestep control ---
+    parser.add_argument("--train_timestep_range", default="0,200", type=parse_train_timestep_range,
+        help="Timestep range(s) for training sampling. Three modes are supported:\n"
+             "  1. Single value:   '100'          → sample uniformly from [0, 100]\n"
+             "  2. Simple range:   '0,200'         → sample uniformly from [0, 200]\n"
+             "  3. Weighted ranges: '0,0.5;100,0.3;200,0.2'\n"
+             "                       → first pick a bucket by weight, then sample uniformly inside it.\n"
+             "  Note: 999 is the scheduler's max timestep (alpha→0 regime). Using smaller values\n"
+             "         avoids the numerically unstable region near alpha=0.\n"
+             "Examples:\n"
+             "  --train_timestep_range '100'           (fixed range [0,100])\n"
+             "  --train_timestep_range '0,200'         (uniform range [0,200])\n"
+             "  --train_timestep_range '0,0.5;200,0.5' (50%% weight for [0,200], 50%% for t=200)")
+
     # --- Resume training ---
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
         help="Path to a checkpoint to resume training from. "
@@ -164,6 +231,25 @@ def main(args):
         kwargs_handlers=[ddp_kwargs],
     )
 
+    # --- File logging (always write to output_dir/train.log) ---
+    log_file = os.path.join(args.output_dir, "train.log")
+    os.makedirs(args.output_dir, exist_ok=True)
+    file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+
+    # Console handler (root logger + tqdm output)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
     if accelerator.is_local_main_process:
         transformers.utils.logging.set_verbosity_warning()
         diffusers.utils.logging.set_verbosity_info()
@@ -187,7 +273,7 @@ def main(args):
             )
             if resume_checkpoint_path is None:
                 if accelerator.is_main_process:
-                    print("[WARNING] No checkpoint found. Starting from scratch.")
+                    logging.warning("[WARNING] No checkpoint found. Starting from scratch.")
         else:
             resume_checkpoint_path = args.resume_from_checkpoint
 
@@ -291,12 +377,18 @@ def main(args):
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
+        logging.info("=" * 60)
+        logging.info("Training config:")
+        for k, v in sorted(vars(args).items()):
+            logging.info(f"  {k}: {v}")
+        logging.info(f"train_timestep_range: {args.train_timestep_range}")
+        logging.info("=" * 60)
 
     # --- Load checkpoint if resuming ---
     start_epoch = 0
     if resume_checkpoint_path is not None:
         if accelerator.is_main_process:
-            print(f"[INFO] Loading checkpoint from: {resume_checkpoint_path}")
+            logging.info(f"[INFO] Loading checkpoint from: {resume_checkpoint_path}")
         checkpoint = torch.load(resume_checkpoint_path, map_location="cpu")
 
         # Load model_gen weights
@@ -311,47 +403,39 @@ def main(args):
 
         # Load optimizer and scheduler states
         if "optimizer_state_dict" in checkpoint and not args.resume_ignore_mismatch:
-            try:
-                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                if accelerator.is_main_process:
-                    print("[INFO] Optimizer state loaded.")
-            except Exception as e:
-                if accelerator.is_main_process:
-                    print(f"[WARNING] Failed to load optimizer state: {e}")
+                try:
+                    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                    logging.info("[INFO] Optimizer state loaded.")
+                except Exception as e:
+                    logging.warning(f"[WARNING] Failed to load optimizer state: {e}")
 
         if "lr_scheduler_state_dict" in checkpoint and not args.resume_ignore_mismatch:
-            try:
-                lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
-                if accelerator.is_main_process:
-                    print("[INFO] LR Scheduler state loaded.")
-            except Exception as e:
-                if accelerator.is_main_process:
-                    print(f"[WARNING] Failed to load scheduler state: {e}")
+                try:
+                    lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
+                    logging.info("[INFO] LR Scheduler state loaded.")
+                except Exception as e:
+                    logging.warning(f"[WARNING] Failed to load scheduler state: {e}")
 
         if "lr_scheduler_reg_state_dict" in checkpoint and not args.resume_ignore_mismatch:
-            try:
-                lr_scheduler_reg.load_state_dict(checkpoint["lr_scheduler_reg_state_dict"])
-                if accelerator.is_main_process:
-                    print("[INFO] Reg LR Scheduler state loaded.")
-            except Exception as e:
-                if accelerator.is_main_process:
-                    print(f"[WARNING] Failed to load reg scheduler state: {e}")
+                try:
+                    lr_scheduler_reg.load_state_dict(checkpoint["lr_scheduler_reg_state_dict"])
+                    logging.info("[INFO] Reg LR Scheduler state loaded.")
+                except Exception as e:
+                    logging.warning(f"[WARNING] Failed to load reg scheduler state: {e}")
 
         if "optimizer_reg_state_dict" in checkpoint and not args.resume_ignore_mismatch:
-            try:
-                optimizer_reg.load_state_dict(checkpoint["optimizer_reg_state_dict"])
-                if accelerator.is_main_process:
-                    print("[INFO] Reg Optimizer state loaded.")
-            except Exception as e:
-                if accelerator.is_main_process:
-                    print(f"[WARNING] Failed to load reg optimizer state: {e}")
+                try:
+                    optimizer_reg.load_state_dict(checkpoint["optimizer_reg_state_dict"])
+                    logging.info("[INFO] Reg Optimizer state loaded.")
+                except Exception as e:
+                    logging.warning(f"[WARNING] Failed to load reg optimizer state: {e}")
 
         # Get starting step and epoch
         start_epoch = checkpoint.get("epoch", 0)
         global_step = checkpoint.get("global_step", 0)
 
         if accelerator.is_main_process:
-            print(f"[INFO] Resuming from epoch {start_epoch}, step {global_step}")
+            logging.info(f"[INFO] Resuming from epoch {start_epoch}, step {global_step}")
 
     # Initialize step tracking for non-resume case
     if 'global_step' not in dir():
@@ -364,7 +448,12 @@ def main(args):
         disable=not accelerator.is_local_main_process)
 
     # --- Training loop ---
+    epoch_loss_sum = 0.0
+    epoch_loss_count = 0
     for epoch in range(start_epoch, args.num_training_epochs):
+        logging.info(f"--- Epoch {epoch} started ---")
+        epoch_loss_sum = 0.0
+        epoch_loss_count = 0
         for step, batch in enumerate(dl_train):
             m_acc = [model_gen, model_reg]
             with accelerator.accumulate(*m_acc):
@@ -462,9 +551,20 @@ def main(args):
                             epoch=epoch,
                             additional_info={"reg_checkpoint": reg_checkpoint}
                         )
-                        print(f"\n[Saved] {outf}")
+                        logging.info(f"[Checkpoint] Step={global_step} | loss={loss.item():.6f} | Saved: {outf}")
 
                     accelerator.log(logs, step=global_step)
+
+                    # Write step-level loss to log file every 10 steps
+                    if global_step % 10 == 0:
+                        logging.info(
+                            f"step={global_step} | loss={loss.item():.6f} | "
+                            f"loss_l2={loss_l2.item():.6f} | loss_lpips={loss_lpips.item():.6f} | "
+                            f"loss_kl={loss_kl.item():.6f} | loss_d={loss_d.item():.6f} | "
+                            f"lr={lr_scheduler.get_last_lr()[0]:.2e}"
+                        )
+                    epoch_loss_sum += loss.item()
+                    epoch_loss_count += 1
 
             # Safety: prevent infinite loop in debug
             if global_step >= args.max_train_steps:
@@ -472,6 +572,9 @@ def main(args):
 
         if global_step >= args.max_train_steps:
             break
+
+        avg_epoch_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count > 0 else 0
+        logging.info(f"--- Epoch {epoch} finished, steps so far: {global_step}, avg_loss={avg_epoch_loss:.6f} ---")
 
     # --- Final save ---
     if accelerator.is_main_process:
@@ -492,7 +595,7 @@ def main(args):
             epoch=epoch,
             additional_info={"reg_checkpoint": reg_checkpoint}
         )
-        print(f"\n[Final model saved] {final_path}")
+        logging.info(f"[Final] Training complete. Model saved: {final_path}")
 
     accelerator.end_training()
 
