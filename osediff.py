@@ -16,7 +16,7 @@ from peft import LoraConfig
 
 from my_utils.vaehook import VAEHook, perfcount
 
-def initialize_vae(args, vae_in_channels=None):
+def initialize_vae(args, vae_in_channels=None, add_lora=True):
     vae_dir = os.path.join(args.pretrained_model_name_or_path, "vae")
     with open(os.path.join(vae_dir, "config.json"), "r") as f:
         vae_config = json.load(f)
@@ -67,8 +67,9 @@ def initialize_vae(args, vae_in_channels=None):
             elif ('quant_conv' in n) and ('post_quant_conv' not in n):
                 l_target_modules_encoder.append(n.replace(".weight",""))
     
-    lora_conf_encoder = LoraConfig(r=args.lora_rank, init_lora_weights="gaussian",target_modules=l_target_modules_encoder)
-    vae.add_adapter(lora_conf_encoder, adapter_name="default_encoder")
+    if add_lora:
+        lora_conf_encoder = LoraConfig(r=args.lora_rank, init_lora_weights="gaussian",target_modules=l_target_modules_encoder)
+        vae.add_adapter(lora_conf_encoder, adapter_name="default_encoder")
 
     return vae, l_target_modules_encoder
 
@@ -393,7 +394,7 @@ class OSEDiff_test(torch.nn.Module):
         self.noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
         self.noise_scheduler.set_timesteps(1, device="cuda")
         vae_in_channels = getattr(args, 'vae_in_channels', None)
-        self.vae, _ = initialize_vae(args, vae_in_channels=vae_in_channels)
+        self.vae, _ = initialize_vae(args, vae_in_channels=vae_in_channels, add_lora=False)
         unet_dir = os.path.join(self.args.pretrained_model_name_or_path, "unet")
         with open(os.path.join(unet_dir, "config.json"), "r") as f:
             unet_config = json.load(f)
@@ -626,7 +627,7 @@ class OSEDiff_inference_time(torch.nn.Module):
         self.noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
         self.noise_scheduler.set_timesteps(1, device="cuda")
         vae_in_channels = getattr(args, 'vae_in_channels', None)
-        self.vae, _ = initialize_vae(args, vae_in_channels=vae_in_channels)
+        self.vae, _ = initialize_vae(args, vae_in_channels=vae_in_channels, add_lora=False)
         unet_dir = os.path.join(self.args.pretrained_model_name_or_path, "unet")
         with open(os.path.join(unet_dir, "config.json"), "r") as f:
             unet_config = json.load(f)
