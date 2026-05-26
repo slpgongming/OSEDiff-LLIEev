@@ -181,7 +181,18 @@ class OSEDiffHDRevGen(torch.nn.Module):
         if return_target_latent:
             target_latent = self.encode_target_latent(batch["output_pixel_values"])
 
-        return output_image, x_denoised, prompt_embeds, neg_prompt_embeds, start_latent, target_latent
+        # Return model_pred and timesteps so the training loop can tell whether
+        # NaNs first appear in the UNet prediction or inside scheduler.step().
+        return (
+            output_image,
+            x_denoised,
+            prompt_embeds,
+            neg_prompt_embeds,
+            start_latent,
+            target_latent,
+            model_pred,
+            timesteps,
+        )
 
     def load_ckpt(self, checkpoint, strict=True):
         for name, param in self.unet.named_parameters():

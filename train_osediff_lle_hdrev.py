@@ -19,6 +19,13 @@ from osediff import OSEDiff_reg
 from osediff_hdrev import OSEDiffHDRevGen, tensor_stats
 
 
+def tensor_is_finite(tensor):
+    """Return 1.0 when all tensor values are finite, else 0.0 for tracker logging."""
+    if tensor is None:
+        return 1.0
+    return float(torch.isfinite(tensor.detach()).all().item())
+
+
 def parse_train_timestep_range(arg):
     """Parse fixed/range/weighted timestep options used by the OSEDiff one-step scheduler."""
     arg = arg.strip()
@@ -296,7 +303,16 @@ def main(args):
 
                 x_tgt = batch["output_pixel_values"]
                 need_target_latent = args.lambda_latent_align > 0
-                x_tgt_pred, latents_pred, prompt_embeds, neg_prompt_embeds, start_latent, target_latent = model_gen(
+                (
+                    x_tgt_pred,
+                    latents_pred,
+                    prompt_embeds,
+                    neg_prompt_embeds,
+                    start_latent,
+                    target_latent,
+                    model_pred,
+                    sampled_timesteps,
+                ) = model_gen(
                     batch,
                     args=args,
                     return_target_latent=need_target_latent,
@@ -360,10 +376,17 @@ def main(args):
 
                 if accelerator.is_main_process:
                     start_stats = tensor_stats(start_latent)
+                    model_pred_stats = tensor_stats(model_pred)
                     denoised_stats = tensor_stats(latents_pred)
                     target_stats = tensor_stats(target_latent) if target_latent is not None else None
                     output_stats = tensor_stats(x_tgt_pred)
                     event_sparsity = (batch["event_voxel"] != 0).float().mean().item()
+                    finite_flags = {
+                        "start_latent_finite": tensor_is_finite(start_latent),
+                        "model_pred_finite": tensor_is_finite(model_pred),
+                        "x_denoised_finite": tensor_is_finite(latents_pred),
+                        "output_finite": tensor_is_finite(x_tgt_pred),
+                    }
 
                     logs = {
                         "loss": loss.detach().item(),
@@ -375,24 +398,70 @@ def main(args):
                         "lr": lr_scheduler.get_last_lr()[0],
                         "start_latent_mean": start_stats["mean"],
                         "start_latent_std": start_stats["std"],
+                        "model_pred_mean": model_pred_stats["mean"],
+                        "model_pred_std": model_pred_stats["std"],
                         "x_denoised_mean": denoised_stats["mean"],
                         "x_denoised_std": denoised_stats["std"],
                         "event_sparsity": event_sparsity,
                         "output_min": output_stats["min"],
                         "output_max": output_stats["max"],
+                        **finite_flags,
                     }
                     if target_stats is not None:
                         logs["target_latent_mean"] = target_stats["mean"]
                         logs["target_latent_std"] = target_stats["std"]
+                        logs["target_latent_min"] = target_stats["min"]
+                        logs["target_latent_max"] = target_stats["max"]
 
                     progress_bar.set_postfix(loss=logs["loss"], loss_latent=logs["loss_latent"])
                     accelerator.log(logs, step=global_step)
+
+                    if min(finite_flags.values()) < 1.0:
+                        # Keep training behavior unchanged for now, but emit enough
+                        # context to identify whether NaN appears before or after
+                        # scheduler.step().
+                        logging.warning(
+                            "[NonFinite] step=%d timestep=%s loss=%.6f "
+                            "start_finite=%.0f model_pred_finite=%.0f x_denoised_finite=%.0f output_finite=%.0f "
+                            "start(mean/std/min/max)=%.4f/%.4f/%.4f/%.4f "
+                            "model_pred(mean/std/min/max)=%.4f/%.4f/%.4f/%.4f "
+                            "denoised(mean/std/min/max)=%.4f/%.4f/%.4f/%.4f "
+                            "target(mean/std/min/max)=%s event_sparsity=%.6f",
+                            global_step,
+                            sampled_timesteps.detach().cpu().tolist(),
+                            logs["loss"],
+                            finite_flags["start_latent_finite"],
+                            finite_flags["model_pred_finite"],
+                            finite_flags["x_denoised_finite"],
+                            finite_flags["output_finite"],
+                            start_stats["mean"],
+                            start_stats["std"],
+                            start_stats["min"],
+                            start_stats["max"],
+                            model_pred_stats["mean"],
+                            model_pred_stats["std"],
+                            model_pred_stats["min"],
+                            model_pred_stats["max"],
+                            denoised_stats["mean"],
+                            denoised_stats["std"],
+                            denoised_stats["min"],
+                            denoised_stats["max"],
+                            (
+                                f"{target_stats['mean']:.4f}/{target_stats['std']:.4f}/"
+                                f"{target_stats['min']:.4f}/{target_stats['max']:.4f}"
+                                if target_stats is not None
+                                else "None"
+                            ),
+                            event_sparsity,
+                        )
 
                     if global_step % 10 == 0:
                         logging.info(
                             "step=%d loss=%.6f l2=%.6f lpips=%.6f kl=%.6f latent=%.6f "
                             "start(mean/std/min/max)=%.4f/%.4f/%.4f/%.4f "
-                            "denoised(mean/std)=%.4f/%.4f event_sparsity=%.6f output(min/max)=%.4f/%.4f",
+                            "model_pred(mean/std/min/max)=%.4f/%.4f/%.4f/%.4f "
+                            "denoised(mean/std)=%.4f/%.4f event_sparsity=%.6f "
+                            "finite(start/pred/den/out)=%.0f/%.0f/%.0f/%.0f output(min/max)=%.4f/%.4f",
                             global_step,
                             logs["loss"],
                             logs["loss_l2"],
@@ -403,9 +472,17 @@ def main(args):
                             start_stats["std"],
                             start_stats["min"],
                             start_stats["max"],
+                            model_pred_stats["mean"],
+                            model_pred_stats["std"],
+                            model_pred_stats["min"],
+                            model_pred_stats["max"],
                             denoised_stats["mean"],
                             denoised_stats["std"],
                             event_sparsity,
+                            finite_flags["start_latent_finite"],
+                            finite_flags["model_pred_finite"],
+                            finite_flags["x_denoised_finite"],
+                            finite_flags["output_finite"],
                             output_stats["min"],
                             output_stats["max"],
                         )

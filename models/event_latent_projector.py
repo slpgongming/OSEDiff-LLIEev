@@ -21,6 +21,7 @@ class EventPyramidLatentProjector(nn.Module):
         conditioning_channels: Sequence[int] = (64, 128, 256, 512),
         block_out_channels: Sequence[int] = (16, 32, 96, 256),
         downsample: bool = True,
+        use_input_groupnorm: bool = True,
     ):
         super().__init__()
         if len(conditioning_channels) != 4 or len(block_out_channels) != 4:
@@ -31,6 +32,17 @@ class EventPyramidLatentProjector(nn.Module):
 
         self.conditioning_channels: Tuple[int, ...] = conditioning_channels
         self.block_out_channels: Tuple[int, ...] = block_out_channels
+        self.use_input_groupnorm = use_input_groupnorm
+
+        # Normalize each HDRev feature level before pyramid fusion. This stabilizes
+        # feature scale drift without normalizing the final 4-channel latent, where
+        # global exposure/brightness information should remain available.
+        self.input_norms = nn.ModuleList(
+            [
+                nn.GroupNorm(num_groups=self._safe_num_groups(ch), num_channels=ch)
+                for ch in conditioning_channels
+            ]
+        )
 
         self.conv_in = nn.Conv2d(conditioning_channels[0], block_out_channels[0], kernel_size=3, padding=1)
         self.blocks = nn.ModuleList()
@@ -57,9 +69,23 @@ class EventPyramidLatentProjector(nn.Module):
             padding=1,
         )
 
+    @staticmethod
+    def _safe_num_groups(channels: int, max_groups: int = 32) -> int:
+        """Choose the largest GroupNorm group count up to max_groups that divides channels."""
+        for groups in range(min(max_groups, channels), 0, -1):
+            if channels % groups == 0:
+                return groups
+        return 1
+
     def forward(self, conditioning):
         if len(conditioning) != 4:
             raise ValueError(f"Expected four HDRev feature maps, got {len(conditioning)}.")
+
+        if self.use_input_groupnorm:
+            conditioning = [
+                norm(feature)
+                for norm, feature in zip(self.input_norms, conditioning)
+            ]
 
         embedding = F.silu(self.conv_in(conditioning[0]))
         for block, condition in zip(self.blocks, conditioning):

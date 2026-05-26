@@ -51,7 +51,7 @@ def main(args):
         )
         start_latent = model.event_latent_projector(hdrev_features)
         target_latent = model.encode_target_latent(batch["output_pixel_values"])
-        output, x_denoised, *_ = model(batch, args=args, return_target_latent=False)
+        output, x_denoised, *_, model_pred, sampled_timesteps = model(batch, args=args, return_target_latent=False)
 
     print("===== Stage 3 HDRev shape smoke test =====")
     print(f"low_rgb [-1,1]:      {tuple(batch['conditioning_pixel_values'].shape)}")
@@ -61,8 +61,10 @@ def main(args):
         print(f"hdrev_feature[{idx}]: {tuple(feat.shape)}")
     print(f"start_latent:        {tuple(start_latent.shape)} stats={tensor_stats(start_latent)}")
     print(f"target_latent:       {tuple(target_latent.shape)} stats={tensor_stats(target_latent)}")
+    print(f"model_pred:          {tuple(model_pred.shape)} stats={tensor_stats(model_pred)}")
     print(f"x_denoised:          {tuple(x_denoised.shape)} stats={tensor_stats(x_denoised)}")
     print(f"output:              {tuple(output.shape)} stats={tensor_stats(output)}")
+    print(f"sampled_timestep:    {sampled_timesteps.detach().cpu().tolist()}")
     print(f"event_sparsity:      {(batch['event_voxel'] != 0).float().mean().item():.8f}")
 
 
