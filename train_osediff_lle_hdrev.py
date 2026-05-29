@@ -3,6 +3,14 @@ import logging
 import os
 from pathlib import Path
 
+# Some managed/HPC environments ship an incomplete CA certificate chain.
+# Set these at process startup, before Accelerate can initialize wandb, so all
+# torchrun ranks inherit the same SSL behavior. WANDB_INSECURE is kept for
+# compatibility with older W&B versions; WANDB_INSECURE_DISABLE_SSL matches the
+# current W&B Settings field `insecure_disable_ssl`.
+os.environ["WANDB_INSECURE"] = "true"
+os.environ["WANDB_INSECURE_DISABLE_SSL"] = "true"
+
 import diffusers
 import lpips
 import torch
@@ -60,11 +68,28 @@ def parse_args(input_args=None):
     parser.add_argument("--test_data_root", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="experience/osediff_lle_hdrev_stage3")
     parser.add_argument("--pretrained_model_name_or_path", type=str, required=True)
-    parser.add_argument("--hdrev_pretrained_root", type=str, default="checkpoints/HDRev")
+    parser.add_argument(
+        "--hdrev_pretrained_root",
+        type=str,
+        default="checkpoints/HDRev",
+        help=(
+            "Original HDRev checkpoint root. Used only when "
+            "--encoder_projector_pretrain_path is not provided."
+        ),
+    )
     parser.add_argument("--hdrev_encoder_i_path", type=str, default=None)
     parser.add_argument("--hdrev_encoder_e_path", type=str, default=None)
     parser.add_argument("--hdrev_merge_path", type=str, default=None)
     parser.add_argument("--hdrev_decoder_path", type=str, default=None)
+    parser.add_argument(
+        "--encoder_projector_pretrain_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional clean-latent pretrain checkpoint used to initialize "
+            "HDRevEncoder and EventPyramidLatentProjector before Stage 3 training."
+        ),
+    )
 
     # Data
     parser.add_argument("--resolution", type=int, default=256)
@@ -122,8 +147,29 @@ def parse_args(input_args=None):
 
     # Logging / resume
     parser.add_argument("--logging_dir", type=str, default="logs")
-    parser.add_argument("--report_to", type=str, default="tensorboard")
+    parser.add_argument("--report_to", type=str, default="wandb")
     parser.add_argument("--tracker_project_name", type=str, default="train_osediff_lle_hdrev")
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default=None,
+        help="W&B project name. Defaults to tracker_project_name when report_to uses wandb.",
+    )
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Optional W&B run name.")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="Optional W&B entity/team.")
+    parser.add_argument(
+        "--wandb_tags",
+        type=str,
+        default=None,
+        help="Comma-separated W&B tags, e.g. stage3,hdrev,pretrain-init.",
+    )
+    parser.add_argument(
+        "--wandb_mode",
+        type=str,
+        default=None,
+        choices=["online", "offline", "disabled"],
+        help="Optional W&B mode. Use offline when the server has no internet during training.",
+    )
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--resume_ignore_mismatch", action="store_true")
 
@@ -188,6 +234,22 @@ def main(args):
 
     model_gen = OSEDiffHDRevGen(args)
     model_gen.set_train()
+    if args.encoder_projector_pretrain_path and args.resume_from_checkpoint:
+        logging.warning(
+            "[PretrainInit] Ignoring encoder_projector_pretrain_path because "
+            "resume_from_checkpoint restores the full Stage 3 training state."
+        )
+    elif args.encoder_projector_pretrain_path:
+        # Clean-latent pretraining teaches HDRevEncoder + pyramid projector to
+        # produce scaled SD-VAE clean latents. Stage 3 then starts from those
+        # weights while UNet LoRA/VSD components remain freshly initialized.
+        pretrain_checkpoint = torch.load(args.encoder_projector_pretrain_path, map_location="cpu")
+        model_gen.load_encoder_projector_pretrain(
+            pretrain_checkpoint,
+            strict=not args.resume_ignore_mismatch,
+        )
+        logging.info("[PretrainInit] Loaded HDRev/projector weights from %s", args.encoder_projector_pretrain_path)
+
     model_reg = OSEDiff_reg(args=args, accelerator=accelerator)
     model_reg.set_train()
     net_lpips = lpips.LPIPS(net="vgg").cuda()
@@ -261,7 +323,38 @@ def main(args):
 
     if accelerator.is_main_process:
         tracker_config = {k: (str(v) if isinstance(v, (list, tuple)) else v) for k, v in vars(args).items()}
-        accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
+        init_kwargs = {}
+        report_targets = [target.strip() for target in args.report_to.split(",")]
+        uses_wandb = args.report_to == "all" or "wandb" in report_targets
+        if uses_wandb:
+            import wandb
+
+            # Only the main process initializes the W&B run through Accelerate.
+            # These kwargs keep run naming/grouping explicit for multi-GPU
+            # torchrun jobs while leaving tensorboard behavior unchanged.
+            wandb_kwargs = {}
+            if args.wandb_run_name:
+                wandb_kwargs["name"] = args.wandb_run_name
+            if args.wandb_entity:
+                wandb_kwargs["entity"] = args.wandb_entity
+            if args.wandb_tags:
+                wandb_kwargs["tags"] = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
+            if args.wandb_mode:
+                wandb_kwargs["mode"] = args.wandb_mode
+            # Explicitly pass the SSL bypass through wandb.init as well as the
+            # environment. This covers W&B versions where WANDB_INSECURE is
+            # ignored but Settings(insecure_disable_ssl=True) is honored.
+            try:
+                wandb_kwargs["settings"] = wandb.Settings(insecure_disable_ssl=True)
+            except TypeError:
+                logging.warning(
+                    "This wandb version does not accept Settings(insecure_disable_ssl=True); "
+                    "falling back to WANDB_INSECURE/WANDB_INSECURE_DISABLE_SSL environment variables."
+                )
+            init_kwargs["wandb"] = wandb_kwargs
+
+        tracker_project_name = args.wandb_project if uses_wandb and args.wandb_project else args.tracker_project_name
+        accelerator.init_trackers(tracker_project_name, config=tracker_config, init_kwargs=init_kwargs)
         logging.info("===== Stage 3 HDRev training config =====")
         for key, value in sorted(vars(args).items()):
             logging.info(f"  {key}: {value}")

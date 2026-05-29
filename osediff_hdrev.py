@@ -70,6 +70,7 @@ class OSEDiffHDRevGen(torch.nn.Module):
 
         self.vae = initialize_frozen_vae(args)
         self.unet, self.lora_unet_modules_encoder, self.lora_unet_modules_decoder, self.lora_unet_others = initialize_unet(args)
+        use_encoder_projector_pretrain = bool(getattr(args, "encoder_projector_pretrain_path", None))
         self.hdrev_encoder = HDRevEncoder(
             num_bins=args.num_bins,
             pretrained_root=args.hdrev_pretrained_root,
@@ -77,7 +78,11 @@ class OSEDiffHDRevGen(torch.nn.Module):
             pretrained_e_path=getattr(args, "hdrev_encoder_e_path", None),
             pretrained_merge_path=getattr(args, "hdrev_merge_path", None),
             pretrained_d_path=getattr(args, "hdrev_decoder_path", None),
-            load_pretrained=True,
+            # When clean-latent pretraining is provided, Stage 3 should be
+            # initialized directly from that checkpoint. Skipping the original
+            # HDRev load means Linux training only needs the pretrain checkpoint,
+            # not the separate checkpoints/HDRev files.
+            load_pretrained=not use_encoder_projector_pretrain,
         )
         self.event_latent_projector = EventPyramidLatentProjector(latent_channels=4)
 
@@ -201,6 +206,25 @@ class OSEDiffHDRevGen(torch.nn.Module):
 
         self.hdrev_encoder.load_state_dict(checkpoint["state_dict_hdrev_encoder"], strict=strict)
         self.event_latent_projector.load_state_dict(checkpoint["state_dict_event_latent_projector"], strict=strict)
+
+    def load_encoder_projector_pretrain(self, checkpoint, strict=True):
+        """
+        Initialize Stage 3 HDRev/projector from clean-latent pretraining.
+
+        The pretrain checkpoint only contains the event-aware encoder and
+        pyramid latent projector. UNet LoRA, VSD regularizer, scheduler state,
+        and optimizer state remain freshly initialized for the Stage 3 run.
+        """
+        if "state_dict_hdrev_encoder" not in checkpoint:
+            raise KeyError("Pretrain checkpoint is missing state_dict_hdrev_encoder.")
+        if "state_dict_event_latent_projector" not in checkpoint:
+            raise KeyError("Pretrain checkpoint is missing state_dict_event_latent_projector.")
+
+        self.hdrev_encoder.load_state_dict(checkpoint["state_dict_hdrev_encoder"], strict=strict)
+        self.event_latent_projector.load_state_dict(
+            checkpoint["state_dict_event_latent_projector"],
+            strict=strict,
+        )
 
     def save_model(
         self,
