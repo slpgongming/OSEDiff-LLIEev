@@ -3,6 +3,14 @@ import logging
 import os
 from pathlib import Path
 
+# Some managed/HPC environments ship an incomplete CA certificate chain.
+# Set these at process startup, before Accelerate can initialize wandb, so all
+# torchrun ranks inherit the same SSL behavior. WANDB_INSECURE is kept for
+# compatibility with older W&B versions; WANDB_INSECURE_DISABLE_SSL matches the
+# current W&B Settings field `insecure_disable_ssl`.
+os.environ["WANDB_INSECURE"] = "true"
+os.environ["WANDB_INSECURE_DISABLE_SSL"] = "true"
+
 import diffusers
 import lpips
 import torch
@@ -35,6 +43,176 @@ def find_latest_checkpoint(checkpoint_dir):
         return None
     checkpoints.sort(key=lambda x: int(x.replace("model_", "").replace(".pkl", "")))
     return os.path.join(checkpoint_dir, checkpoints[-1])
+
+
+def tracker_uses_wandb(report_to):
+    """Return True when Accelerate should initialize a Weights & Biases tracker."""
+    if report_to is None:
+        return False
+    if isinstance(report_to, str):
+        trackers = [item.strip().lower() for item in report_to.split(",")]
+    else:
+        trackers = [str(item).strip().lower() for item in report_to]
+    return "wandb" in trackers or "all" in trackers
+
+
+def build_tracker_init_kwargs(args):
+    """Build optional tracker-specific init kwargs without requiring wandb for tensorboard-only runs."""
+    init_kwargs = {}
+    if tracker_uses_wandb(args.report_to):
+        import wandb
+
+        wandb_kwargs = {}
+        if args.wandb_entity:
+            wandb_kwargs["entity"] = args.wandb_entity
+        if args.wandb_run_name:
+            wandb_kwargs["name"] = args.wandb_run_name
+        if args.wandb_group:
+            wandb_kwargs["group"] = args.wandb_group
+        if args.wandb_tags:
+            # Tags are stored as a comma-separated CLI string to keep torchrun
+            # commands reproducible and shell-friendly.
+            wandb_kwargs["tags"] = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
+        if args.wandb_mode:
+            # mode can be online/offline/disabled. Passing it through wandb.init
+            # is clearer than relying on environment variables hidden elsewhere.
+            wandb_kwargs["mode"] = args.wandb_mode
+        # Explicitly pass the SSL bypass through wandb.init as well as the
+        # environment. This covers W&B versions where WANDB_INSECURE is ignored
+        # but Settings(insecure_disable_ssl=True) is honored.
+        try:
+            wandb_kwargs["settings"] = wandb.Settings(insecure_disable_ssl=True)
+        except TypeError:
+            logging.warning(
+                "This wandb version does not accept Settings(insecure_disable_ssl=True); "
+                "falling back to WANDB_INSECURE/WANDB_INSECURE_DISABLE_SSL environment variables."
+            )
+        init_kwargs["wandb"] = wandb_kwargs
+    return init_kwargs
+
+
+def ensure_wandb_available(args):
+    """Fail early with a clear install hint when wandb logging is requested."""
+    if not tracker_uses_wandb(args.report_to):
+        return
+    os.environ["WANDB_INSECURE"] = "true"
+    os.environ["WANDB_INSECURE_DISABLE_SSL"] = "true"
+    try:
+        import wandb  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "Weights & Biases logging was requested with --report_to wandb, "
+            "but the wandb package is not installed. Activate the osediff "
+            "environment and run: pip install wandb"
+        ) from exc
+
+
+def _tensor_to_uint8_hwc(tensor, value_range):
+    """
+    Convert one image tensor to uint8 HWC for wandb.Image.
+
+    value_range:
+      - "zero_one": tensor is RGB in [0, 1], e.g. HDRev low-light input.
+      - "minus_one_one": tensor is RGB in [-1, 1], e.g. VAE decode / GT.
+    """
+    image = tensor.detach().float().cpu()
+    if value_range == "minus_one_one":
+        image = (image + 1.0) * 0.5
+    elif value_range != "zero_one":
+        raise ValueError(f"Unknown image value range: {value_range}")
+    image = image.clamp(0.0, 1.0)
+    image = image.permute(1, 2, 0).numpy()
+    return (image * 255.0 + 0.5).astype("uint8")
+
+
+def _event_voxel_to_uint8_hwc(event_voxel):
+    """
+    Convert one voxelized event tensor to a color time-bin panel.
+
+    Input shape is [num_bins, H, W]. Each bin is rendered as RGB:
+      positive events -> red, negative events -> blue, zero/no event -> black.
+    Bins are concatenated horizontally so temporal distribution, polarity, and
+    event sparsity can be inspected in one wandb thumbnail.
+    """
+    import numpy as np
+
+    voxel = event_voxel.detach().float().cpu()
+    max_abs = voxel.abs().amax().clamp(min=1e-6)
+    voxel = (voxel / max_abs).clamp(-1.0, 1.0)
+
+    bin_images = []
+    for bin_idx in range(voxel.shape[0]):
+        event_bin = voxel[bin_idx].numpy()
+        rgb = np.zeros((event_bin.shape[0], event_bin.shape[1], 3), dtype=np.float32)
+        rgb[..., 0] = np.clip(event_bin, 0.0, 1.0)
+        rgb[..., 2] = np.clip(-event_bin, 0.0, 1.0)
+        bin_images.append((rgb * 255.0 + 0.5).astype("uint8"))
+
+    return np.concatenate(bin_images, axis=1)
+
+
+def log_wandb_train_images(accelerator, args, batch, image_pred, global_step):
+    """
+    Log compact low/pred/GT and event voxel panels to wandb.
+
+    The tensors use different normalization conventions in this pretrain stage:
+    hdrev_pixel_values is [0, 1], while image_pred/output_pixel_values are
+    [-1, 1]. Keeping this conversion explicit prevents misleading monitoring
+    images caused by accidentally double-normalizing low-light inputs. The event
+    voxel is logged as a separate time-bin panel because concatenating all bins
+    into the RGB image strip would make the reconstruction panel too wide.
+    """
+    if not tracker_uses_wandb(args.report_to):
+        return
+    if args.wandb_log_image_steps <= 0 or args.wandb_num_images <= 0:
+        return
+    if global_step % args.wandb_log_image_steps != 0:
+        return
+
+    try:
+        import numpy as np
+        import wandb
+    except ImportError:
+        logging.warning(
+            "wandb image logging requested but wandb/numpy is unavailable. "
+            "Install wandb or set --wandb_log_image_steps 0."
+        )
+        return
+
+    low_images = batch["hdrev_pixel_values"]
+    target_images = batch["output_pixel_values"]
+    event_voxels = batch["event_voxel"]
+    max_images = min(args.wandb_num_images, low_images.shape[0])
+    image_panels = []
+    event_panels = []
+    scenes = batch.get("scene", ["unknown"] * max_images)
+    sample_indices = batch.get("sample_index", ["unknown"] * max_images)
+
+    for idx in range(max_images):
+        # The image panel is horizontally concatenated as low input, decoded
+        # prediction, and normal-light GT. This makes exposure and color drift
+        # visible without mixing image ranges with event voxel values.
+        low = _tensor_to_uint8_hwc(low_images[idx], "zero_one")
+        pred = _tensor_to_uint8_hwc(image_pred[idx], "minus_one_one")
+        gt = _tensor_to_uint8_hwc(target_images[idx], "minus_one_one")
+        image_panel = np.concatenate([low, pred, gt], axis=1)
+        event_panel = _event_voxel_to_uint8_hwc(event_voxels[idx])
+        caption_base = f"step={global_step} scene={scenes[idx]} sample={sample_indices[idx]}"
+        image_panels.append(wandb.Image(image_panel, caption=f"{caption_base} columns=low|pred|gt"))
+        event_panels.append(
+            wandb.Image(
+                event_panel,
+                caption=f"{caption_base} event_bins=left_to_right positive=red negative=blue",
+            )
+        )
+
+    accelerator.get_tracker("wandb").log(
+        {
+            "train/low_pred_gt": image_panels,
+            "train/event_voxel_bins": event_panels,
+        },
+        step=global_step,
+    )
 
 
 class HDRevCleanLatentPretrain(torch.nn.Module):
@@ -239,6 +417,13 @@ def parse_args(input_args=None):
     parser.add_argument("--logging_dir", type=str, default="logs")
     parser.add_argument("--report_to", type=str, default="tensorboard")
     parser.add_argument("--tracker_project_name", type=str, default="train_osediff_lle_hdrev_clean_latent")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--wandb_group", type=str, default=None)
+    parser.add_argument("--wandb_tags", type=str, default=None)
+    parser.add_argument("--wandb_mode", type=str, default=None, choices=[None, "online", "offline", "disabled"])
+    parser.add_argument("--wandb_log_image_steps", type=int, default=1000)
+    parser.add_argument("--wandb_num_images", type=int, default=2)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--resume_ignore_mismatch", action="store_true")
 
@@ -260,6 +445,7 @@ def trainable_parameters(model):
 def main(args):
     if args.test_data_root is None:
         args.test_data_root = args.train_data_root
+    ensure_wandb_available(args)
 
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
@@ -339,7 +525,12 @@ def main(args):
 
     if accelerator.is_main_process:
         tracker_config = {k: (str(v) if isinstance(v, (list, tuple)) else v) for k, v in vars(args).items()}
-        accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
+        tracker_init_kwargs = build_tracker_init_kwargs(args)
+        accelerator.init_trackers(
+            args.tracker_project_name,
+            config=tracker_config,
+            init_kwargs=tracker_init_kwargs,
+        )
         logging.info("===== Clean latent pretrain config =====")
         for key, value in sorted(vars(args).items()):
             logging.info(f"  {key}: {value}")
@@ -431,8 +622,14 @@ def main(args):
                         "event_sparsity": event_sparsity,
                         **finite_flags,
                     }
+                    if torch.cuda.is_available():
+                        # Rank-0 memory is logged as a lightweight health signal.
+                        # It helps catch unexpected activation/checkpoint growth
+                        # when changing image size, batch size, or loss branches.
+                        logs["cuda_max_memory_allocated_gb"] = torch.cuda.max_memory_allocated() / (1024 ** 3)
                     progress_bar.set_postfix(loss=logs["loss"], latent=logs["loss_latent"])
                     accelerator.log(logs, step=global_step)
+                    log_wandb_train_images(accelerator, args, batch, image_pred, global_step)
 
                     if global_step % 10 == 0:
                         logging.info(
