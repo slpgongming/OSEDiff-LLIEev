@@ -340,6 +340,19 @@ class OSEDiffHDRevTest(torch.nn.Module):
             event_voxel.to(self.device, dtype=self.weight_dtype),
         )
         start_latent = self.event_latent_projector(hdrev_features)
-        model_pred = self.unet(start_latent, self.timesteps, encoder_hidden_states=prompt_embeds).sample
+        # Keep text conditioning in the same precision as the inference UNet.
+        # This mirrors the original OSEDiff fp16 inference path and avoids
+        # mixed dtype attention inputs when --mixed_precision fp16 is used.
+        model_pred = self.unet(
+            start_latent,
+            self.timesteps,
+            encoder_hidden_states=prompt_embeds.to(dtype=self.weight_dtype),
+        ).sample
         x_denoised = self.noise_scheduler.step(model_pred, self.timesteps, start_latent, return_dict=True).prev_sample
-        return self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample.clamp(-1, 1)
+        vae_dtype = next(self.vae.parameters()).dtype
+        # DDPMScheduler arithmetic can promote the denoised latent back to
+        # float32 even when model_pred/start_latent are fp16. Cast immediately
+        # before VAE decode so z matches the fp16 post_quant_conv weights.
+        return self.vae.decode(
+            x_denoised.to(device=self.device, dtype=vae_dtype) / self.vae.config.scaling_factor
+        ).sample.clamp(-1, 1)

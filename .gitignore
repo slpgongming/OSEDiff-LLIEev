@@ -6,6 +6,5 @@ __pycache__/
 *.md
 checkpoints/
 output_lle/
-references/
 experience/
 output_lle_event/
