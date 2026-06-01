@@ -24,6 +24,8 @@ torchrun --nproc_per_node "${NPROC_PER_NODE}" train_stage2_lle_control.py \
   --control_alpha_init 1.0 \
   --control_alpha_final 1.0 \
   --control_alpha_warmup_steps 1 \
+  --control_condition_scale 0.1 \
+  --control_condition_clamp 5.0 \
   --lr 5e-5 \
   --lr_vae_lora 1e-5 \
   --lr_unet_lora 1e-5 \
@@ -31,6 +33,7 @@ torchrun --nproc_per_node "${NPROC_PER_NODE}" train_stage2_lle_control.py \
   --dataloader_num_workers 4 \
   --max_train_steps 100000 \
   --checkpointing_steps 1000 \
+  --log_interval 10 \
   --use_wandb \
   --wandb_project event_guided_osediff \
   --wandb_run_name stage2_lle_control \

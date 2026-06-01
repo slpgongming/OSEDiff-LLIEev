@@ -1,5 +1,6 @@
 import copy
 import os
+from contextlib import nullcontext
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
@@ -250,6 +251,9 @@ class EventGuidedOSEDiff(nn.Module):
         self.control_alpha_init = float(getattr(args, "control_alpha_init", 0.0))
         self.control_alpha_final = float(getattr(args, "control_alpha_final", 1.0))
         self.control_alpha_warmup_steps = max(1, int(getattr(args, "control_alpha_warmup_steps", 5000)))
+        self.control_condition_scale = float(getattr(args, "control_condition_scale", 0.1))
+        self.control_condition_clamp = float(getattr(args, "control_condition_clamp", 5.0))
+        self.control_condition_norm = bool(getattr(args, "control_condition_norm", True))
         if getattr(args, "use_learnable_control_alpha", False):
             self.learnable_control_alpha = nn.Parameter(torch.tensor(self.control_alpha_init, dtype=torch.float32))
         else:
@@ -296,6 +300,18 @@ class EventGuidedOSEDiff(nn.Module):
             return float(torch.clamp(self.learnable_control_alpha.detach(), 0.0, 10.0).item())
         ratio = min(1.0, float(global_step) / float(self.control_alpha_warmup_steps))
         return self.control_alpha_init + (self.control_alpha_final - self.control_alpha_init) * ratio
+
+    def stabilize_control_condition(self, control_condition: torch.Tensor) -> torch.Tensor:
+        # PyramidFusion 使用 Kaiming 初始化后，输出尺度可能明显大于 UNet latent feature。
+        # 这里按样本做标准化、裁剪和缩放，让 control residual 先以温和尺度进入主干。
+        control_condition = torch.nan_to_num(control_condition.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        if self.control_condition_norm:
+            mean = control_condition.mean(dim=(1, 2, 3), keepdim=True)
+            std = control_condition.std(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
+            control_condition = (control_condition - mean) / std
+        if self.control_condition_clamp > 0:
+            control_condition = control_condition.clamp(-self.control_condition_clamp, self.control_condition_clamp)
+        return control_condition * self.control_condition_scale
 
     def encode_prompt(self, prompts: Sequence[str]) -> torch.Tensor:
         embeddings = []
@@ -412,8 +428,11 @@ class EventGuidedOSEDiff(nn.Module):
         # 否则 Windows dry-run 会出现 input half / bias float 的 conv2d mismatch。
         vae_dtype = next(self.vae.parameters()).dtype
         encoded_control = self.vae.encode(low.to(dtype=vae_dtype)).latent_dist.sample() * self.vae.config.scaling_factor
-        hdr_features = self.lle_encoder(low_rgb_01.to(dtype=torch.float32), event_voxel.to(dtype=torch.float32))
-        control_condition = self.pyramid_fusion(hdr_features, target_size=encoded_control.shape[2:]).to(dtype=encoded_control.dtype)
+        control_context = torch.cuda.amp.autocast(enabled=False) if self.device.type == "cuda" else nullcontext()
+        with control_context:
+            hdr_features = self.lle_encoder(low_rgb_01.float(), event_voxel.float())
+            control_condition = self.pyramid_fusion(hdr_features, target_size=encoded_control.shape[2:])
+            control_condition = self.stabilize_control_condition(control_condition)
 
         control_alpha = self.get_control_alpha(global_step=global_step, disable_control=disable_control)
         if disable_control or control_alpha == 0.0:
@@ -421,12 +440,14 @@ class EventGuidedOSEDiff(nn.Module):
             mid_residual = None
         else:
             down_residuals, mid_residual = self.control_module(
-                encoded_control,
+                encoded_control.float(),
                 timesteps,
-                prompt_embeds.to(device=self.device, dtype=encoded_control.dtype),
+                prompt_embeds.to(device=self.device, dtype=torch.float32),
                 control_condition,
                 conditioning_scale=control_alpha,
             )
+            down_residuals = tuple(torch.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0).to(dtype=encoded_control.dtype) for res in down_residuals)
+            mid_residual = torch.nan_to_num(mid_residual, nan=0.0, posinf=0.0, neginf=0.0).to(dtype=encoded_control.dtype)
 
         model_pred = self.unet(
             encoded_control,

@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+import time
 from pathlib import Path
 from typing import Dict
 
@@ -43,6 +44,7 @@ def parse_args(input_args=None, stage_default="stage1"):
     parser.add_argument("--num_train_epochs", type=int, default=10000)
     parser.add_argument("--max_train_steps", type=int, default=100000)
     parser.add_argument("--checkpointing_steps", type=int, default=1000)
+    parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--dry_run", action="store_true")
@@ -61,11 +63,16 @@ def parse_args(input_args=None, stage_default="stage1"):
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--lambda_l1", type=float, default=1.0)
     parser.add_argument("--lambda_lpips", type=float, default=0.0)
+    parser.add_argument("--skip_nonfinite_steps", action="store_true", default=True)
+    parser.add_argument("--max_consecutive_nonfinite", type=int, default=3)
 
     parser.add_argument("--control_alpha_init", type=float, default=0.0)
     parser.add_argument("--control_alpha_final", type=float, default=1.0)
     parser.add_argument("--control_alpha_warmup_steps", type=int, default=5000)
     parser.add_argument("--use_learnable_control_alpha", action="store_true")
+    parser.add_argument("--control_condition_scale", type=float, default=0.1)
+    parser.add_argument("--control_condition_clamp", type=float, default=5.0)
+    parser.add_argument("--disable_control_condition_norm", action="store_true")
 
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="event_guided_osediff")
@@ -77,6 +84,7 @@ def parse_args(input_args=None, stage_default="stage1"):
     parser.add_argument("--wandb_visual_timestep", type=int, default=500)
 
     args = parser.parse_args(input_args)
+    args.control_condition_norm = not args.disable_control_condition_norm
     for name in ["lr_lle_encoder", "lr_pyramid_fusion", "lr_control_adapter"]:
         if getattr(args, name) is None:
             setattr(args, name, args.lr)
@@ -101,6 +109,15 @@ def setup_distributed():
 
 def is_main_process(rank: int) -> bool:
     return rank == 0
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours:d}h{minutes:02d}m{seconds:02d}s"
+    return f"{minutes:d}m{seconds:02d}s"
 
 
 def set_random_seed(seed: int):
@@ -248,6 +265,12 @@ def train_main(args):
     if is_main_process(rank):
         os.makedirs(args.output_dir, exist_ok=True)
         print(f"[Config] stage={args.stage} world_size={world_size} device={device}")
+        print(
+            f"[Config] lambda_lpips={args.lambda_lpips} "
+            f"control_alpha_final={args.control_alpha_final} "
+            f"control_condition_scale={args.control_condition_scale} "
+            f"log_interval={args.log_interval}"
+        )
 
     loader, sampler = build_loader(args, rank, world_size)
     model = EventGuidedOSEDiff(args, stage=args.stage, device=device)
@@ -308,6 +331,12 @@ def train_main(args):
         return
 
     model.train()
+    # 训练速度和 ETA 以当前启动后的有效训练步统计；resume 后从恢复点继续估算剩余 steps。
+    train_start_time = time.perf_counter()
+    run_start_step = global_step
+    last_log_time = train_start_time
+    last_log_step = global_step
+    consecutive_nonfinite = 0
     for epoch in range(start_epoch, args.num_train_epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -323,11 +352,36 @@ def train_main(args):
                 )
                 target = batch["output_pixel_values"].to(device)
                 loss_l1 = F.l1_loss(outputs["output"].float(), target.float()) * args.lambda_l1
-                if net_lpips is not None:
+            # LPIPS 对 fp16 溢出更敏感，单独放在 autocast 外用 fp32 计算。
+            if net_lpips is not None:
+                with torch.cuda.amp.autocast(enabled=False):
                     loss_lpips = net_lpips(outputs["output"].float(), target.float()).mean() * args.lambda_lpips
-                else:
-                    loss_lpips = torch.tensor(0.0, device=device)
-                loss = loss_l1 + loss_lpips
+            else:
+                loss_lpips = torch.tensor(0.0, device=device)
+            loss = loss_l1 + loss_lpips
+
+            finite_flags = {
+                "output": torch.isfinite(outputs["output"]).all().item(),
+                "loss": torch.isfinite(loss).all().item(),
+                "loss_l1": torch.isfinite(loss_l1).all().item(),
+                "loss_lpips": torch.isfinite(loss_lpips).all().item(),
+                "control_residual_norm": torch.isfinite(outputs["control_residual_norm"]).all().item(),
+            }
+            local_finite = torch.tensor(1 if all(finite_flags.values()) else 0, device=device, dtype=torch.int32)
+            if world_size > 1:
+                # DDP 下必须让所有 rank 对“是否跳过当前 step”达成一致。
+                # 否则某个 rank continue，其他 rank 进入 backward/allreduce，会造成训练假死。
+                dist.all_reduce(local_finite, op=dist.ReduceOp.MIN)
+            all_ranks_finite = bool(local_finite.item())
+            if not all_ranks_finite:
+                consecutive_nonfinite += 1
+                if is_main_process(rank):
+                    print(f"[NonFinite] step={global_step + 1} local_flags={finite_flags}; skip optimizer step on all ranks.")
+                optimizer.zero_grad(set_to_none=True)
+                if consecutive_nonfinite >= args.max_consecutive_nonfinite or not args.skip_nonfinite_steps:
+                    raise FloatingPointError(f"Non-finite training state repeated {consecutive_nonfinite} time(s): {finite_flags}")
+                continue
+            consecutive_nonfinite = 0
 
             scaler.scale(loss).backward()
             if args.max_grad_norm > 0:
@@ -337,12 +391,29 @@ def train_main(args):
             scaler.update()
             global_step += 1
 
-            if is_main_process(rank) and global_step % 10 == 0:
+            if is_main_process(rank) and global_step % max(1, args.log_interval) == 0:
+                now = time.perf_counter()
+                elapsed = now - train_start_time
+                window_elapsed = max(1e-6, now - last_log_time)
+                window_steps = max(1, global_step - last_log_step)
+                steps_per_sec = window_steps / window_elapsed
+                seconds_per_step = window_elapsed / window_steps
+                # ETA 使用本次进程的平均速度；resume 时不把历史训练时间混入当前估算。
+                run_steps = max(1, global_step - run_start_step)
+                run_avg_steps_per_sec = max(1e-6, run_steps / max(elapsed, 1e-6))
+                samples_per_sec = steps_per_sec * args.train_batch_size * world_size
+                remaining_steps = max(0, args.max_train_steps - global_step)
+                eta_seconds = remaining_steps / run_avg_steps_per_sec
+
                 print(
                     f"step={global_step} loss={loss.item():.6f} "
                     f"l1={loss_l1.item():.6f} lpips={loss_lpips.item():.6f} "
                     f"alpha={outputs['control_alpha'].item():.4f} "
-                    f"res_norm={outputs['control_residual_norm'].item():.4f}"
+                    f"res_norm={outputs['control_residual_norm'].item():.4f} "
+                    f"speed={seconds_per_step:.2f} sec/step "
+                    f"samples={samples_per_sec:.2f} img/s "
+                    f"elapsed={format_duration(elapsed)} "
+                    f"eta={format_duration(eta_seconds)}"
                 )
                 if wandb is not None:
                     wandb.log({
@@ -351,7 +422,14 @@ def train_main(args):
                         "loss/lpips": loss_lpips.item(),
                         "control/alpha": outputs["control_alpha"].item(),
                         "control/residual_norm": outputs["control_residual_norm"].item(),
+                        "speed/seconds_per_step": seconds_per_step,
+                        "speed/samples_per_sec": samples_per_sec,
+                        "time/elapsed_hours": elapsed / 3600.0,
+                        "time/eta_hours": eta_seconds / 3600.0,
+                        "time/remaining_steps": remaining_steps,
                     }, step=global_step)
+                last_log_time = now
+                last_log_step = global_step
 
             if wandb is not None and args.wandb_log_image_interval > 0 and global_step % args.wandb_log_image_interval == 0:
                 log_wandb_images(wandb, batch, outputs, global_step, args.num_wandb_visual_samples)
