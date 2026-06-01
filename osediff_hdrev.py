@@ -288,7 +288,14 @@ class OSEDiffHDRevTest(torch.nn.Module):
 
         self.vae = initialize_frozen_vae(args)
         self.unet, _, _, _ = initialize_unet(args)
-        self.hdrev_encoder = HDRevEncoder(num_bins=args.num_bins, pretrained_root=args.hdrev_pretrained_root)
+        self.hdrev_encoder = HDRevEncoder(
+            num_bins=args.num_bins,
+            pretrained_root=args.hdrev_pretrained_root,
+            # Inference checkpoints already contain the trained HDRevEncoder
+            # weights. Avoid loading the original HDRev root here so testing
+            # only depends on --osediff_path plus the SD base model.
+            load_pretrained=False,
+        )
         self.event_latent_projector = EventPyramidLatentProjector(latent_channels=4)
 
         checkpoint = torch.load(args.osediff_path, map_location="cpu")

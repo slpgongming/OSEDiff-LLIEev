@@ -46,7 +46,12 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="output_lle_hdrev_stage3")
     parser.add_argument("--pretrained_model_name_or_path", type=str, required=True)
     parser.add_argument("--osediff_path", type=str, required=True)
-    parser.add_argument("--hdrev_pretrained_root", type=str, default="checkpoints/HDRev")
+    parser.add_argument(
+        "--hdrev_pretrained_root",
+        type=str,
+        default="checkpoints/HDRev",
+        help="Deprecated for Stage 3 inference; HDRev/projector weights are loaded from --osediff_path.",
+    )
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--num_bins", type=int, default=5)
