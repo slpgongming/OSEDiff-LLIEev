@@ -53,7 +53,7 @@ class PyramidFusion(nn.Module):
     多尺度 HDR feature list -> latent-resolution condition embedding.
 
     输入来自 LLEEncoder: [H1,H2,H3,H4]，每级 concat 前都会 resize 到当前 embedding 尺寸。
-    conv_out 使用 zero init，使刚初始化时事件条件对主干影响接近 0。
+    所有卷积权重使用 Kaiming 初始化，避免随机分支一开始落在过小或异常的尺度上。
     """
 
     def __init__(
@@ -77,9 +77,22 @@ class PyramidFusion(nn.Module):
                 nn.Conv2d(channel_in, channel_out, kernel_size=3, padding=1, stride=2),
                 nn.SiLU(),
             ))
-        self.conv_out = zero_module(
-            nn.Conv2d(block_out_channels[-1] + conditioning_channels[-1], conditioning_embedding_channels, kernel_size=3, padding=1)
+        self.conv_out = nn.Conv2d(
+            block_out_channels[-1] + conditioning_channels[-1],
+            conditioning_embedding_channels,
+            kernel_size=3,
+            padding=1,
         )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        # Pyramid Fusion 是事件条件进入 ControlModule 前的尺度桥接模块；
+        # 这里对所有卷积做 Kaiming 初始化，bias 清零，保证 conv_out 也不是全零。
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(self, hdr_features: Sequence[torch.Tensor], target_size: Tuple[int, int]) -> torch.Tensor:
         if not isinstance(hdr_features, (list, tuple)) or len(hdr_features) != 4:

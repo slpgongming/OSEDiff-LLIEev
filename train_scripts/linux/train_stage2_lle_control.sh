@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
-PRETRAINED_MODEL="${PRETRAINED_MODEL:-/path/to/stable-diffusion-2-1-base}"
-TRAIN_ROOT="${TRAIN_ROOT:-/path/to/SDE_dataset/SDE_indoor/sde_in_release/train}"
-TEST_ROOT="${TEST_ROOT:-/path/to/SDE_dataset/SDE_indoor/sde_in_release/test}"
+# Keep the torchrun process count no larger than the number of visible GPUs.
+# This server has 2 GPUs by default; override NPROC_PER_NODE when the job gets a different allocation.
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+PRETRAINED_MODEL="${PRETRAINED_MODEL:/public/home/slpchen/stable-diffusion-2-1-base}"
+TRAIN_ROOT="${TRAIN_ROOT:/public/home/slpchen/EvLight--main/SDE_dataset/SDE_indoor/sde_in_release/train}"
+TEST_ROOT="${TEST_ROOT:/public/home/slpchen/EvLight--main/SDE_dataset/SDE_indoor/sde_in_release/test}"
 OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/event_guided_stage2}"
 OSEDIFF_LORA="${OSEDIFF_LORA:-checkpoints/osediff_lle_5-14-1935/checkpoints/model_94001.pkl}"
 STAGE1_CKPT="${STAGE1_CKPT:-checkpoints/event_guided_stage1/latest_model.pkl}"
@@ -17,7 +19,7 @@ torchrun --nproc_per_node "${NPROC_PER_NODE}" train_stage2_lle_control.py \
   --output_dir "${OUTPUT_DIR}" \
   --stage1_checkpoint_path "${STAGE1_CKPT}" \
   --pretrained_osediff_lora_path "${OSEDIFF_LORA}" \
-  --train_timestep 500 \
+  --train_timestep 400,600 \
   --num_bins 5 \
   --control_alpha_init 1.0 \
   --control_alpha_final 1.0 \

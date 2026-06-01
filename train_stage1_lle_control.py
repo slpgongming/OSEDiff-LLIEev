@@ -111,6 +111,24 @@ def set_random_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+def configure_wandb_ssl_bypass(wandb_module=None):
+    # Some Linux servers use an internal CA bundle that W&B cannot verify.
+    # Set both environment switches before wandb.init so the HTTP client skips
+    # TLS certificate verification instead of failing with "unknown authority".
+    os.environ.setdefault("WANDB_INSECURE", "true")
+    os.environ.setdefault("WANDB_INSECURE_DISABLE_SSL", "true")
+
+    if wandb_module is None:
+        return None
+
+    try:
+        # Newer wandb versions also accept an explicit Settings flag. The
+        # environment variables above remain the fallback for older releases.
+        return wandb_module.Settings(insecure_disable_ssl=True)
+    except Exception:
+        return None
+
+
 def build_loader(args, rank: int, world_size: int):
     dataset = SDEIndoorEGLolDataset(
         root=args.train_root,
@@ -255,15 +273,20 @@ def train_main(args):
 
     wandb = None
     if args.use_wandb and is_main_process(rank):
+        configure_wandb_ssl_bypass()
         import wandb as wandb_module
         wandb = wandb_module
-        wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name or args.stage,
-            entity=args.wandb_entity,
-            mode=args.wandb_mode,
-            config=vars(args),
-        )
+        wandb_settings = configure_wandb_ssl_bypass(wandb)
+        wandb_init_kwargs = {
+            "project": args.wandb_project,
+            "name": args.wandb_run_name or args.stage,
+            "entity": args.wandb_entity,
+            "mode": args.wandb_mode,
+            "config": vars(args),
+        }
+        if wandb_settings is not None:
+            wandb_init_kwargs["settings"] = wandb_settings
+        wandb.init(**wandb_init_kwargs)
 
     if args.dry_run:
         batch = next(iter(loader))
