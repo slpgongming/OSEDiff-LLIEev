@@ -28,6 +28,38 @@ def sample_train_timesteps(train_timestep_arg: str, batch_size: int, device: tor
     return torch.full((batch_size,), timestep, device=device, dtype=torch.long)
 
 
+def scheduler_step_with_batch_timesteps(
+    noise_scheduler: DDPMScheduler,
+    model_pred: torch.Tensor,
+    timesteps: torch.Tensor,
+    sample: torch.Tensor,
+) -> torch.Tensor:
+    # diffusers DDPMScheduler.step expects one scalar timestep, because it uses
+    # Python control flow such as "prev_t >= 0".  UNet, however, accepts a
+    # [B]-shaped timestep tensor.  Keep the [B] tensor for UNet/ControlModule,
+    # then convert to scalar here when all samples share the same timestep.
+    if timesteps.ndim == 0:
+        return noise_scheduler.step(model_pred, int(timesteps.item()), sample, return_dict=True).prev_sample
+
+    unique_timesteps = torch.unique(timesteps.detach())
+    if unique_timesteps.numel() == 1:
+        return noise_scheduler.step(model_pred, int(unique_timesteps.item()), sample, return_dict=True).prev_sample
+
+    # When train_timestep is a range such as "400,600", each sample may have a
+    # different diffusion timestep.  Step each sample independently so the DDPM
+    # update remains consistent with the timestep used by the UNet prediction.
+    denoised_samples = []
+    for idx in range(timesteps.shape[0]):
+        denoised = noise_scheduler.step(
+            model_pred[idx:idx + 1],
+            int(timesteps[idx].item()),
+            sample[idx:idx + 1],
+            return_dict=True,
+        ).prev_sample
+        denoised_samples.append(denoised)
+    return torch.cat(denoised_samples, dim=0)
+
+
 def _torch_load(path: str):
     try:
         return torch.load(path, map_location="cpu", weights_only=True)
@@ -456,7 +488,7 @@ class EventGuidedOSEDiff(nn.Module):
             down_block_additional_residuals=down_residuals,
             mid_block_additional_residual=mid_residual,
         ).sample
-        x_denoised = self.noise_scheduler.step(model_pred, timesteps, encoded_control, return_dict=True).prev_sample
+        x_denoised = scheduler_step_with_batch_timesteps(self.noise_scheduler, model_pred, timesteps, encoded_control)
         output_image = self.vae.decode(x_denoised.to(dtype=vae_dtype) / self.vae.config.scaling_factor).sample.clamp(-1, 1)
 
         residual_norm = torch.tensor(0.0, device=self.device)
