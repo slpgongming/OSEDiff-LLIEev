@@ -121,6 +121,7 @@ def main():
 
     rows = []
     psnr_values, ssim_values, lpips_values = [], [], []
+    scene_sorted_indices = {}
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
@@ -140,7 +141,12 @@ def main():
                 seq_name = batch["seq_name"][item_idx]
                 frame_id = batch["frame_id"][item_idx]
                 scene_dir = os.path.join(images_dir, seq_name)
-                prefix = f"{frame_id}"
+                # Match test_osediff_lle.py: save images with the sorted
+                # 1-based index inside each scene, while keeping the original
+                # timestamp frame_id in the metrics CSV for traceability.
+                scene_sorted_indices[seq_name] = scene_sorted_indices.get(seq_name, 0) + 1
+                sorted_index = scene_sorted_indices[seq_name]
+                prefix = f"{sorted_index:04d}"
 
                 low_arr = tensor_to_uint8_image(batch["conditioning_pixel_values"][item_idx])
                 gt_arr = tensor_to_uint8_image(batch["output_pixel_values"][item_idx])
@@ -173,6 +179,7 @@ def main():
                     lpips_values.append(lpips_score)
                 rows.append({
                     "seq_name": seq_name,
+                    "sorted_index": sorted_index,
                     "frame_id": frame_id,
                     "psnr": psnr,
                     "ssim": ssim,
@@ -180,11 +187,11 @@ def main():
                     "event_mode": args.event_mode,
                     "disable_control": args.disable_control,
                 })
-                print(f"[{batch_idx + 1}/{len(loader)}] {seq_name}/{frame_id} PSNR={psnr:.4f} SSIM={ssim:.4f} LPIPS={lpips_score:.4f}")
+                print(f"[{batch_idx + 1}/{len(loader)}] {seq_name}/{prefix} frame_id={frame_id} PSNR={psnr:.4f} SSIM={ssim:.4f} LPIPS={lpips_score:.4f}", flush=True)
 
     per_image_path = os.path.join(metrics_dir, "metrics_per_image.csv")
     with open(per_image_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["seq_name", "frame_id", "psnr", "ssim", "lpips", "event_mode", "disable_control"])
+        writer = csv.DictWriter(f, fieldnames=["seq_name", "sorted_index", "frame_id", "psnr", "ssim", "lpips", "event_mode", "disable_control"])
         writer.writeheader()
         writer.writerows(rows)
 

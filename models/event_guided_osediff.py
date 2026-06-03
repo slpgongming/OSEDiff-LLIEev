@@ -60,6 +60,29 @@ def scheduler_step_with_batch_timesteps(
     return torch.cat(denoised_samples, dim=0)
 
 
+def pad_spatial_to_multiple(
+    tensor: torch.Tensor,
+    multiple: int = 8,
+    mode: str = "constant",
+    value: float = 0.0,
+) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    # Stable Diffusion VAE downsamples spatial dimensions by 8.  Full-resolution
+    # SDE frames can have sizes such as 260, which decode back to 256 if they are
+    # fed directly through the latent path.  Pad only the bottom/right borders so
+    # the model can run on a valid latent grid, then crop the decoded image back
+    # to the original H/W.
+    height, width = tensor.shape[-2:]
+    pad_h = (multiple - height % multiple) % multiple
+    pad_w = (multiple - width % multiple) % multiple
+    if pad_h == 0 and pad_w == 0:
+        return tensor, (height, width)
+
+    padding = (0, pad_w, 0, pad_h)
+    if mode == "constant":
+        return F.pad(tensor, padding, mode=mode, value=value), (height, width)
+    return F.pad(tensor, padding, mode=mode), (height, width)
+
+
 def _torch_load(path: str):
     try:
         return torch.load(path, map_location="cpu", weights_only=True)
@@ -435,6 +458,7 @@ class EventGuidedOSEDiff(nn.Module):
         low = batch["conditioning_pixel_values"].to(self.device)
         low_rgb_01 = batch.get("low_rgb_01", (low + 1.0) * 0.5).to(self.device)
         event_voxel = batch["event_values"].to(self.device)
+        original_height, original_width = low.shape[-2:]
 
         if event_mode == "zero":
             event_voxel = torch.zeros_like(event_voxel)
@@ -442,6 +466,15 @@ class EventGuidedOSEDiff(nn.Module):
             event_voxel = event_voxel[torch.roll(torch.arange(event_voxel.shape[0], device=event_voxel.device), shifts=1)]
         elif event_mode != "normal":
             raise ValueError(f"Unknown event_mode: {event_mode}")
+
+        # The VAE/UNet latent path requires H/W divisible by 8.  Training patches
+        # are normally 256x256, but full-resolution testing may be 260px or other
+        # non-multiples.  Replicate-pad RGB tensors to avoid artificial dark
+        # borders; pad event voxels with zeros because no events exist outside the
+        # original image support.
+        low, _ = pad_spatial_to_multiple(low, multiple=8, mode="replicate")
+        low_rgb_01, _ = pad_spatial_to_multiple(low_rgb_01, multiple=8, mode="replicate")
+        event_voxel, _ = pad_spatial_to_multiple(event_voxel, multiple=8, mode="constant", value=0.0)
 
         prompts = batch.get("prompt", None)
         if prompts is None or prompts == "":
@@ -490,6 +523,7 @@ class EventGuidedOSEDiff(nn.Module):
         ).sample
         x_denoised = scheduler_step_with_batch_timesteps(self.noise_scheduler, model_pred, timesteps, encoded_control)
         output_image = self.vae.decode(x_denoised.to(dtype=vae_dtype) / self.vae.config.scaling_factor).sample.clamp(-1, 1)
+        output_image = output_image[..., :original_height, :original_width]
 
         residual_norm = torch.tensor(0.0, device=self.device)
         if down_residuals is not None:
