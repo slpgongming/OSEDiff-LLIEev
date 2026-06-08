@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Keep the torchrun process count no larger than the number of visible GPUs.
+## Keep the torchrun process count no larger than the number of visible GPUs.
 # This server has 2 GPUs by default; override NPROC_PER_NODE when the job gets a different allocation.
 NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/slpchen/stable-diffusion-2-1-base}"
