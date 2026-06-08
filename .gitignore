@@ -8,3 +8,5 @@ checkpoints/
 output_lle/
 references/
 experience/
+test_scripts/
+train_scripts/
