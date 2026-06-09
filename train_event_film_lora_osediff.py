@@ -463,15 +463,12 @@ def main(args):
                     logs.update({f"event_film/{k}": v for k, v in debug_stats.items()})
                     progress_bar.set_postfix({
                         "loss": f"{logs['loss']:.4f}",
-                        "t": logs["timestep"],
-                        "s/step": f"{s_per_step:.2f}",
                         "eta": format_duration(eta_seconds),
                     })
                     accelerator.log(logs, step=global_step)
                     if global_step % 10 == 0:
                         logging.info(
                             f"step={global_step} | loss={logs['loss']:.6f} | "
-                            f"t={logs['timestep']} | s/step={s_per_step:.2f} | "
                             f"elapsed={format_duration(elapsed)} | eta={format_duration(eta_seconds)}"
                         )
                     if global_step % args.checkpointing_steps == 0:

@@ -39,6 +39,7 @@ accelerate launch --num_processes "$NPROC_PER_NODE" train_event_film_lora_osedif
   --output_dir "$OUTPUT_DIR" \
   --image_size 256 \
   --train_batch_size "${TRAIN_BATCH_SIZE:-8}" \
+  --dataloader_num_workers "${DATALOADER_NUM_WORKERS:-2}" \
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-1}" \
   --max_train_steps "${MAX_TRAIN_STEPS:-100000}" \
   --checkpointing_steps "${CHECKPOINTING_STEPS:-500}" \
