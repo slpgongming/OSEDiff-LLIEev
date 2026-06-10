@@ -2,6 +2,7 @@ import argparse
 import csv
 import os
 from collections import defaultdict
+from dataclasses import dataclass, field
 
 import pyiqa
 import torch
@@ -10,6 +11,28 @@ from torchvision import transforms
 
 from dataloaders.sde_event_film_dataset import SDEEventFilmDataset
 from osediff_event_film import OSEDiffEventFiLMTest
+
+
+METRIC_NAMES = ("psnr", "ssim", "lpips")
+
+
+@dataclass
+class MetricAccumulator:
+    count: int = 0
+    sums: dict = field(default_factory=lambda: {name: 0.0 for name in METRIC_NAMES})
+
+    def update(self, metric_values):
+        # Each sample contributes one scalar per metric.  We keep raw sums so
+        # scene-level and overall averages are computed from the same values
+        # that are written to the per-image CSV.
+        self.count += 1
+        for name in METRIC_NAMES:
+            self.sums[name] += float(metric_values[name])
+
+    def averages(self):
+        if self.count == 0:
+            return {name: 0.0 for name in METRIC_NAMES}
+        return {name: self.sums[name] / self.count for name in METRIC_NAMES}
 
 
 def tensor_to_pil(tensor):
@@ -27,6 +50,58 @@ def save_event_activity(events, path):
     activity = events.abs().sum(dim=0)
     activity = activity / activity.max().clamp_min(1e-6)
     Image.fromarray((activity.cpu().numpy() * 255).astype("uint8")).save(path)
+
+
+def build_ablation_event(events, shuffled_events, mode):
+    # All ablation inputs keep the same [B, event_bins, H, W] shape expected by
+    # the event encoder.  Only the event evidence content changes.
+    if mode == "correct":
+        return events
+    if mode == "zero":
+        return torch.zeros_like(events)
+    if mode == "shuffled":
+        return shuffled_events
+    raise ValueError(f"Unknown ablation mode: {mode}")
+
+
+def compute_quality_metrics(pred, gt, psnr_metric, ssim_metric, lpips_metric):
+    # pyiqa full-reference metrics expect image tensors in [0, 1].  The model
+    # path uses the OSEDiff convention [-1, 1], so clamp before remapping to
+    # avoid out-of-range values dominating PSNR/SSIM/LPIPS.
+    pred_01 = pred.float().clamp(-1, 1) * 0.5 + 0.5
+    gt_01 = gt.float().clamp(-1, 1) * 0.5 + 0.5
+    return {
+        "psnr": psnr_metric(pred_01, gt_01).item(),
+        "ssim": ssim_metric(pred_01, gt_01).item(),
+        "lpips": lpips_metric(pred_01, gt_01).item(),
+    }
+
+
+def write_csv(path, rows, fieldnames):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def build_summary_rows(stats_by_mode, modes, include_scene):
+    rows = []
+    for mode in modes:
+        if mode not in stats_by_mode:
+            continue
+        if include_scene:
+            items = sorted(stats_by_mode[mode].items())
+        else:
+            items = [(None, stats_by_mode[mode])]
+
+        for scene_name, accumulator in items:
+            averages = accumulator.averages()
+            row = {"mode": mode, "count": accumulator.count}
+            if include_scene:
+                row["scene"] = scene_name
+            row.update({name: averages[name] for name in METRIC_NAMES})
+            rows.append(row)
+    return rows
 
 
 def parse_args():
@@ -61,10 +136,15 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     psnr_metric = pyiqa.create_metric("psnr", test_y_channel=True, color_space="ycbcr").to(device)
     ssim_metric = pyiqa.create_metric("ssim", test_y_channel=True, color_space="ycbcr").to(device)
+    lpips_metric = pyiqa.create_metric("lpips", device=device).to(device)
     modes = [m.strip() for m in args.ablation_modes.split(",") if m.strip()]
+    if not modes:
+        raise ValueError("--ablation_modes must contain at least one mode.")
 
     scene_counts = defaultdict(int)
-    rows = []
+    per_image_rows = []
+    scene_stats = defaultdict(lambda: defaultdict(MetricAccumulator))
+    overall_stats = defaultdict(MetricAccumulator)
     for idx in range(len(dataset)):
         sample = dataset[idx]
         scene_name = sample["scene_name"]
@@ -77,16 +157,9 @@ def main(args):
         shuffled_events = dataset[(idx + 1) % len(dataset)]["events"].unsqueeze(0).to(device)
 
         for mode in modes:
-            if mode == "correct":
-                event_input = events
-            elif mode == "zero":
-                event_input = torch.zeros_like(events)
-            elif mode == "shuffled":
-                event_input = shuffled_events
-            else:
-                raise ValueError(f"Unknown ablation mode: {mode}")
+            event_input = build_ablation_event(events, shuffled_events, mode)
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 pred = model(lq, event_input, prompt=args.fixed_prompt)
 
             out_dir = os.path.join(args.output_dir, mode, scene_name)
@@ -98,23 +171,24 @@ def main(args):
             tensor_to_pil(pred[0]).save(result_path)
             tensor_to_pil(gt[0]).save(gt_path)
 
-            pred_01 = pred.float().clamp(-1, 1) * 0.5 + 0.5
-            gt_01 = gt.float().clamp(-1, 1) * 0.5 + 0.5
-            psnr = psnr_metric(pred_01, gt_01).item()
-            ssim = ssim_metric(pred_01, gt_01).item()
+            with torch.inference_mode():
+                metric_values = compute_quality_metrics(pred, gt, psnr_metric, ssim_metric, lpips_metric)
             active_l1 = event_active_l1(pred.float(), gt.float(), event_input.float())
             debug_stats = model.debug_stats()
+            scene_stats[mode][scene_name].update(metric_values)
+            overall_stats[mode].update(metric_values)
 
             if args.save_debug_vis:
                 save_event_activity(event_input[0].float(), os.path.join(out_dir, f"{prefix}_event_activity.png"))
 
-            rows.append({
+            per_image_rows.append({
                 "mode": mode,
                 "scene": scene_name,
                 "prefix": prefix,
                 "frame_id": sample["frame_id"],
-                "psnr": psnr,
-                "ssim": ssim,
+                "psnr": metric_values["psnr"],
+                "ssim": metric_values["ssim"],
+                "lpips": metric_values["lpips"],
                 "event_active_l1": active_l1,
                 "dgamma_abs_mean": debug_stats.get("dgamma_abs_mean", 0.0),
                 "dbeta_abs_mean": debug_stats.get("dbeta_abs_mean", 0.0),
@@ -122,16 +196,36 @@ def main(args):
             })
             print(
                 f"[{idx + 1}/{len(dataset)}] {mode}/{scene_name}/{prefix} | "
-                f"PSNR={psnr:.4f} | SSIM={ssim:.4f} | event_L1={active_l1:.6f}"
+                f"PSNR={metric_values['psnr']:.4f} | SSIM={metric_values['ssim']:.4f} | "
+                f"LPIPS={metric_values['lpips']:.4f} | event_L1={active_l1:.6f}"
             )
 
-    csv_path = os.path.join(args.output_dir, "metrics_event_film_ablation.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+    per_image_csv = os.path.join(args.output_dir, "metrics_event_film_ablation.csv")
+    scene_csv = os.path.join(args.output_dir, "metrics_event_film_ablation_scene.csv")
+    overall_csv = os.path.join(args.output_dir, "metrics_event_film_ablation_overall.csv")
+    per_image_fields = [
+        "mode", "scene", "prefix", "frame_id", "psnr", "ssim", "lpips",
+        "event_active_l1", "dgamma_abs_mean", "dbeta_abs_mean", "result_path",
+    ]
+    scene_fields = ["mode", "scene", "count", *METRIC_NAMES]
+    overall_fields = ["mode", "count", *METRIC_NAMES]
+    scene_rows = build_summary_rows(scene_stats, modes, include_scene=True)
+    overall_rows = build_summary_rows(overall_stats, modes, include_scene=False)
 
-    print(f"[Done] Metrics: {csv_path}")
+    write_csv(per_image_csv, per_image_rows, per_image_fields)
+    write_csv(scene_csv, scene_rows, scene_fields)
+    write_csv(overall_csv, overall_rows, overall_fields)
+
+    print("\n===== Overall Average Metrics by Ablation Mode =====")
+    for row in overall_rows:
+        print(
+            f"{row['mode']} (n={row['count']}): "
+            f"PSNR={row['psnr']:.4f} | SSIM={row['ssim']:.4f} | LPIPS={row['lpips']:.4f}"
+        )
+
+    print(f"[Done] Per-image metrics: {per_image_csv}")
+    print(f"[Done] Per-scene metrics: {scene_csv}")
+    print(f"[Done] Overall metrics: {overall_csv}")
 
 
 if __name__ == "__main__":
