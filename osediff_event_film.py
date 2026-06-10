@@ -46,6 +46,26 @@ def _load_compatible_named_parameters(module, checkpoint_state):
     return loaded, skipped
 
 
+def _first_parameter_dtype(module, default=torch.float32):
+    for param in module.parameters(recurse=True):
+        return param.dtype
+    return default
+
+
+def _unet_cross_attention_dtype(unet, default=torch.float32):
+    """
+    推理/训练时 cross-attention 的 text embedding dtype 必须匹配 attn2.to_k/to_v。
+
+    PEFT LoRA wrapper 在不同版本中可能让部分 base_layer 保持 float32，即使外层
+    UNet 已经 `.to(dtype=torch.float16)`。动态读取实际 to_k 权重 dtype，比硬编码
+    fp16/fp32 更稳，能避免 F.linear(input, weight) 的 Half/Float mismatch。
+    """
+    for name, module in unet.named_modules():
+        if name.endswith("attn2.to_k"):
+            return _first_parameter_dtype(module, default=default)
+    return default
+
+
 class OSEDiffEventFiLMGen(torch.nn.Module):
     """
     Event-FiLM LoRA Generator。
@@ -178,6 +198,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         encoded_control = self.vae.encode(c_t).latent_dist.sample() * self.vae.config.scaling_factor
         prompt_embeds = self.encode_prompt(batch["prompt"])
         neg_prompt_embeds = self.encode_prompt(batch["neg_prompt"])
+        cross_attn_dtype = _unet_cross_attention_dtype(self.unet, default=encoded_control.dtype)
 
         # 事件特征只在 UNet forward 期间放入 LoRA 缓存，避免跨 batch 残留错误条件。
         event_feats = self.event_encoder(events)
@@ -186,7 +207,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             model_pred = self.unet(
                 encoded_control,
                 timesteps,
-                encoder_hidden_states=prompt_embeds.to(torch.float32),
+                encoder_hidden_states=prompt_embeds.to(dtype=cross_attn_dtype),
             ).sample
         finally:
             clear_event_feats_for_all_event_lora(self.unet)
@@ -194,8 +215,11 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         x_denoised = self.noise_scheduler.step(
             model_pred, timesteps, encoded_control, return_dict=True
         ).prev_sample
+        vae_dtype = _first_parameter_dtype(self.vae, default=x_denoised.dtype)
         output_image = (
-            self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample
+            self.vae.decode(
+                x_denoised.to(dtype=vae_dtype) / self.vae.config.scaling_factor
+            ).sample
         ).clamp(-1, 1)
         return output_image, x_denoised, prompt_embeds, neg_prompt_embeds
 
