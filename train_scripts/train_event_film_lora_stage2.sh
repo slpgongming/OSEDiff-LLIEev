@@ -9,10 +9,10 @@ export WANDB_CONSOLE="${WANDB_CONSOLE:-wrap}"
 export WANDB_INSECURE=true
 export WANDB_INSECURE_DISABLE_SSL=true
 
-PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/hutao/Chen_Project/PretrainedModel/stable-diffusion-2-1-base}"
-TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/public/home/hutao/Chen_Project/dataset/SDE_dataset/SDE_indoor/sde_in_release/train}"
+PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/slpchen/stable-diffusion-2-1-base}"
+TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/public/home/slpchen/EvLight--main/SDE_dataset/SDE_indoor/sde_in_release/train}"
 STAGE1_CKPT="${STAGE1_CKPT:-checkpoints/osediff_lle_5-14-1935/checkpoints/model_94001.pkl}"
-OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/OSEDiff_clora_stage2_6-9-1630}"
+OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/OSEDiff_clora_stage2_6-10-1700}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 
 if [ ! -d "$PRETRAINED_MODEL" ]; then
@@ -48,7 +48,7 @@ accelerate launch --num_processes "$NPROC_PER_NODE" train_event_film_lora_osedif
   --mixed_precision fp16 \
   --report_to wandb \
   --tracker_project_name OSEDiff_clora_stage2 \
-  --wandb_run_name stage2_6-9-1630 \
+  --wandb_run_name stage2_6-10-1700 \
   --generator_train_timestep "${GENERATOR_TRAIN_TIMESTEP:-400,600}" \
   --regularizer_train_timestep "${REGULARIZER_TRAIN_TIMESTEP:-400,600}" \
   --lambda_vsd "${LAMBDA_VSD:-0.0}" \
@@ -60,4 +60,5 @@ accelerate launch --num_processes "$NPROC_PER_NODE" train_event_film_lora_osedif
   --lambda_edge "${LAMBDA_EDGE:-0.02}" \
   --lambda_smooth "${LAMBDA_SMOOTH:-0.005}" \
   --lambda_mod "${LAMBDA_MOD:-0.01}" \
+  --dataloader_num_workers "${DATALOADER_NUM_WORKERS:-2}" \
   "${EXTRA_ARGS[@]}"
