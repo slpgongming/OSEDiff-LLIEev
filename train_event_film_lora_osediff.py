@@ -6,6 +6,7 @@ from pathlib import Path
 
 import diffusers
 import lpips
+import numpy as np
 import torch
 import torch.nn.functional as F
 import transformers
@@ -16,7 +17,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from tqdm.auto import tqdm
 
 from dataloaders.sde_event_film_dataset import SDEEventFilmDataset
-from models.event_lora_utils import collect_event_lora_regularization
+from models.event_lora_utils import collect_event_lora_regularization, collect_event_lora_visuals
 from osediff_event_film import OSEDiffEventFiLMGen, OSEDiffEventFiLMReg
 
 
@@ -96,6 +97,102 @@ def event_edge_loss(pred, gt, events):
     return loss_x + loss_y
 
 
+def _tensor_to_uint8_hwc(tensor, signed_image=False, normalize_map=False):
+    """
+    将训练中的 tensor 转成 W&B Image 可接受的 HWC uint8。
+
+    signed_image=True 用于 low/pred/gt: [-1,1] -> [0,1]。
+    normalize_map=True 用于 event/dgamma/dbeta 热力图: 按当前图自身最大值归一化。
+    """
+    tensor = tensor.detach().float().cpu()
+    if tensor.dim() == 4:
+        tensor = tensor[0]
+    if tensor.dim() == 2:
+        tensor = tensor.unsqueeze(0)
+    if tensor.shape[0] != 1 and tensor.shape[0] != 3:
+        tensor = tensor.mean(dim=0, keepdim=True)
+
+    if signed_image:
+        tensor = tensor * 0.5 + 0.5
+    elif normalize_map:
+        tensor = tensor - tensor.min()
+        tensor = tensor / tensor.max().clamp_min(1e-6)
+    tensor = tensor.clamp(0.0, 1.0)
+
+    if tensor.shape[0] == 1:
+        tensor = tensor.repeat(3, 1, 1)
+    image = tensor.permute(1, 2, 0).numpy()
+    return (image * 255.0).round().astype(np.uint8)
+
+
+def build_wandb_visual_logs(x_src, x_pred, x_tgt, events, event_lora_visuals):
+    """
+    构造训练可视化面板，只返回给 accelerator.log，不保存任何本地图片。
+
+    面板内容：
+    low / pred / gt / event activity / mean(abs(dgamma)) / mean(abs(dbeta))
+    """
+    try:
+        import wandb
+    except Exception:
+        return {}
+
+    images = [
+        wandb.Image(_tensor_to_uint8_hwc(x_src, signed_image=True), caption="low"),
+        wandb.Image(_tensor_to_uint8_hwc(x_pred, signed_image=True), caption="pred"),
+        wandb.Image(_tensor_to_uint8_hwc(x_tgt, signed_image=True), caption="gt"),
+    ]
+
+    event_map = events.detach().float().abs().sum(dim=1, keepdim=True)
+    event_map = event_map / event_map.flatten(1).amax(dim=1).view(-1, 1, 1, 1).clamp_min(1e-6)
+    images.append(wandb.Image(_tensor_to_uint8_hwc(event_map, normalize_map=True), caption="event_activity"))
+
+    for key, caption in (("dgamma_abs", "mean_abs_dgamma"), ("dbeta_abs", "mean_abs_dbeta")):
+        if key in event_lora_visuals:
+            heatmap = event_lora_visuals[key]
+            if heatmap.shape[-2:] != x_src.shape[-2:]:
+                heatmap = F.interpolate(
+                    heatmap.float(),
+                    size=x_src.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            images.append(wandb.Image(_tensor_to_uint8_hwc(heatmap, normalize_map=True), caption=caption))
+
+    return {"train/visuals": images}
+
+
+def log_training_history(accelerator, logs, step, report_to):
+    """
+    训练标量日志统一入口。
+
+    W&B run 仍由 Accelerate 初始化；但写 history 时直接取出底层
+    wandb.Run 调用 log，绕过 accelerator.log 在部分环境中不写入
+    W&B history 的问题。非 W&B tracker 继续走 accelerator.log。
+    """
+    if "wandb" not in str(report_to) and str(report_to) != "all":
+        accelerator.log(logs, step=step)
+        return
+    try:
+        wandb_run = accelerator.get_tracker("wandb", unwrap=True)
+        wandb_run.log(logs, step=step)
+    except Exception as exc:
+        logging.warning(f"[W&B] Direct tracker log failed at step={step}: {exc}")
+
+
+def get_wandb_run_from_accelerator(accelerator):
+    """
+    返回 Accelerate 创建的底层 wandb.Run。
+
+    只在主进程调用。失败时返回 None，训练继续运行，避免监控通道影响实验。
+    """
+    try:
+        return accelerator.get_tracker("wandb", unwrap=True)
+    except Exception as exc:
+        logging.warning(f"[W&B] Could not access underlying wandb run: {exc}")
+        return None
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", type=int, choices=[2, 3], default=2)
@@ -115,13 +212,16 @@ def parse_args():
     parser.add_argument("--event_bins", type=int, default=5)
     parser.add_argument("--event_channels", type=int, default=5)
     parser.add_argument("--event_base_channels", type=int, default=32)
-    parser.add_argument("--mod_channels", type=int, default=32)
+    parser.add_argument("--mod_channels", type=int, default=64)
+    parser.add_argument("--mod_num_heads", type=int, default=4)
+    parser.add_argument("--mod_window_size", type=int, default=8)
     parser.add_argument("--modulation_scale", type=float, default=0.1)
 
     parser.add_argument("--train_batch_size", type=int, default=4)
     parser.add_argument("--num_training_epochs", type=int, default=10000)
     parser.add_argument("--max_train_steps", type=int, default=100000)
     parser.add_argument("--checkpointing_steps", type=int, default=500)
+    parser.add_argument("--visualization_steps", type=int, default=5000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
@@ -343,19 +443,51 @@ def main(args):
                     logging.warning(f"[Resume] Failed to load {label}: {exc}")
 
     if accelerator.is_main_process:
-        tracker_config = {k: str(v) if isinstance(v, tuple) else v for k, v in vars(args).items()}
+        tracker_config = {
+            k: str(v) if isinstance(v, tuple) else v
+            for k, v in vars(args).items()
+            if "timestep" not in k
+        }
         init_kwargs = {}
-        if "wandb" in args.report_to or args.report_to == "all":
+        if "wandb" in str(args.report_to) or str(args.report_to) == "all":
             try:
                 import wandb
-                init_kwargs["wandb"] = {"settings": wandb.Settings(insecure_disable_ssl=True)}
+                init_kwargs["wandb"] = {
+                    # console="wrap" forces W&B to capture stdout/stderr in remote runs,
+                    # making the W&B Logs tab useful even before the first training step.
+                    "settings": wandb.Settings(insecure_disable_ssl=True, console="wrap")
+                }
                 if args.wandb_run_name:
                     init_kwargs["wandb"]["name"] = args.wandb_run_name
-            except Exception:
+            except Exception as exc:
+                logging.warning(f"[W&B] Failed to build init kwargs, using Accelerate defaults: {exc}")
                 init_kwargs = {}
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config, init_kwargs=init_kwargs)
+        # Write an immediate heartbeat so the W&B run has history before the
+        # first expensive Stage3 forward/backward step finishes.
+        startup_logs = {
+            "startup/heartbeat": 1.0,
+            "global_step": global_step,
+            "startup/stage": float(args.stage),
+        }
+        if "wandb" in str(args.report_to) or str(args.report_to) == "all":
+            wandb_run = get_wandb_run_from_accelerator(accelerator)
+            if wandb_run is not None:
+                wandb_run.log(startup_logs, step=global_step)
+                logging.info(
+                    "[W&B] Tracker initialized | "
+                    f"id={getattr(wandb_run, 'id', 'unknown')} | "
+                    f"name={getattr(wandb_run, 'name', 'unknown')} | "
+                    f"url={getattr(wandb_run, 'url', 'unknown')} | "
+                    f"dir={getattr(wandb_run, 'dir', 'unknown')}"
+                )
+        else:
+            accelerator.log(startup_logs, step=global_step)
+        logging.info(f"[W&B] Startup heartbeat logged at step={global_step}.")
         logging.info("=" * 60)
         for k, v in sorted(vars(args).items()):
+            if "timestep" in k:
+                continue
             logging.info(f"{k}: {v}")
         logging.info("=" * 60)
 
@@ -454,8 +586,7 @@ def main(args):
                         "loss_kl": loss_kl.detach().item(),
                         "loss_d": loss_d.detach().item(),
                         "lr_event": optimizer.param_groups[0]["lr"],
-                        "timestep": int(shared_timestep.item()),
-                        "s_per_step": s_per_step,
+                        "global_step": global_step,
                         "eta_seconds": eta_seconds,
                         "event_abs_mean": event_abs.mean().item(),
                         "event_abs_max": event_abs.max().item(),
@@ -465,7 +596,19 @@ def main(args):
                         "loss": f"{logs['loss']:.4f}",
                         "eta": format_duration(eta_seconds),
                     })
-                    accelerator.log(logs, step=global_step)
+                    log_training_history(accelerator, logs, global_step, args.report_to)
+                    if args.visualization_steps > 0 and global_step % args.visualization_steps == 0:
+                        visual_logs = build_wandb_visual_logs(
+                            x_src=x_src,
+                            x_pred=x_pred,
+                            x_tgt=x_tgt,
+                            events=events,
+                            event_lora_visuals=collect_event_lora_visuals(
+                                accelerator.unwrap_model(model_gen).unet
+                            ),
+                        )
+                        if visual_logs:
+                            log_training_history(accelerator, visual_logs, global_step, args.report_to)
                     if global_step % 10 == 0:
                         logging.info(
                             f"step={global_step} | loss={logs['loss']:.6f} | "

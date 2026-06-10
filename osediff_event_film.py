@@ -90,8 +90,10 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             self.unet,
             rank=self.args.lora_rank,
             modulation_scale=getattr(self.args, "modulation_scale", 0.1),
-            mod_channels=getattr(self.args, "mod_channels", 32),
+            mod_channels=getattr(self.args, "mod_channels", 64),
             event_channels_by_size=self.event_encoder.out_channels_by_size,
+            mod_num_heads=getattr(self.args, "mod_num_heads", 4),
+            mod_window_size=getattr(self.args, "mod_window_size", 8),
         )
         self.event_film_installed = True
         self.event_film_replaced_names = names
@@ -154,7 +156,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         params = []
         params += [p for p in self.event_encoder.parameters() if p.requires_grad]
         for name, param in self.unet.named_parameters():
-            if param.requires_grad and any(k in name for k in ("event_proj", "z_proj", "modulation_head")):
+            if param.requires_grad and not ("lora_down" in name or "lora_up" in name):
                 params.append(param)
         return params
 
