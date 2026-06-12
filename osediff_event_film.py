@@ -34,6 +34,26 @@ def _normalize_prompt_batch(prompt_batch):
     return list(prompt_batch)
 
 
+def _first_parameter_dtype(module, default=torch.float32):
+    """返回模块第一个参数的 dtype，用于对齐混合精度边界。"""
+    for param in module.parameters(recurse=True):
+        return param.dtype
+    return default
+
+
+def _unet_cross_attention_dtype(unet, default=torch.float32):
+    """
+    推理/训练时 cross-attention 的 text embedding dtype 必须匹配 attn2.to_k/to_v。
+
+    PEFT LoRA wrapper 中 base_layer 可能仍保持 float32，也可能被外层 .to(fp16)
+    转成 float16；这里读取实际权重 dtype，避免把 prompt_embeds 固定成某一种精度。
+    """
+    for name, module in unet.named_modules():
+        if name.endswith("attn2.to_k"):
+            return _first_parameter_dtype(module, default=default)
+    return default
+
+
 def _load_compatible_named_parameters(module, checkpoint_state):
     loaded, skipped = 0, 0
     named = dict(module.named_parameters())
@@ -180,6 +200,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         encoded_control = self.vae.encode(c_t).latent_dist.sample() * self.vae.config.scaling_factor
         prompt_embeds = self.encode_prompt(batch["prompt"])
         neg_prompt_embeds = self.encode_prompt(batch["neg_prompt"])
+        cross_attn_dtype = _unet_cross_attention_dtype(self.unet, default=encoded_control.dtype)
 
         # 事件特征只在 UNet forward 期间放入 LoRA 缓存，避免跨 batch 残留错误条件。
         event_feats = self.event_encoder(events)
@@ -188,7 +209,9 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             model_pred = self.unet(
                 encoded_control,
                 timesteps,
-                encoder_hidden_states=prompt_embeds.to(torch.float32),
+                # prompt_embeds 是 cross-attention 的输入，必须跟 attn2.to_k/to_v
+                # 的实际权重 dtype 一致，否则 fp16 推理会在 PEFT LoRA Linear 报错。
+                encoder_hidden_states=prompt_embeds.to(dtype=cross_attn_dtype),
             ).sample
         finally:
             clear_event_feats_for_all_event_lora(self.unet)
@@ -196,8 +219,10 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         x_denoised = self.noise_scheduler.step(
             model_pred, timesteps, encoded_control, return_dict=True
         ).prev_sample
+        vae_dtype = _first_parameter_dtype(self.vae, default=x_denoised.dtype)
         output_image = (
-            self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample
+            # VAE decode 也处在混合精度边界，latent dtype 跟随 VAE 权重。
+            self.vae.decode(x_denoised.to(dtype=vae_dtype) / self.vae.config.scaling_factor).sample
         ).clamp(-1, 1)
         return output_image, x_denoised, prompt_embeds, neg_prompt_embeds
 
