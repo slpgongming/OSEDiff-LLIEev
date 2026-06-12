@@ -117,6 +117,13 @@ def parse_args():
     parser.add_argument("--event_base_channels", type=int, default=32)
     parser.add_argument("--mod_channels", type=int, default=32)
     parser.add_argument("--modulation_scale", type=float, default=0.1)
+    parser.add_argument(
+        "--regularizer_lora_mode",
+        type=str,
+        default="event_film",
+        choices=["original", "event_film"],
+        help="Use original PEFT LoRA or Event-FiLM LoRA for the fine-tuned regularizer UNet.",
+    )
 
     parser.add_argument("--train_batch_size", type=int, default=4)
     parser.add_argument("--num_training_epochs", type=int, default=10000)
@@ -231,7 +238,7 @@ def main(args):
 
     model_gen = OSEDiffEventFiLMGen(args)
     model_reg = OSEDiffEventFiLMReg(args=args, accelerator=accelerator)
-    model_reg.set_train()
+    model_reg.set_shared_event_encoder(model_gen.event_encoder)
 
     resume_checkpoint = None
     start_epoch = 0
@@ -260,6 +267,7 @@ def main(args):
             model_reg.load_ckpt(reg_state)
 
     model_gen.set_train_stage(args.stage)
+    model_reg.set_train()
 
     if args.enable_xformers_memory_efficient_attention:
         if not is_xformers_available():
@@ -403,6 +411,7 @@ def main(args):
                         neg_prompt_embeds=neg_prompt_embeds,
                         timesteps=shared_timestep,
                         cfg_vsd=args.cfg_vsd,
+                        events=events,
                     ) * args.lambda_vsd
                     loss = loss + loss_kl
                 else:
@@ -413,6 +422,7 @@ def main(args):
                         latents=latents_pred,
                         prompt_embeds=prompt_embeds,
                         timesteps=shared_timestep,
+                        events=events,
                     ) * args.lambda_vsd_lora
                 else:
                     loss_d = torch.zeros((), device=x_src.device)
@@ -443,32 +453,27 @@ def main(args):
 
                 if accelerator.is_main_process:
                     debug_stats = accelerator.unwrap_model(model_gen).debug_stats()
-                    event_abs = events.detach().float().abs()
                     logs = {
-                        "loss": loss.detach().item(),
-                        "loss_l2": loss_l2.detach().item(),
-                        "loss_lpips": loss_lpips.detach().item(),
-                        "loss_edge": loss_edge.detach().item(),
-                        "loss_smooth": loss_smooth.detach().item(),
-                        "loss_mod": loss_mod.detach().item(),
-                        "loss_kl": loss_kl.detach().item(),
-                        "loss_d": loss_d.detach().item(),
-                        "lr_event": optimizer.param_groups[0]["lr"],
-                        "timestep": int(shared_timestep.item()),
-                        "s_per_step": s_per_step,
-                        "eta_seconds": eta_seconds,
-                        "event_abs_mean": event_abs.mean().item(),
-                        "event_abs_max": event_abs.max().item(),
+                        "time/s_per_step": s_per_step,
+                        "time/eta_seconds": eta_seconds,
+                        "loss/total": loss.detach().item(),
+                        "loss/l2": loss_l2.detach().item(),
+                        "loss/lpips": loss_lpips.detach().item(),
+                        "loss/edge": loss_edge.detach().item(),
+                        "loss/smooth": loss_smooth.detach().item(),
+                        "loss/mod": loss_mod.detach().item(),
+                        "loss/vsd": loss_kl.detach().item(),
+                        "loss/regularizer_diff": loss_d.detach().item(),
                     }
                     logs.update({f"event_film/{k}": v for k, v in debug_stats.items()})
                     progress_bar.set_postfix({
-                        "loss": f"{logs['loss']:.4f}",
+                        "loss": f"{logs['loss/total']:.4f}",
                         "eta": format_duration(eta_seconds),
                     })
                     accelerator.log(logs, step=global_step)
                     if global_step % 10 == 0:
                         logging.info(
-                            f"step={global_step} | loss={logs['loss']:.6f} | "
+                            f"step={global_step} | loss={logs['loss/total']:.6f} | "
                             f"elapsed={format_duration(elapsed)} | eta={format_duration(eta_seconds)}"
                         )
                     if global_step % args.checkpointing_steps == 0:
@@ -487,13 +492,11 @@ def main(args):
                                 "regularizer_train_timestep": args.regularizer_train_timestep,
                             },
                             additional_info={
-                                "reg_checkpoint": {
-                                    "state_dict_reg": accelerator.unwrap_model(model_reg).state_dict_reg()
-                                }
+                                "reg_checkpoint": accelerator.unwrap_model(model_reg).checkpoint_state()
                             },
                         )
                         logging.info(f"[Checkpoint] Saved: {outf}")
-                    epoch_loss_sum += logs["loss"]
+                    epoch_loss_sum += logs["loss/total"]
                     epoch_loss_count += 1
 
             if global_step >= args.max_train_steps:
@@ -519,9 +522,7 @@ def main(args):
                 "regularizer_train_timestep": args.regularizer_train_timestep,
             },
             additional_info={
-                "reg_checkpoint": {
-                    "state_dict_reg": accelerator.unwrap_model(model_reg).state_dict_reg()
-                }
+                "reg_checkpoint": accelerator.unwrap_model(model_reg).checkpoint_state()
             },
         )
         logging.info(f"[Final] Saved: {final_path}")

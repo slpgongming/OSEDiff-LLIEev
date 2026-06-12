@@ -47,6 +47,7 @@ accelerate launch --num_processes "$NPROC_PER_NODE" train_event_film_lora_osedif
   --report_to wandb \
   --tracker_project_name OSEDiff_clora_stage2 \
   --wandb_run_name stage2_6-8-2240 \
+  --regularizer_lora_mode "${REGULARIZER_LORA_MODE:-event_film}" \
   --generator_train_timestep "${GENERATOR_TRAIN_TIMESTEP:-400,600}" \
   --regularizer_train_timestep "${REGULARIZER_TRAIN_TIMESTEP:-400,600}" \
   --lambda_vsd "${LAMBDA_VSD:-0.0}" \
