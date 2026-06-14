@@ -147,7 +147,12 @@ def build_wandb_visual_logs(x_src, x_pred, x_tgt, events, event_lora_visuals):
     event_map = event_map / event_map.flatten(1).amax(dim=1).view(-1, 1, 1, 1).clamp_min(1e-6)
     images.append(wandb.Image(_tensor_to_uint8_hwc(event_map, normalize_map=True), caption="event_activity"))
 
-    for key, caption in (("dgamma_abs", "mean_abs_dgamma"), ("dbeta_abs", "mean_abs_dbeta")):
+    for key, caption in (
+        ("dgamma_abs", "mean_abs_dgamma"),
+        ("dbeta_abs", "mean_abs_dbeta"),
+        ("z_event_abs", "mean_abs_z_event"),
+        ("z_delta_abs", "mean_abs_z_delta"),
+    ):
         if key in event_lora_visuals:
             heatmap = event_lora_visuals[key]
             if heatmap.shape[-2:] != x_src.shape[-2:]:
@@ -159,7 +164,7 @@ def build_wandb_visual_logs(x_src, x_pred, x_tgt, events, event_lora_visuals):
                 )
             images.append(wandb.Image(_tensor_to_uint8_hwc(heatmap, normalize_map=True), caption=caption))
 
-    return {"train/visuals": images}
+    return {"event_film/visuals": images}
 
 
 def log_training_history(accelerator, logs, step, report_to):
@@ -216,6 +221,20 @@ def parse_args():
     parser.add_argument("--mod_num_heads", type=int, default=4)
     parser.add_argument("--mod_window_size", type=int, default=8)
     parser.add_argument("--modulation_scale", type=float, default=0.1)
+    parser.add_argument(
+        "--event_lora_variant",
+        type=str,
+        default="film",
+        choices=["film", "residual_cross_attn"],
+        help="Choose Event-LoRA variant for Generator and finetuned regularizer.",
+    )
+    parser.add_argument(
+        "--regularizer_lora_mode",
+        type=str,
+        default="event_lora",
+        choices=["original", "event_lora", "event_film"],
+        help="Use original PEFT LoRA or Event-LoRA for the finetuned regularizer UNet.",
+    )
 
     parser.add_argument("--train_batch_size", type=int, default=4)
     parser.add_argument("--num_training_epochs", type=int, default=10000)
@@ -272,6 +291,9 @@ def parse_args():
 
 
 def main(args):
+    if args.regularizer_lora_mode == "event_film":
+        print("[WARN] --regularizer_lora_mode event_film is deprecated; using event_lora.")
+        args.regularizer_lora_mode = "event_lora"
     if not same_timestep_spec(args.generator_train_timestep, args.regularizer_train_timestep):
         raise ValueError(
             "Generator 和 fine-tuned regularizer 的 timestep 参数必须一致，"
@@ -331,7 +353,7 @@ def main(args):
 
     model_gen = OSEDiffEventFiLMGen(args)
     model_reg = OSEDiffEventFiLMReg(args=args, accelerator=accelerator)
-    model_reg.set_train()
+    model_reg.set_shared_event_encoder(model_gen.event_encoder)
 
     resume_checkpoint = None
     start_epoch = 0
@@ -360,6 +382,7 @@ def main(args):
             model_reg.load_ckpt(reg_state)
 
     model_gen.set_train_stage(args.stage)
+    model_reg.set_train()
 
     if args.enable_xformers_memory_efficient_attention:
         if not is_xformers_available():
@@ -465,15 +488,9 @@ def main(args):
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config, init_kwargs=init_kwargs)
         # Write an immediate heartbeat so the W&B run has history before the
         # first expensive Stage3 forward/backward step finishes.
-        startup_logs = {
-            "startup/heartbeat": 1.0,
-            "global_step": global_step,
-            "startup/stage": float(args.stage),
-        }
         if "wandb" in str(args.report_to) or str(args.report_to) == "all":
             wandb_run = get_wandb_run_from_accelerator(accelerator)
             if wandb_run is not None:
-                wandb_run.log(startup_logs, step=global_step)
                 logging.info(
                     "[W&B] Tracker initialized | "
                     f"id={getattr(wandb_run, 'id', 'unknown')} | "
@@ -481,9 +498,6 @@ def main(args):
                     f"url={getattr(wandb_run, 'url', 'unknown')} | "
                     f"dir={getattr(wandb_run, 'dir', 'unknown')}"
                 )
-        else:
-            accelerator.log(startup_logs, step=global_step)
-        logging.info(f"[W&B] Startup heartbeat logged at step={global_step}.")
         logging.info("=" * 60)
         for k, v in sorted(vars(args).items()):
             if "timestep" in k:
@@ -535,6 +549,7 @@ def main(args):
                         neg_prompt_embeds=neg_prompt_embeds,
                         timesteps=shared_timestep,
                         cfg_vsd=args.cfg_vsd,
+                        events=events,
                     ) * args.lambda_vsd
                     loss = loss + loss_kl
                 else:
@@ -545,6 +560,7 @@ def main(args):
                         latents=latents_pred,
                         prompt_embeds=prompt_embeds,
                         timesteps=shared_timestep,
+                        events=events,
                     ) * args.lambda_vsd_lora
                 else:
                     loss_d = torch.zeros((), device=x_src.device)
@@ -577,23 +593,22 @@ def main(args):
                     debug_stats = accelerator.unwrap_model(model_gen).debug_stats()
                     event_abs = events.detach().float().abs()
                     logs = {
-                        "loss": loss.detach().item(),
-                        "loss_l2": loss_l2.detach().item(),
-                        "loss_lpips": loss_lpips.detach().item(),
-                        "loss_edge": loss_edge.detach().item(),
-                        "loss_smooth": loss_smooth.detach().item(),
-                        "loss_mod": loss_mod.detach().item(),
-                        "loss_kl": loss_kl.detach().item(),
-                        "loss_d": loss_d.detach().item(),
-                        "lr_event": optimizer.param_groups[0]["lr"],
-                        "global_step": global_step,
-                        "eta_seconds": eta_seconds,
-                        "event_abs_mean": event_abs.mean().item(),
-                        "event_abs_max": event_abs.max().item(),
+                        "time/s_per_step": s_per_step,
+                        "time/eta_hours": eta_seconds / 3600.0,
+                        "loss/total": loss.detach().item(),
+                        "loss/l2": loss_l2.detach().item(),
+                        "loss/lpips": loss_lpips.detach().item(),
+                        "loss/edge": loss_edge.detach().item(),
+                        "loss/smooth": loss_smooth.detach().item(),
+                        "loss/mod": loss_mod.detach().item(),
+                        "loss/vsd": loss_kl.detach().item(),
+                        "loss/regularizer_diff": loss_d.detach().item(),
+                        "event_film/event_abs_mean": event_abs.mean().item(),
+                        "event_film/event_abs_max": event_abs.max().item(),
                     }
                     logs.update({f"event_film/{k}": v for k, v in debug_stats.items()})
                     progress_bar.set_postfix({
-                        "loss": f"{logs['loss']:.4f}",
+                        "loss": f"{logs['loss/total']:.4f}",
                         "eta": format_duration(eta_seconds),
                     })
                     log_training_history(accelerator, logs, global_step, args.report_to)
@@ -611,7 +626,7 @@ def main(args):
                             log_training_history(accelerator, visual_logs, global_step, args.report_to)
                     if global_step % 10 == 0:
                         logging.info(
-                            f"step={global_step} | loss={logs['loss']:.6f} | "
+                            f"step={global_step} | loss={logs['loss/total']:.6f} | "
                             f"elapsed={format_duration(elapsed)} | eta={format_duration(eta_seconds)}"
                         )
                     if global_step % args.checkpointing_steps == 0:
@@ -630,13 +645,11 @@ def main(args):
                                 "regularizer_train_timestep": args.regularizer_train_timestep,
                             },
                             additional_info={
-                                "reg_checkpoint": {
-                                    "state_dict_reg": accelerator.unwrap_model(model_reg).state_dict_reg()
-                                }
+                                "reg_checkpoint": accelerator.unwrap_model(model_reg).checkpoint_state()
                             },
                         )
                         logging.info(f"[Checkpoint] Saved: {outf}")
-                    epoch_loss_sum += logs["loss"]
+                    epoch_loss_sum += logs["loss/total"]
                     epoch_loss_count += 1
 
             if global_step >= args.max_train_steps:
@@ -662,9 +675,7 @@ def main(args):
                 "regularizer_train_timestep": args.regularizer_train_timestep,
             },
             additional_info={
-                "reg_checkpoint": {
-                    "state_dict_reg": accelerator.unwrap_model(model_reg).state_dict_reg()
-                }
+                "reg_checkpoint": accelerator.unwrap_model(model_reg).checkpoint_state()
             },
         )
         logging.info(f"[Final] Saved: {final_path}")

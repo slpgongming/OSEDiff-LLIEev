@@ -15,6 +15,8 @@ STAGE1_CKPT="${STAGE1_CKPT:-checkpoints/osediff_lle_5-14-1935/checkpoints/model_
 INIT_FROM_EVENT_CHECKPOINT="${INIT_FROM_EVENT_CHECKPOINT:-checkpoints/OSEDiff_clora_stage2_6-8-2320/checkpoints/model_final.pkl}"
 OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/event_film_lora_stage3_6-10-1330}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-film}"
+REGULARIZER_LORA_MODE="${REGULARIZER_LORA_MODE:-event_lora}"
 
 if [ ! -d "$PRETRAINED_MODEL" ]; then
   echo "[ERROR] PRETRAINED_MODEL does not exist: $PRETRAINED_MODEL" >&2
@@ -22,6 +24,10 @@ if [ ! -d "$PRETRAINED_MODEL" ]; then
 fi
 if [ ! -d "$TRAIN_DATA_ROOT" ]; then
   echo "[ERROR] TRAIN_DATA_ROOT does not exist: $TRAIN_DATA_ROOT" >&2
+  exit 1
+fi
+if [ ! -f "$STAGE1_CKPT" ]; then
+  echo "[ERROR] STAGE1_CKPT does not exist: $STAGE1_CKPT" >&2
   exit 1
 fi
 if [ -z "$RESUME_FROM_CHECKPOINT" ] && [ ! -f "$INIT_FROM_EVENT_CHECKPOINT" ]; then
@@ -51,6 +57,8 @@ accelerate launch --num_processes "$NPROC_PER_NODE" train_event_film_lora_osedif
   --report_to wandb \
   --tracker_project_name OSEDiff_clora_stage3 \
   --wandb_run_name stage3_6-10-1330 \
+  --event_lora_variant "$EVENT_LORA_VARIANT" \
+  --regularizer_lora_mode "$REGULARIZER_LORA_MODE" \
   --generator_train_timestep "${GENERATOR_TRAIN_TIMESTEP:-400,600}" \
   --regularizer_train_timestep "${REGULARIZER_TRAIN_TIMESTEP:-400,600}" \
   --lambda_vsd "${LAMBDA_VSD:-0.5}" \

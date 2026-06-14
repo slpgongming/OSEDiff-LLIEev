@@ -8,6 +8,7 @@ PRETRAINED_MODEL="${PRETRAINED_MODEL:-/path/to/stable-diffusion-2-1-base}"
 TEST_DATA_ROOT="${TEST_DATA_ROOT:-/path/to/SDE_indoor/sde_in_release/test}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-experience/event_film_lora_stage2/checkpoints/model_final.pkl}"
 OUTPUT_DIR="${OUTPUT_DIR:-output_event_film/stage2_test}"
+EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-film}"
 
 if [ ! -d "$PRETRAINED_MODEL" ]; then
   echo "[ERROR] PRETRAINED_MODEL does not exist: $PRETRAINED_MODEL" >&2
@@ -30,6 +31,7 @@ python test_event_film_lora_osediff.py \
   --osediff_path "$CHECKPOINT_PATH" \
   --generator_timestep "${GENERATOR_TIMESTEP:-999}" \
   --image_size 256 \
+  --event_lora_variant "$EVENT_LORA_VARIANT" \
   --mixed_precision fp16 \
   --ablation_modes "${ABLATION_MODES:-correct,zero,shuffled}" \
   --save_debug_vis

@@ -120,8 +120,17 @@ def parse_args():
     parser.add_argument("--event_bins", type=int, default=5)
     parser.add_argument("--event_channels", type=int, default=5)
     parser.add_argument("--event_base_channels", type=int, default=32)
-    parser.add_argument("--mod_channels", type=int, default=32)
+    parser.add_argument("--mod_channels", type=int, default=64)
+    parser.add_argument("--mod_num_heads", type=int, default=4)
+    parser.add_argument("--mod_window_size", type=int, default=8)
     parser.add_argument("--modulation_scale", type=float, default=0.1)
+    parser.add_argument(
+        "--event_lora_variant",
+        type=str,
+        default="film",
+        choices=["film", "residual_cross_attn"],
+        help="Event-LoRA variant; checkpoint value has priority when present.",
+    )
     parser.add_argument("--lora_rank", type=int, default=4)
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["fp16", "fp32"])
     parser.add_argument("--ablation_modes", type=str, default="correct,zero,shuffled")
@@ -192,6 +201,8 @@ def main(args):
                 "event_active_l1": active_l1,
                 "dgamma_abs_mean": debug_stats.get("dgamma_abs_mean", 0.0),
                 "dbeta_abs_mean": debug_stats.get("dbeta_abs_mean", 0.0),
+                "z_event_abs_mean": debug_stats.get("z_event_abs_mean", 0.0),
+                "z_delta_abs_mean": debug_stats.get("z_delta_abs_mean", 0.0),
                 "result_path": result_path,
             })
             print(
@@ -205,7 +216,8 @@ def main(args):
     overall_csv = os.path.join(args.output_dir, "metrics_event_film_ablation_overall.csv")
     per_image_fields = [
         "mode", "scene", "prefix", "frame_id", "psnr", "ssim", "lpips",
-        "event_active_l1", "dgamma_abs_mean", "dbeta_abs_mean", "result_path",
+        "event_active_l1", "dgamma_abs_mean", "dbeta_abs_mean",
+        "z_event_abs_mean", "z_delta_abs_mean", "result_path",
     ]
     scene_fields = ["mode", "scene", "count", *METRIC_NAMES]
     overall_fields = ["mode", "count", *METRIC_NAMES]

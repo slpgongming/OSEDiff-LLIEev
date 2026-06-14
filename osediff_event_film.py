@@ -17,7 +17,7 @@ from models.event_lora_utils import (
     collect_event_lora_debug,
     copy_compatible_state_dict,
     event_film_state_keys,
-    replace_self_attn_to_v_with_event_film_lora,
+    replace_self_attn_to_v_with_event_lora,
     set_event_feats_for_all_event_lora,
     set_event_lora_trainable,
     set_modulation_enabled_for_all_event_lora,
@@ -32,6 +32,11 @@ def _normalize_prompt_batch(prompt_batch):
     if len(prompt_batch) > 0 and isinstance(prompt_batch[0], (list, tuple)):
         return [p[0] for p in prompt_batch]
     return list(prompt_batch)
+
+
+def _normalize_regularizer_lora_mode(mode):
+    # 兼容旧命令中的 event_film；新命令统一使用 event_lora。
+    return "event_lora" if mode == "event_film" else mode
 
 
 def _first_parameter_dtype(module, default=torch.float32):
@@ -106,7 +111,8 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
     def install_event_film_lora(self):
         if self.event_film_installed:
             return 0, self.event_film_replaced_names
-        num_replaced, names = replace_self_attn_to_v_with_event_film_lora(
+        variant = getattr(self.args, "event_lora_variant", "film")
+        num_replaced, names = replace_self_attn_to_v_with_event_lora(
             self.unet,
             rank=self.args.lora_rank,
             modulation_scale=getattr(self.args, "modulation_scale", 0.1),
@@ -114,12 +120,13 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             event_channels_by_size=self.event_encoder.out_channels_by_size,
             mod_num_heads=getattr(self.args, "mod_num_heads", 4),
             mod_window_size=getattr(self.args, "mod_window_size", 8),
+            event_lora_variant=variant,
         )
         self.event_film_installed = True
         self.event_film_replaced_names = names
-        print(f"[Event-FiLM] Replaced {num_replaced} self-attn to_v layer(s).")
+        print(f"[Event-LoRA] variant={variant}. Replaced {num_replaced} self-attn to_v layer(s).")
         for name in names[:20]:
-            print(f"[Event-FiLM]   {name}")
+            print(f"[Event-LoRA]   {name}")
         return num_replaced, names
 
     def load_stage1_full(self, checkpoint_path):
@@ -257,6 +264,13 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             "state_dict_unet": state_unet,
             "state_dict_vae": {k: v for k, v in self.vae.state_dict().items() if "lora" in k},
             "state_dict_event_encoder": self.event_encoder.state_dict(),
+            "event_lora_variant": getattr(self.args, "event_lora_variant", "film"),
+            "event_lora_config": {
+                "mod_channels": getattr(self.args, "mod_channels", 64),
+                "mod_num_heads": getattr(self.args, "mod_num_heads", 4),
+                "mod_window_size": getattr(self.args, "mod_window_size", 8),
+                "modulation_scale": getattr(self.args, "modulation_scale", 0.1),
+            },
             "event_film_replaced_names": self.event_film_replaced_names,
             "stage": stage,
             "timestep_config": timestep_config or {},
@@ -276,6 +290,14 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         torch.save(sd, outf)
 
     def load_event_checkpoint(self, checkpoint):
+        ckpt_variant = checkpoint.get("event_lora_variant")
+        if ckpt_variant is not None and ckpt_variant != getattr(self.args, "event_lora_variant", "film"):
+            print(
+                "[Event-LoRA Load] "
+                f"CLI variant={getattr(self.args, 'event_lora_variant', 'film')}, "
+                f"checkpoint variant={ckpt_variant}; using checkpoint variant."
+            )
+            self.args.event_lora_variant = ckpt_variant
         self.install_event_film_lora()
         unet_loaded, unet_skipped = copy_compatible_state_dict(
             self.unet, checkpoint.get("state_dict_unet", {})
@@ -351,6 +373,12 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
         )
         self.unet_fix.load_state_dict(load_file(os.path.join(unet_dir, "diffusion_pytorch_model.safetensors")))
         self.unet_update, self.lora_unet_modules_encoder, self.lora_unet_modules_decoder, self.lora_unet_others = initialize_unet(args)
+        self.regularizer_lora_mode = _normalize_regularizer_lora_mode(
+            getattr(args, "regularizer_lora_mode", "event_lora")
+        )
+        self._shared_event_encoder_ref = [None]
+        self.event_lora_installed = False
+        self.event_lora_replaced_names = []
         self.lora_rank_unet = args.lora_rank
 
         self.text_encoder.to(accelerator.device, dtype=weight_dtype)
@@ -361,33 +389,131 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
         self.vae.requires_grad_(False)
         self.unet_fix.requires_grad_(False)
 
+    def set_shared_event_encoder(self, event_encoder):
+        # 使用普通 list 保存引用，避免把共享 EventEncoder 注册成 regularizer 的子模块。
+        self._shared_event_encoder_ref[0] = event_encoder
+
+    def get_shared_event_encoder(self):
+        event_encoder = self._shared_event_encoder_ref[0]
+        if event_encoder is None:
+            raise RuntimeError("regularizer_lora_mode=event_lora requires sharing Generator.event_encoder.")
+        return event_encoder
+
+    def install_event_lora(self):
+        if self.regularizer_lora_mode != "event_lora":
+            return 0, self.event_lora_replaced_names
+        if self.event_lora_installed:
+            return 0, self.event_lora_replaced_names
+        event_encoder = self.get_shared_event_encoder()
+        variant = getattr(self.args, "event_lora_variant", "film")
+        num_replaced, names = replace_self_attn_to_v_with_event_lora(
+            self.unet_update,
+            rank=self.args.lora_rank,
+            modulation_scale=getattr(self.args, "modulation_scale", 0.1),
+            mod_channels=getattr(self.args, "mod_channels", 64),
+            event_channels_by_size=event_encoder.out_channels_by_size,
+            mod_num_heads=getattr(self.args, "mod_num_heads", 4),
+            mod_window_size=getattr(self.args, "mod_window_size", 8),
+            event_lora_variant=variant,
+        )
+        self.event_lora_installed = True
+        self.event_lora_replaced_names = names
+        print(f"[Reg Event-LoRA] variant={variant}. Replaced {num_replaced} self-attn to_v layer(s).")
+        for name in names[:20]:
+            print(f"[Reg Event-LoRA]   {name}")
+        return num_replaced, names
+
     def set_train(self):
         self.unet_update.train()
-        for name, param in self.unet_update.named_parameters():
-            param.requires_grad = "lora" in name
+        self.unet_update.requires_grad_(False)
+        if self.regularizer_lora_mode == "event_lora":
+            self.install_event_lora()
+            # regularizer 共享 Generator 的 EventEncoder，但 LoRA A/B 和 Event-LoRA head 独立训练。
+            set_event_lora_trainable(self.unet_update, train_lora=True, train_modulation=True)
+            set_modulation_enabled_for_all_event_lora(self.unet_update, True)
+        else:
+            for name, param in self.unet_update.named_parameters():
+                param.requires_grad = "lora" in name
 
     def load_ckpt(self, checkpoint):
+        ckpt_mode = checkpoint.get("regularizer_lora_mode")
+        if ckpt_mode is not None:
+            self.regularizer_lora_mode = _normalize_regularizer_lora_mode(ckpt_mode)
+        ckpt_variant = checkpoint.get("event_lora_variant")
+        if ckpt_variant is not None:
+            self.args.event_lora_variant = ckpt_variant
         state = checkpoint.get("state_dict_reg", checkpoint.get("state_dict_unet", {}))
-        loaded, skipped = _load_compatible_named_parameters(self.unet_update, state)
-        print(f"[Reg Load] loaded={loaded}, skipped={skipped}")
+        has_event_lora_state = any(
+            any(marker in key for marker in event_film_state_keys())
+            for key in state
+        )
+        if self.regularizer_lora_mode == "event_lora" and has_event_lora_state:
+            self.install_event_lora()
+            loaded, skipped = copy_compatible_state_dict(self.unet_update, state)
+        elif self.regularizer_lora_mode == "event_lora":
+            # 兼容普通 LoRA checkpoint：先加载 PEFT LoRA，再迁移到 Event-LoRA 模块。
+            loaded, skipped = _load_compatible_named_parameters(self.unet_update, state)
+            self.install_event_lora()
+        else:
+            loaded, skipped = _load_compatible_named_parameters(self.unet_update, state)
+        print(
+            "[Reg Load] "
+            f"mode={self.regularizer_lora_mode}, "
+            f"variant={getattr(self.args, 'event_lora_variant', 'film')}, "
+            f"loaded={loaded}, skipped={skipped}, "
+            f"shared_event_encoder={self.regularizer_lora_mode == 'event_lora'}"
+        )
 
     def state_dict_reg(self):
+        keep_markers = ("lora",) + event_film_state_keys()
         return {
             k: v for k, v in self.unet_update.state_dict().items()
-            if "lora" in k
+            if any(marker in k for marker in keep_markers)
         }
 
-    def diff_loss(self, latents, prompt_embeds, timesteps):
+    def checkpoint_state(self):
+        return {
+            "state_dict_reg": self.state_dict_reg(),
+            "regularizer_lora_mode": self.regularizer_lora_mode,
+            "event_lora_variant": getattr(self.args, "event_lora_variant", "film"),
+            "reg_event_lora_replaced_names": self.event_lora_replaced_names,
+        }
+
+    def _predict_with_update_unet(self, noisy_latents, timesteps, prompt_embeds, events):
+        if self.regularizer_lora_mode != "event_lora":
+            return self.unet_update(
+                noisy_latents,
+                timestep=timesteps,
+                encoder_hidden_states=prompt_embeds,
+            ).sample
+
+        # finetuned regularizer 共享 Generator.event_encoder，但这里不反传到共享 encoder；
+        # optimizer_reg 只更新 regularizer 自己的 LoRA A/B 和 Event-LoRA head。
+        with torch.no_grad():
+            event_feats = self.get_shared_event_encoder()(events)
+        event_feats = {key: value.detach() for key, value in event_feats.items()}
+        set_event_feats_for_all_event_lora(self.unet_update, event_feats)
+        try:
+            return self.unet_update(
+                noisy_latents,
+                timestep=timesteps,
+                encoder_hidden_states=prompt_embeds,
+            ).sample
+        finally:
+            clear_event_feats_for_all_event_lora(self.unet_update)
+
+    def diff_loss(self, latents, prompt_embeds, timesteps, events):
         latents, prompt_embeds = latents.detach(), prompt_embeds.detach()
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
         t_batch = timesteps.expand(bsz).to(latents.device).long()
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, t_batch)
-        noise_pred = self.unet_update(
+        noise_pred = self._predict_with_update_unet(
             noisy_latents,
-            timestep=t_batch,
-            encoder_hidden_states=prompt_embeds,
-        ).sample
+            t_batch,
+            prompt_embeds,
+            events,
+        )
         return F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
 
     def eps_to_mu(self, scheduler, model_output, sample, timesteps):
@@ -398,17 +524,18 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
         beta_prod_t = 1 - alpha_prod_t
         return (sample - beta_prod_t.sqrt() * model_output) / alpha_prod_t.sqrt()
 
-    def distribution_matching_loss(self, latents, prompt_embeds, neg_prompt_embeds, timesteps, cfg_vsd):
+    def distribution_matching_loss(self, latents, prompt_embeds, neg_prompt_embeds, timesteps, cfg_vsd, events):
         bsz = latents.shape[0]
         t_batch = timesteps.expand(bsz).to(latents.device).long()
         noise = torch.randn_like(latents)
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, t_batch)
         with torch.no_grad():
-            noise_pred_update = self.unet_update(
+            noise_pred_update = self._predict_with_update_unet(
                 noisy_latents,
-                timestep=t_batch,
-                encoder_hidden_states=prompt_embeds.float(),
-            ).sample
+                t_batch,
+                prompt_embeds.float(),
+                events,
+            )
             x0_pred_update = self.eps_to_mu(self.noise_scheduler, noise_pred_update, noisy_latents, t_batch)
 
             noisy_latents_input = torch.cat([noisy_latents] * 2)
