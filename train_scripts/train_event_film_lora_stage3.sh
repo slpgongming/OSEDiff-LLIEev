@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Stage3：从 Stage2 Event-FiLM checkpoint 初始化，联合训练 Event branch 与 attn1.to_v LoRA。
+# slpchen / Stage3：从同 variant 的 Stage2 checkpoint 初始化，联合训练 Event branch 与 LoRA A/B。
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 export WANDB_INSECURE=true
 export WANDB_INSECURE_DISABLE_SSL=true
 
-PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/zyx111/Chen_Project/PretrainedModel/stable-diffusion-2-1-base}"
-TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/public/home/zyx111/Chen_Project/dataset/SDE_dataset/SDE_indoor/sde_in_release/train}"
+PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/slpchen/stable-diffusion-2-1-base}"
+TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/public/home/slpchen/EvLight--main/SDE_dataset/SDE_indoor/sde_in_release/train}"
 STAGE1_CKPT="${STAGE1_CKPT:-checkpoints/osediff_lle_5-14-1935/checkpoints/model_94001.pkl}"
-INIT_FROM_EVENT_CHECKPOINT="${INIT_FROM_EVENT_CHECKPOINT:-checkpoints/OSEDiff_clora_stage2_6-8-2320/checkpoints/model_final.pkl}"
-OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/OSEDiff_clora_stage3_6-8-2320}"
+INIT_FROM_EVENT_CHECKPOINT="${INIT_FROM_EVENT_CHECKPOINT:-checkpoints/OSEDiff_cbam_lowrank_residual_stage2_6-19/checkpoints/model_final.pkl}"
+OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/OSEDiff_cbam_lowrank_residual_stage3_6-19}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-cbam_lowrank_residual}"
+REGULARIZER_LORA_MODE="${REGULARIZER_LORA_MODE:-same_as_generator}"
 
 if [ ! -d "$PRETRAINED_MODEL" ]; then
   echo "[ERROR] PRETRAINED_MODEL does not exist: $PRETRAINED_MODEL" >&2
@@ -46,14 +48,21 @@ accelerate launch --num_processes "$NPROC_PER_NODE" train_event_film_lora_osedif
   --output_dir "$OUTPUT_DIR" \
   --image_size 256 \
   --train_batch_size "${TRAIN_BATCH_SIZE:-8}" \
+  --dataloader_num_workers "${DATALOADER_NUM_WORKERS:-2}" \
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-1}" \
   --max_train_steps "${MAX_TRAIN_STEPS:-100000}" \
   --checkpointing_steps "${CHECKPOINTING_STEPS:-500}" \
   --mixed_precision fp16 \
   --report_to wandb \
   --tracker_project_name event_film_lora_stage3 \
-  --wandb_run_name "${WANDB_RUN_NAME:-OSEDiff_clora_stage3_6-8-2320}" \
-  --regularizer_lora_mode "${REGULARIZER_LORA_MODE:-event_film}" \
+  --wandb_run_name "${WANDB_RUN_NAME:-cbam_lowrank_residual_stage3_6-19}" \
+  --event_lora_variant "$EVENT_LORA_VARIANT" \
+  --lora_rank "${LORA_RANK:-4}" \
+  --mod_channels "${EVENT_LORA_MOD_CHANNELS:-32}" \
+  --modulation_scale "${EVENT_LORA_MODULATION_SCALE:-0.1}" \
+  --event_lora_cbam_reduction "${EVENT_LORA_CBAM_REDUCTION:-8}" \
+  --event_lora_cbam_spatial_kernel "${EVENT_LORA_CBAM_SPATIAL_KERNEL:-7}" \
+  --regularizer_lora_mode "$REGULARIZER_LORA_MODE" \
   --generator_train_timestep "${GENERATOR_TRAIN_TIMESTEP:-400,600}" \
   --regularizer_train_timestep "${REGULARIZER_TRAIN_TIMESTEP:-400,600}" \
   --lambda_vsd "${LAMBDA_VSD:-0.5}" \

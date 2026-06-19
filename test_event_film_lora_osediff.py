@@ -122,6 +122,22 @@ def parse_args():
     parser.add_argument("--event_base_channels", type=int, default=32)
     parser.add_argument("--mod_channels", type=int, default=32)
     parser.add_argument("--modulation_scale", type=float, default=0.1)
+    parser.add_argument(
+        "--event_lora_variant",
+        type=str,
+        default="film_affine",
+        choices=["film_affine", "cbam_lowrank_residual", "cbam_output_gate"],
+    )
+    parser.add_argument("--event_lora_cbam_reduction", type=int, default=8)
+    parser.add_argument(
+        "--event_lora_cbam_spatial_kernel", type=int, default=7, choices=[3, 7]
+    )
+    parser.add_argument(
+        "--event_lora_output_gate_channels",
+        type=str,
+        default="spatial",
+        choices=["spatial", "channel_spatial"],
+    )
     parser.add_argument("--lora_rank", type=int, default=4)
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["fp16", "fp32"])
     parser.add_argument("--ablation_modes", type=str, default="correct,zero,shuffled")
@@ -192,6 +208,8 @@ def main(args):
                 "event_active_l1": active_l1,
                 "dgamma_abs_mean": debug_stats.get("dgamma_abs_mean", 0.0),
                 "dbeta_abs_mean": debug_stats.get("dbeta_abs_mean", 0.0),
+                "delta_z_abs_mean": debug_stats.get("delta_z_abs_mean", 0.0),
+                "gate_mean": debug_stats.get("gate_mean", 0.0),
                 "result_path": result_path,
             })
             print(
@@ -205,7 +223,8 @@ def main(args):
     overall_csv = os.path.join(args.output_dir, "metrics_event_film_ablation_overall.csv")
     per_image_fields = [
         "mode", "scene", "prefix", "frame_id", "psnr", "ssim", "lpips",
-        "event_active_l1", "dgamma_abs_mean", "dbeta_abs_mean", "result_path",
+        "event_active_l1", "dgamma_abs_mean", "dbeta_abs_mean",
+        "delta_z_abs_mean", "gate_mean", "result_path",
     ]
     scene_fields = ["mode", "scene", "count", *METRIC_NAMES]
     overall_fields = ["mode", "count", *METRIC_NAMES]

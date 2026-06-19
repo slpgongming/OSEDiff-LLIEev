@@ -115,14 +115,44 @@ def parse_args():
     parser.add_argument("--event_bins", type=int, default=5)
     parser.add_argument("--event_channels", type=int, default=5)
     parser.add_argument("--event_base_channels", type=int, default=32)
-    parser.add_argument("--mod_channels", type=int, default=32)
+    parser.add_argument(
+        "--mod_channels",
+        type=int,
+        default=32,
+        help="Event/RGB 融合头的中间通道数；越大表达力越强，但 3x3 融合卷积开销近似平方增长。",
+    )
     parser.add_argument("--modulation_scale", type=float, default=0.1)
+    parser.add_argument(
+        "--event_lora_variant",
+        type=str,
+        default="film_affine",
+        choices=["film_affine", "cbam_lowrank_residual", "cbam_output_gate"],
+    )
+    parser.add_argument(
+        "--event_lora_cbam_reduction",
+        type=int,
+        default=8,
+        help="CBAM channel attention 的压缩比例；越大越省参数，但通道关系表达更弱。",
+    )
+    parser.add_argument(
+        "--event_lora_cbam_spatial_kernel",
+        type=int,
+        default=7,
+        choices=[3, 7],
+        help="CBAM spatial attention 卷积核；7 的感受野更大，3 更轻量。",
+    )
+    parser.add_argument(
+        "--event_lora_output_gate_channels",
+        type=str,
+        default="spatial",
+        choices=["spatial", "channel_spatial"],
+    )
     parser.add_argument(
         "--regularizer_lora_mode",
         type=str,
-        default="event_film",
-        choices=["original", "event_film"],
-        help="Use original PEFT LoRA or Event-FiLM LoRA for the fine-tuned regularizer UNet.",
+        default="same_as_generator",
+        choices=["original", "same_as_generator", "event_film"],
+        help="unet_update 使用普通 PEFT LoRA，或使用与 Generator 同结构但权重独立的 Event-LoRA。",
     )
 
     parser.add_argument("--train_batch_size", type=int, default=4)
@@ -188,11 +218,16 @@ def main(args):
     setup_wandb_ssl_bypass()
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-    # Event-FiLM 的 smooth/mod 正则在训练 loop 中直接读取模块参数，
-    # 属于 DDP forward 之外的额外梯度路径。若开启 find_unused_parameters，
-    # DDP 的 unused-param hook 可能和正则项梯度重复标记同一参数 ready。
-    # Stage2/Stage3 训练前已经按阶段冻结无关分支，因此这里关闭 unused 扫描。
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    # 每个 Event-LoRA 层都保存多个 event 尺度对应的 1x1 projection，但一次
+    # forward 只会选择与当前 token 分辨率最接近的一支。其余 projection 在该轮
+    # 不参与计算，因此 DDP 必须启用 unused-parameter 检测；否则第一步 backward
+    # 后仍有 bucket 未完成归约，第二步 forward 会报
+    # "Expected to have finished reduction in the prior iteration"。
+    #
+    # 当前 smooth/mod 正则读取的是同一次 forward 产生的 last_aux 张量，这些张量
+    # 与图像重建输出属于同一计算图，不再是独立读取模块参数的额外梯度路径，
+    # 因而可以安全地配合 find_unused_parameters=True。
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -238,7 +273,9 @@ def main(args):
 
     model_gen = OSEDiffEventFiLMGen(args)
     model_reg = OSEDiffEventFiLMReg(args=args, accelerator=accelerator)
-    model_reg.set_shared_event_encoder(model_gen.event_encoder)
+    model_reg.set_shared_event_encoder(
+        model_gen.event_encoder, model_gen.event_lora_config
+    )
 
     resume_checkpoint = None
     start_epoch = 0
@@ -249,7 +286,7 @@ def main(args):
         model_gen.load_event_checkpoint(resume_checkpoint)
         reg_state = resume_checkpoint.get("additional_info", {}).get("reg_checkpoint", {})
         if reg_state:
-            model_reg.load_ckpt(reg_state)
+            model_reg.load_ckpt(reg_state, strict_config=True)
         start_epoch = int(resume_checkpoint.get("epoch", 0))
         global_step = int(resume_checkpoint.get("global_step", 0))
     elif args.init_from_event_checkpoint is not None:
@@ -258,13 +295,13 @@ def main(args):
         model_gen.load_event_checkpoint(init_checkpoint)
         reg_state = init_checkpoint.get("additional_info", {}).get("reg_checkpoint", {})
         if reg_state:
-            model_reg.load_ckpt(reg_state)
+            model_reg.load_ckpt(reg_state, strict_config=False)
     else:
         logging.info(f"[Stage1] Loading full Stage1 checkpoint: {args.stage1_checkpoint}")
         stage1_checkpoint = model_gen.load_stage1_full(args.stage1_checkpoint)
         reg_state = stage1_checkpoint.get("additional_info", {}).get("reg_checkpoint", {})
         if reg_state:
-            model_reg.load_ckpt(reg_state)
+            model_reg.load_ckpt(reg_state, strict_config=False)
 
     model_gen.set_train_stage(args.stage)
     model_reg.set_train()
@@ -465,7 +502,12 @@ def main(args):
                         "loss/vsd": loss_kl.detach().item(),
                         "loss/regularizer_diff": loss_d.detach().item(),
                     }
-                    logs.update({f"event_film/{k}": v for k, v in debug_stats.items()})
+                    logs.update({f"event_lora/{k}": v for k, v in debug_stats.items()})
+                    logs["event_lora/variant_id"] = {
+                        "film_affine": 0,
+                        "cbam_lowrank_residual": 1,
+                        "cbam_output_gate": 2,
+                    }[args.event_lora_variant]
                     progress_bar.set_postfix({
                         "loss": f"{logs['loss/total']:.4f}",
                         "eta": format_duration(eta_seconds),
