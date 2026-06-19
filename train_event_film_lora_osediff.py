@@ -152,6 +152,8 @@ def build_wandb_visual_logs(x_src, x_pred, x_tgt, events, event_lora_visuals):
         ("dbeta_abs", "mean_abs_dbeta"),
         ("z_event_abs", "mean_abs_z_event"),
         ("z_delta_abs", "mean_abs_z_delta"),
+        ("bax_event_abs", "mean_abs_bax_event"),
+        ("bax_delta_abs", "mean_abs_bax_delta"),
     ):
         if key in event_lora_visuals:
             heatmap = event_lora_visuals[key]
@@ -225,7 +227,7 @@ def parse_args():
         "--event_lora_variant",
         type=str,
         default="film",
-        choices=["film", "residual_cross_attn"],
+        choices=["film", "residual_cross_attn", "residual_cross_attn_bax"],
         help="Choose Event-LoRA variant for Generator and finetuned regularizer.",
     )
     parser.add_argument(
@@ -364,7 +366,8 @@ def main(args):
         model_gen.load_event_checkpoint(resume_checkpoint)
         reg_state = resume_checkpoint.get("additional_info", {}).get("reg_checkpoint", {})
         if reg_state:
-            model_reg.load_ckpt(reg_state)
+            # 断点续训必须恢复 checkpoint 中的 regularizer 结构。
+            model_reg.load_ckpt(reg_state, restore_mode_from_checkpoint=True)
         start_epoch = int(resume_checkpoint.get("epoch", 0))
         global_step = int(resume_checkpoint.get("global_step", 0))
     elif args.init_from_event_checkpoint is not None:
@@ -373,13 +376,18 @@ def main(args):
         model_gen.load_event_checkpoint(init_checkpoint)
         reg_state = init_checkpoint.get("additional_info", {}).get("reg_checkpoint", {})
         if reg_state:
-            model_reg.load_ckpt(reg_state)
+            # Stage3 初始化时由当前 CLI/REGULARIZER_LORA_MODE 决定 unet_update 结构。
+            model_reg.load_ckpt(reg_state, restore_mode_from_checkpoint=False)
     else:
         logging.info(f"[Stage1] Loading full Stage1 checkpoint: {args.stage1_checkpoint}")
         stage1_checkpoint = model_gen.load_stage1_full(args.stage1_checkpoint)
         reg_state = stage1_checkpoint.get("additional_info", {}).get("reg_checkpoint", {})
         if reg_state:
-            model_reg.load_ckpt(reg_state)
+            model_reg.load_ckpt(reg_state, restore_mode_from_checkpoint=False)
+
+    if not reg_state:
+        # 没有 regularizer checkpoint 时，unet_update 明确跟随 Generator 当前变体。
+        model_reg.regularizer_event_lora_variant = args.event_lora_variant
 
     model_gen.set_train_stage(args.stage)
     model_reg.set_train()

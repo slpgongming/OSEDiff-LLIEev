@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Stage3：从 Stage2 Event-FiLM checkpoint 初始化，联合训练 Event branch 与 attn1.to_v LoRA。
+# Stage3 BAx：从 Stage2 BAx checkpoint 初始化，
+# 联合训练 Event branch 与 Generator attn1.to_v LoRA A/B。
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 export WANDB_MODE="${WANDB_MODE:-online}"
@@ -12,11 +13,14 @@ export WANDB_INSECURE_DISABLE_SSL=true
 PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/zyx111/Chen_Project/PretrainedModel/stable-diffusion-2-1-base}"
 TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/public/home/zyx111/Chen_Project/dataset/SDE_dataset/SDE_indoor/sde_in_release/train}"
 STAGE1_CKPT="${STAGE1_CKPT:-checkpoints/osediff_lle_5-14-1935/checkpoints/model_94001.pkl}"
-INIT_FROM_EVENT_CHECKPOINT="${INIT_FROM_EVENT_CHECKPOINT:-checkpoints/OSEDiff_clora_stage2_6-8-2320/checkpoints/model_final.pkl}"
-OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/event_film_lora_stage3_6-10-1330}"
+INIT_FROM_EVENT_CHECKPOINT="${INIT_FROM_EVENT_CHECKPOINT:-checkpoints/OSEDiff_clora_bax_stage2/checkpoints/model_final.pkl}"
+OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/OSEDiff_clora_bax_stage3}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
-EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-film}"
-REGULARIZER_LORA_MODE="${REGULARIZER_LORA_MODE:-event_lora}"
+# Generator 使用的 Event-LoRA 变体；加载 Stage2 checkpoint 时以 checkpoint 元数据为准。
+EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-residual_cross_attn_bax}"
+# event_lora: unet_update 跟随 Generator 使用 BAx 变体；
+# original: unet_update 保持普通 PEFT LoRA。unet_fix 始终不注入 Event-LoRA。
+REGULARIZER_LORA_MODE="${REGULARIZER_LORA_MODE:-original}"
 
 if [ ! -d "$PRETRAINED_MODEL" ]; then
   echo "[ERROR] PRETRAINED_MODEL does not exist: $PRETRAINED_MODEL" >&2
@@ -56,7 +60,7 @@ accelerate launch --num_processes "$NPROC_PER_NODE" train_event_film_lora_osedif
   --mixed_precision fp16 \
   --report_to wandb \
   --tracker_project_name OSEDiff_clora_stage3 \
-  --wandb_run_name stage3_6-10-1330 \
+  --wandb_run_name "${WANDB_RUN_NAME:-residual_cross_attn_bax_stage3}" \
   --event_lora_variant "$EVENT_LORA_VARIANT" \
   --regularizer_lora_mode "$REGULARIZER_LORA_MODE" \
   --generator_train_timestep "${GENERATOR_TRAIN_TIMESTEP:-400,600}" \

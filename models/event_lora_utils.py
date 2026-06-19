@@ -53,6 +53,35 @@ def _event_lora_attr_name(variant):
     return f"_event_lora_shared_heads_{variant}"
 
 
+def _infer_bax_query_channels_by_size(unet, event_channels_by_size):
+    """
+    根据 UNet block channels 推导各空间尺度 BAx 的通道数。
+
+    对 256 输入的 SD2.1 UNet，event 尺度 32/16/8/4 对应
+    block_out_channels 320/640/1280/1280。
+    """
+    config = getattr(unet, "config", None)
+    block_channels = getattr(config, "block_out_channels", None)
+    if block_channels is None and isinstance(config, dict):
+        block_channels = config.get("block_out_channels")
+    if block_channels is None:
+        raise ValueError(
+            "residual_cross_attn_bax requires unet.config.block_out_channels."
+        )
+
+    sizes = sorted((int(size) for size in event_channels_by_size), reverse=True)
+    block_channels = [int(channels) for channels in block_channels]
+    if len(sizes) != len(block_channels):
+        raise ValueError(
+            "无法为 BAx head 建立尺度-通道映射："
+            f"event_sizes={sizes}, block_out_channels={block_channels}."
+        )
+    return {
+        str(size): channels
+        for size, channels in zip(sizes, block_channels)
+    }
+
+
 def replace_self_attn_to_v_with_event_lora(
     unet,
     rank=4,
@@ -69,9 +98,20 @@ def replace_self_attn_to_v_with_event_lora(
     返回：
         (num_replaced, replaced_names)
     """
+    event_channels_by_size = event_channels_by_size or {
+        "32": 64,
+        "16": 96,
+        "8": 128,
+        "4": 128,
+    }
     replaced_names = []
     shared_attr = _event_lora_attr_name(event_lora_variant)
     shared_heads = getattr(unet, shared_attr, None)
+    query_channels_by_size = None
+    if event_lora_variant == "residual_cross_attn_bax":
+        query_channels_by_size = _infer_bax_query_channels_by_size(
+            unet, event_channels_by_size
+        )
     shared_rank = None
     for name, module in list(unet.named_modules()):
         if not name.endswith("attn1.to_v"):
@@ -86,6 +126,7 @@ def replace_self_attn_to_v_with_event_lora(
                 dim=mod_channels,
                 num_heads=mod_num_heads,
                 window_size=mod_window_size,
+                query_channels_by_size=query_channels_by_size,
             )
             # 将共享 Event-LoRA heads 注册到当前 UNet 顶层；Generator 与
             # finetuned regularizer 会各自调用本函数，因此权重天然独立。
@@ -175,6 +216,10 @@ def collect_event_lora_debug(unet):
         "z_event_abs_max": [],
         "z_delta_abs_mean": [],
         "z_delta_abs_max": [],
+        "bax_event_abs_mean": [],
+        "bax_event_abs_max": [],
+        "bax_delta_abs_mean": [],
+        "bax_delta_abs_max": [],
         "base_norm": [],
         "lora_norm": [],
     }

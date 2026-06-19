@@ -128,7 +128,7 @@ def parse_args():
         "--event_lora_variant",
         type=str,
         default="film",
-        choices=["film", "residual_cross_attn"],
+        choices=["film", "residual_cross_attn", "residual_cross_attn_bax"],
         help="Event-LoRA variant; checkpoint value has priority when present.",
     )
     parser.add_argument("--lora_rank", type=int, default=4)
@@ -203,6 +203,8 @@ def main(args):
                 "dbeta_abs_mean": debug_stats.get("dbeta_abs_mean", 0.0),
                 "z_event_abs_mean": debug_stats.get("z_event_abs_mean", 0.0),
                 "z_delta_abs_mean": debug_stats.get("z_delta_abs_mean", 0.0),
+                "bax_event_abs_mean": debug_stats.get("bax_event_abs_mean", 0.0),
+                "bax_delta_abs_mean": debug_stats.get("bax_delta_abs_mean", 0.0),
                 "result_path": result_path,
             })
             print(
@@ -217,7 +219,8 @@ def main(args):
     per_image_fields = [
         "mode", "scene", "prefix", "frame_id", "psnr", "ssim", "lpips",
         "event_active_l1", "dgamma_abs_mean", "dbeta_abs_mean",
-        "z_event_abs_mean", "z_delta_abs_mean", "result_path",
+        "z_event_abs_mean", "z_delta_abs_mean",
+        "bax_event_abs_mean", "bax_delta_abs_mean", "result_path",
     ]
     scene_fields = ["mode", "scene", "count", *METRIC_NAMES]
     overall_fields = ["mode", "count", *METRIC_NAMES]

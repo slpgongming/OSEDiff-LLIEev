@@ -71,6 +71,40 @@ def _load_compatible_named_parameters(module, checkpoint_state):
     return loaded, skipped
 
 
+def _load_event_lora_ab_into_peft(module, checkpoint_state):
+    """
+    将 Event-LoRA 的 lora_down/lora_up 反向迁移到普通 PEFT LoRA A/B。
+
+    这样 Stage3 从 Event-LoRA checkpoint 初始化时，仍可通过
+    regularizer_lora_mode=original 让 unet_update 回到普通 PEFT LoRA。
+    """
+    named = dict(module.named_parameters())
+    loaded = 0
+    for source_name, tensor in checkpoint_state.items():
+        if source_name.endswith(".lora_down.weight"):
+            prefix = source_name[: -len(".lora_down.weight")]
+            target_marker = f"{prefix}.lora_A."
+        elif source_name.endswith(".lora_up.weight"):
+            prefix = source_name[: -len(".lora_up.weight")]
+            target_marker = f"{prefix}.lora_B."
+        else:
+            continue
+
+        candidates = [
+            (name, param)
+            for name, param in named.items()
+            if name.startswith(target_marker) and name.endswith(".weight")
+        ]
+        if len(candidates) != 1:
+            continue
+        _, target = candidates[0]
+        if target.shape != tensor.shape:
+            continue
+        target.data.copy_(tensor.to(device=target.device, dtype=target.dtype))
+        loaded += 1
+    return loaded
+
+
 class OSEDiffEventFiLMGen(torch.nn.Module):
     """
     Event-FiLM LoRA Generator。
@@ -376,6 +410,11 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
         self.regularizer_lora_mode = _normalize_regularizer_lora_mode(
             getattr(args, "regularizer_lora_mode", "event_lora")
         )
+        # unet_update 默认跟随 Generator 的 Event-LoRA 变体，但保存为独立元数据，
+        # 便于 checkpoint 加载时检查两侧结构是否一致。
+        self.regularizer_event_lora_variant = getattr(
+            args, "event_lora_variant", "film"
+        )
         self._shared_event_encoder_ref = [None]
         self.event_lora_installed = False
         self.event_lora_replaced_names = []
@@ -405,7 +444,7 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
         if self.event_lora_installed:
             return 0, self.event_lora_replaced_names
         event_encoder = self.get_shared_event_encoder()
-        variant = getattr(self.args, "event_lora_variant", "film")
+        variant = self.regularizer_event_lora_variant
         num_replaced, names = replace_self_attn_to_v_with_event_lora(
             self.unet_update,
             rank=self.args.lora_rank,
@@ -435,13 +474,26 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
             for name, param in self.unet_update.named_parameters():
                 param.requires_grad = "lora" in name
 
-    def load_ckpt(self, checkpoint):
+    def load_ckpt(self, checkpoint, restore_mode_from_checkpoint=True):
         ckpt_mode = checkpoint.get("regularizer_lora_mode")
-        if ckpt_mode is not None:
+        if restore_mode_from_checkpoint and ckpt_mode is not None:
             self.regularizer_lora_mode = _normalize_regularizer_lora_mode(ckpt_mode)
         ckpt_variant = checkpoint.get("event_lora_variant")
-        if ckpt_variant is not None:
-            self.args.event_lora_variant = ckpt_variant
+        reg_variant = checkpoint.get(
+            "regularizer_event_lora_variant", ckpt_variant
+        )
+        generator_variant = getattr(self.args, "event_lora_variant", "film")
+        if (
+            self.regularizer_lora_mode == "event_lora"
+            and reg_variant is not None
+            and reg_variant != generator_variant
+        ):
+            raise ValueError(
+                "Generator 与 unet_update 的 Event-LoRA 变体不一致："
+                f"generator={generator_variant}, regularizer={reg_variant}."
+            )
+        if reg_variant is not None:
+            self.regularizer_event_lora_variant = reg_variant
         state = checkpoint.get("state_dict_reg", checkpoint.get("state_dict_unet", {}))
         has_event_lora_state = any(
             any(marker in key for marker in event_film_state_keys())
@@ -456,10 +508,13 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
             self.install_event_lora()
         else:
             loaded, skipped = _load_compatible_named_parameters(self.unet_update, state)
+            migrated = _load_event_lora_ab_into_peft(self.unet_update, state)
+            loaded += migrated
+            skipped = max(skipped - migrated, 0)
         print(
             "[Reg Load] "
             f"mode={self.regularizer_lora_mode}, "
-            f"variant={getattr(self.args, 'event_lora_variant', 'film')}, "
+            f"variant={self.regularizer_event_lora_variant}, "
             f"loaded={loaded}, skipped={skipped}, "
             f"shared_event_encoder={self.regularizer_lora_mode == 'event_lora'}"
         )
@@ -475,7 +530,10 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
         return {
             "state_dict_reg": self.state_dict_reg(),
             "regularizer_lora_mode": self.regularizer_lora_mode,
-            "event_lora_variant": getattr(self.args, "event_lora_variant", "film"),
+            # event_lora_variant 保留给旧 checkpoint 读取；
+            # 新字段明确表示这是 unet_update 自己的结构元数据。
+            "event_lora_variant": self.regularizer_event_lora_variant,
+            "regularizer_event_lora_variant": self.regularizer_event_lora_variant,
             "reg_event_lora_replaced_names": self.event_lora_replaced_names,
         }
 

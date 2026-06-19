@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-EVENT_LORA_VARIANTS = ("film", "residual_cross_attn")
+EVENT_LORA_VARIANTS = ("film", "residual_cross_attn", "residual_cross_attn_bax")
 
 
 class WindowRGBEventCrossAttentionCore(nn.Module):
@@ -13,7 +13,7 @@ class WindowRGBEventCrossAttentionCore(nn.Module):
     Window RGB-Event Cross-Attention 共享核心。
 
     输入:
-        z_map:      [B, rank, H, W]，LoRA A 的低秩空间特征。
+        z_map:      [B, C_query, H, W]，LoRA Ax 或 BAx 空间特征。
         event_feat: [B, C_event, H, W]，同尺度或可插值到同尺度的事件特征。
     输出:
         fz/fe/fa:   [B, dim, H, W]，分别是 LoRA 投影、event 投影、cross-attn 输出。
@@ -21,8 +21,9 @@ class WindowRGBEventCrossAttentionCore(nn.Module):
 
     def __init__(
         self,
-        rank,
         event_channels,
+        rank=None,
+        query_channels=None,
         dim=64,
         num_heads=4,
         window_size=8,
@@ -32,7 +33,13 @@ class WindowRGBEventCrossAttentionCore(nn.Module):
         if dim % num_heads != 0:
             raise ValueError(f"mod_channels/dim={dim} must be divisible by num_heads={num_heads}.")
 
-        self.rank = int(rank)
+        if query_channels is None:
+            query_channels = rank
+        if query_channels is None:
+            raise ValueError("Window cross-attention requires query_channels or rank.")
+        self.query_channels = int(query_channels)
+        # 保留 rank 属性，兼容旧代码对共享核心的检查和旧 checkpoint 语义。
+        self.rank = self.query_channels
         self.event_channels = int(event_channels)
         self.dim = int(dim)
         self.num_heads = int(num_heads)
@@ -40,7 +47,7 @@ class WindowRGBEventCrossAttentionCore(nn.Module):
         self.use_dwconv_pe = bool(use_dwconv_pe)
 
         # z_proj 将 LoRA 低秩空间投影到 attention dim；event_proj 对齐事件特征通道。
-        self.z_proj = nn.Conv2d(self.rank, self.dim, kernel_size=1)
+        self.z_proj = nn.Conv2d(self.query_channels, self.dim, kernel_size=1)
         self.event_proj = nn.Conv2d(self.event_channels, self.dim, kernel_size=1)
 
         if self.use_dwconv_pe:
@@ -86,6 +93,11 @@ class WindowRGBEventCrossAttentionCore(nn.Module):
         return x.view(bsz, channels, height, width)
 
     def forward(self, z_map, event_feat):
+        if z_map.shape[1] != self.query_channels:
+            raise ValueError(
+                "Window cross-attention Query 通道不匹配："
+                f"expected={self.query_channels}, got={z_map.shape[1]}."
+            )
         bsz, _, height, width = z_map.shape
         if event_feat.shape[-2:] != (height, width):
             # 事件编码器输出是固定多尺度特征；这里按 LoRA token 的真实空间尺度对齐。
@@ -245,6 +257,54 @@ class ResidualEventCrossAttentionHead(nn.Module):
         return self.out_proj(fuse)
 
 
+class ResidualBAxEventCrossAttentionHead(nn.Module):
+    """
+    BAx 输出空间的 Event Cross-Attention residual head。
+
+    输入:
+        bax_map:    [B, C_out, H, W]，普通 LoRA 的未缩放输出 B(Ax)。
+        event_feat: [B, C_event, H, W]。
+    输出:
+        bax_event:  [B, C_out, H, W]，加到 BAx 上的事件残差。
+    """
+
+    def __init__(
+        self,
+        query_channels,
+        event_channels,
+        dim=64,
+        num_heads=4,
+        window_size=8,
+        use_dwconv_pe=True,
+    ):
+        super().__init__()
+        self.query_channels = int(query_channels)
+        self.core = WindowRGBEventCrossAttentionCore(
+            query_channels=self.query_channels,
+            event_channels=event_channels,
+            dim=dim,
+            num_heads=num_heads,
+            window_size=window_size,
+            use_dwconv_pe=use_dwconv_pe,
+        )
+        self.out_proj = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(dim, self.query_channels, kernel_size=1),
+        )
+        self.zero_init_last()
+
+    def zero_init_last(self):
+        # 初始 bax_event=0，保证新变体严格退化为普通 LoRA。
+        last = self.out_proj[-1]
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
+
+    def forward(self, bax_map, event_feat):
+        _, _, fa = self.core(bax_map, event_feat)
+        return self.out_proj(fa)
+
+
 class SharedEventLoRAHeads(nn.Module):
     """
     同尺度共享的 Event-LoRA head 容器。
@@ -252,7 +312,9 @@ class SharedEventLoRAHeads(nn.Module):
     作用：
     - 相同空间分辨率共享一个 event head；
     - Generator 和 finetuned regularizer 各自拥有独立容器；
-    - `film` 返回 dgamma/dbeta，`residual_cross_attn` 返回 z_event。
+    - `film` 返回 dgamma/dbeta；
+    - `residual_cross_attn` 返回低秩空间 z_event；
+    - `residual_cross_attn_bax` 返回 LoRA 输出空间 bax_event。
     """
 
     def __init__(
@@ -265,6 +327,7 @@ class SharedEventLoRAHeads(nn.Module):
         window_size=8,
         use_dwconv_pe=True,
         use_local_event_concat=True,
+        query_channels_by_size=None,
     ):
         super().__init__()
         if variant not in EVENT_LORA_VARIANTS:
@@ -276,6 +339,11 @@ class SharedEventLoRAHeads(nn.Module):
             "8": 128,
             "4": 128,
         }
+        self.query_channels_by_size = (
+            {str(k): int(v) for k, v in query_channels_by_size.items()}
+            if query_channels_by_size is not None
+            else None
+        )
 
         heads = {}
         for size, channels in self.event_channels_by_size.items():
@@ -299,6 +367,20 @@ class SharedEventLoRAHeads(nn.Module):
                     use_dwconv_pe=use_dwconv_pe,
                     # residual 第一版只使用 fa，解释最干净；后续可单独做 concat ablation。
                     use_local_event_concat=False,
+                )
+            elif variant == "residual_cross_attn_bax":
+                if self.query_channels_by_size is None or str(size) not in self.query_channels_by_size:
+                    raise ValueError(
+                        "residual_cross_attn_bax requires query_channels_by_size "
+                        f"for spatial size {size}."
+                    )
+                heads[str(size)] = ResidualBAxEventCrossAttentionHead(
+                    query_channels=self.query_channels_by_size[str(size)],
+                    event_channels=channels,
+                    dim=dim,
+                    num_heads=num_heads,
+                    window_size=window_size,
+                    use_dwconv_pe=use_dwconv_pe,
                 )
         self.heads = nn.ModuleDict(heads)
 
@@ -324,6 +406,7 @@ class SpatialRGBEventFiLMLoRALinear(nn.Module):
     支持:
     - film: 在 LoRA 低秩空间做 gamma/beta 调制；
     - residual_cross_attn: 在 LoRA 低秩空间加入事件 cross-attn residual。
+    - residual_cross_attn_bax: 在 LoRA 输出空间对 BAx 加事件 cross-attn residual。
 
     输入 hidden_states:
         [B, N, C]，其中 N=H*W 是 self-attention 的图像 token 数。
@@ -371,6 +454,11 @@ class SpatialRGBEventFiLMLoRALinear(nn.Module):
         self.lora_up = nn.Linear(self.rank, out_features, bias=False)
 
         if shared_modulation_heads is None:
+            query_channels_by_size = None
+            if self.event_lora_variant == "residual_cross_attn_bax":
+                query_channels_by_size = {
+                    str(size): out_features for size in self.event_channels_by_size
+                }
             self.shared_modulation_heads = SharedEventLoRAHeads(
                 variant=self.event_lora_variant,
                 rank=self.rank,
@@ -378,6 +466,7 @@ class SpatialRGBEventFiLMLoRALinear(nn.Module):
                 dim=self.mod_channels,
                 num_heads=mod_num_heads,
                 window_size=mod_window_size,
+                query_channels_by_size=query_channels_by_size,
             )
         else:
             # shared_modulation_heads 已作为 UNet 顶层子模块注册；这里保存引用即可，
@@ -410,7 +499,7 @@ class SpatialRGBEventFiLMLoRALinear(nn.Module):
         ):
             lora_out = self.lora_up(z) * self.scaling
             self.last_z_delta = None
-            self._record_debug(None, None, None, base_out, lora_out)
+            self._record_debug(None, None, None, None, base_out, lora_out)
             return base_out + lora_out
 
         bsz, token_count, _ = hidden_states.shape
@@ -429,20 +518,34 @@ class SpatialRGBEventFiLMLoRALinear(nn.Module):
             z_mod = (1.0 + scale * torch.tanh(dgamma)) * z_map
             z_mod = z_mod + scale * dbeta
             z_event = None
+            bax_event = None
         elif self.event_lora_variant == "residual_cross_attn":
             z_event = self.shared_modulation_heads(z_map, self.event_feats)
             dgamma, dbeta = None, None
             z_mod = z_map + scale * z_event
+            bax_event = None
+        elif self.event_lora_variant == "residual_cross_attn_bax":
+            # 新变体先得到未缩放 BAx，再以 BAx 为 Query 检索同尺度事件特征。
+            bax = self.lora_up(z)
+            bax_map = bax.transpose(1, 2).reshape(
+                bsz, self.base_linear.out_features, spatial, spatial
+            )
+            bax_event = self.shared_modulation_heads(bax_map, self.event_feats)
+            bax_mod = bax_map + scale * bax_event
+            self.last_z_delta = (bax_mod - bax_map).detach()
+            lora_out = bax_mod.flatten(2).transpose(1, 2).contiguous() * self.scaling
+            self._record_debug(None, None, None, bax_event, base_out, lora_out)
+            return base_out + lora_out
         else:
             raise ValueError(f"Unsupported event_lora_variant={self.event_lora_variant}.")
 
         self.last_z_delta = (z_mod - z_map).detach()
         z_mod = z_mod.flatten(2).transpose(1, 2).contiguous()
         lora_out = self.lora_up(z_mod) * self.scaling
-        self._record_debug(dgamma, dbeta, z_event, base_out, lora_out)
+        self._record_debug(dgamma, dbeta, z_event, bax_event, base_out, lora_out)
         return base_out + lora_out
 
-    def _record_debug(self, dgamma, dbeta, z_event, base_out, lora_out):
+    def _record_debug(self, dgamma, dbeta, z_event, bax_event, base_out, lora_out):
         zero = base_out.detach().float().new_tensor(0.0)
         self.last_visuals = {}
         self.last_debug = {
@@ -454,6 +557,10 @@ class SpatialRGBEventFiLMLoRALinear(nn.Module):
             "z_event_abs_max": zero,
             "z_delta_abs_mean": zero,
             "z_delta_abs_max": zero,
+            "bax_event_abs_mean": zero,
+            "bax_event_abs_max": zero,
+            "bax_delta_abs_mean": zero,
+            "bax_delta_abs_max": zero,
             "base_norm": base_out.detach().float().norm(),
             "lora_norm": lora_out.detach().float().norm(),
         }
@@ -480,6 +587,14 @@ class SpatialRGBEventFiLMLoRALinear(nn.Module):
             })
             self.last_visuals["z_event_abs"] = z_event_abs.mean(dim=1, keepdim=True)
 
+        if bax_event is not None:
+            bax_event_abs = bax_event.detach().abs()
+            self.last_debug.update({
+                "bax_event_abs_mean": bax_event_abs.mean(),
+                "bax_event_abs_max": bax_event_abs.max(),
+            })
+            self.last_visuals["bax_event_abs"] = bax_event_abs.mean(dim=1, keepdim=True)
+
         if self.last_z_delta is not None:
             z_delta_abs = self.last_z_delta.abs()
             self.last_debug.update({
@@ -487,6 +602,12 @@ class SpatialRGBEventFiLMLoRALinear(nn.Module):
                 "z_delta_abs_max": z_delta_abs.max(),
             })
             self.last_visuals["z_delta_abs"] = z_delta_abs.mean(dim=1, keepdim=True)
+            if self.event_lora_variant == "residual_cross_attn_bax":
+                self.last_debug.update({
+                    "bax_delta_abs_mean": z_delta_abs.mean(),
+                    "bax_delta_abs_max": z_delta_abs.max(),
+                })
+                self.last_visuals["bax_delta_abs"] = z_delta_abs.mean(dim=1, keepdim=True)
 
 
 # 兼容旧 import/命名：旧代码和 checkpoint 仍可识别这些类名。
