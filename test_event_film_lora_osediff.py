@@ -15,6 +15,7 @@ from osediff_event_film import OSEDiffEventFiLMTest
 
 
 METRIC_NAMES = ("psnr", "ssim", "lpips")
+FID_INCEPTION_WEIGHTS_NAME = "pt_inception-2015-12-05-6726825d.pth"
 
 
 @dataclass
@@ -66,13 +67,54 @@ class FIDEvaluator:
         image.save(os.path.join(self.pred_dirs[mode], self._file_name(sample_index)))
         self.pred_counts[mode] += 1
 
+    @staticmethod
+    def _fid_weights_path():
+        # PyIQA 将 FID Inception 权重放在 torch hub 的 pyiqa 子目录中；
+        # 使用 torch.hub.get_dir() 可兼容默认 ~/.cache 和自定义 TORCH_HOME。
+        return os.path.join(
+            torch.hub.get_dir(),
+            "pyiqa",
+            FID_INCEPTION_WEIGHTS_NAME,
+        )
+
+    def _create_metric_with_cache_repair(self):
+        try:
+            return pyiqa.create_metric("fid", device=self.device)
+        except RuntimeError as exc:
+            error_text = str(exc).lower()
+            corruption_markers = (
+                "unexpected eof",
+                "pickle data was truncated",
+                "failed finding central directory",
+                "pytorchstreamreader failed",
+                "invalid header",
+            )
+            if not any(marker in error_text for marker in corruption_markers):
+                raise
+
+            weights_path = self._fid_weights_path()
+            if not os.path.isfile(weights_path):
+                raise RuntimeError(
+                    "FID Inception weights appear corrupted, but the cached file "
+                    f"was not found at the expected path: {weights_path}"
+                ) from exc
+
+            # 下载中断会留下不完整 .pth；删除后让 PyIQA 自动重新下载一次。
+            file_size_mb = os.path.getsize(weights_path) / (1024 ** 2)
+            print(
+                "[FID][Warning] Corrupted Inception cache detected: "
+                f"{weights_path} ({file_size_mb:.1f} MB). Removing and retrying once."
+            )
+            os.remove(weights_path)
+            return pyiqa.create_metric("fid", device=self.device)
+
     def compute(self, modes):
         if self.gt_count < 2:
             raise RuntimeError("FID requires at least two GT images.")
 
         # 推理全部结束后再创建 Inception 特征网络，避免它长期占用额外显存。
         # FID 是整组图像分布之间的距离，不能逐样本计算后再平均。
-        metric = pyiqa.create_metric("fid", device=self.device)
+        metric = self._create_metric_with_cache_repair()
         scores = {}
         for mode in modes:
             if self.pred_counts[mode] != self.gt_count:
