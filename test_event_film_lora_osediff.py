@@ -1,6 +1,7 @@
 import argparse
 import csv
 import os
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -35,6 +36,60 @@ class MetricAccumulator:
         return {name: self.sums[name] / self.count for name in METRIC_NAMES}
 
 
+class FIDEvaluator:
+    """在临时目录中收集整组图像，并按消融模式计算总体 FID。"""
+
+    def __init__(self, modes, device):
+        self._temp_dir = tempfile.TemporaryDirectory(prefix="osediff_fid_")
+        self.device = device
+        self.gt_dir = os.path.join(self._temp_dir.name, "ground_truth")
+        self.pred_dirs = {
+            mode: os.path.join(self._temp_dir.name, "generated", mode)
+            for mode in modes
+        }
+        os.makedirs(self.gt_dir, exist_ok=True)
+        for pred_dir in self.pred_dirs.values():
+            os.makedirs(pred_dir, exist_ok=True)
+        self.gt_count = 0
+        self.pred_counts = defaultdict(int)
+
+    @staticmethod
+    def _file_name(sample_index):
+        # 使用全局样本序号保证跨 scene 文件名唯一，并让 GT/预测集合顺序稳定。
+        return f"{sample_index:08d}.png"
+
+    def add_ground_truth(self, sample_index, image):
+        image.save(os.path.join(self.gt_dir, self._file_name(sample_index)))
+        self.gt_count += 1
+
+    def add_prediction(self, mode, sample_index, image):
+        image.save(os.path.join(self.pred_dirs[mode], self._file_name(sample_index)))
+        self.pred_counts[mode] += 1
+
+    def compute(self, modes):
+        if self.gt_count < 2:
+            raise RuntimeError("FID requires at least two GT images.")
+
+        # 推理全部结束后再创建 Inception 特征网络，避免它长期占用额外显存。
+        # FID 是整组图像分布之间的距离，不能逐样本计算后再平均。
+        metric = pyiqa.create_metric("fid", device=self.device)
+        scores = {}
+        for mode in modes:
+            if self.pred_counts[mode] != self.gt_count:
+                raise RuntimeError(
+                    f"FID image count mismatch for mode={mode}: "
+                    f"generated={self.pred_counts[mode]}, gt={self.gt_count}"
+                )
+            with torch.inference_mode():
+                scores[mode] = float(
+                    metric(self.pred_dirs[mode], self.gt_dir).item()
+                )
+        return scores
+
+    def cleanup(self):
+        self._temp_dir.cleanup()
+
+
 def tensor_to_pil(tensor):
     tensor = tensor.detach().cpu().float().clamp(-1, 1) * 0.5 + 0.5
     return transforms.ToPILImage()(tensor)
@@ -52,15 +107,13 @@ def save_event_activity(events, path):
     Image.fromarray((activity.cpu().numpy() * 255).astype("uint8")).save(path)
 
 
-def build_ablation_event(events, shuffled_events, mode):
+def build_ablation_event(events, mode):
     # All ablation inputs keep the same [B, event_bins, H, W] shape expected by
     # the event encoder.  Only the event evidence content changes.
     if mode == "correct":
         return events
     if mode == "zero":
         return torch.zeros_like(events)
-    if mode == "shuffled":
-        return shuffled_events
     raise ValueError(f"Unknown ablation mode: {mode}")
 
 
@@ -133,7 +186,12 @@ def parse_args():
     )
     parser.add_argument("--lora_rank", type=int, default=4)
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["fp16", "fp32"])
-    parser.add_argument("--ablation_modes", type=str, default="correct,zero,shuffled")
+    parser.add_argument("--ablation_modes", type=str, default="correct,zero")
+    parser.add_argument(
+        "--calculate_fid",
+        action="store_true",
+        help="Compute dataset-level FID between generated images and GT for each ablation mode.",
+    )
     parser.add_argument("--save_debug_vis", action="store_true")
     return parser.parse_args()
 
@@ -149,6 +207,12 @@ def main(args):
     modes = [m.strip() for m in args.ablation_modes.split(",") if m.strip()]
     if not modes:
         raise ValueError("--ablation_modes must contain at least one mode.")
+    if len(modes) != len(set(modes)):
+        raise ValueError(f"--ablation_modes contains duplicate modes: {modes}")
+    invalid_modes = sorted(set(modes) - {"correct", "zero"})
+    if invalid_modes:
+        raise ValueError(f"Unknown ablation modes: {invalid_modes}")
+    fid_evaluator = FIDEvaluator(modes, device) if args.calculate_fid else None
 
     scene_counts = defaultdict(int)
     per_image_rows = []
@@ -163,10 +227,13 @@ def main(args):
         lq = sample["conditioning_pixel_values"].unsqueeze(0).to(device)
         gt = sample["output_pixel_values"].unsqueeze(0).to(device)
         events = sample["events"].unsqueeze(0).to(device)
-        shuffled_events = dataset[(idx + 1) % len(dataset)]["events"].unsqueeze(0).to(device)
+        low_pil = tensor_to_pil(lq[0])
+        gt_pil = tensor_to_pil(gt[0])
+        if fid_evaluator is not None:
+            fid_evaluator.add_ground_truth(idx, gt_pil)
 
         for mode in modes:
-            event_input = build_ablation_event(events, shuffled_events, mode)
+            event_input = build_ablation_event(events, mode)
 
             with torch.inference_mode():
                 pred = model(lq, event_input, prompt=args.fixed_prompt)
@@ -176,9 +243,12 @@ def main(args):
             low_path = os.path.join(out_dir, f"{prefix}_lowlight.png")
             result_path = os.path.join(out_dir, f"{prefix}_result.png")
             gt_path = os.path.join(out_dir, f"{prefix}_gt.png")
-            tensor_to_pil(lq[0]).save(low_path)
-            tensor_to_pil(pred[0]).save(result_path)
-            tensor_to_pil(gt[0]).save(gt_path)
+            pred_pil = tensor_to_pil(pred[0])
+            low_pil.save(low_path)
+            pred_pil.save(result_path)
+            gt_pil.save(gt_path)
+            if fid_evaluator is not None:
+                fid_evaluator.add_prediction(mode, idx, pred_pil)
 
             with torch.inference_mode():
                 metric_values = compute_quality_metrics(pred, gt, psnr_metric, ssim_metric, lpips_metric)
@@ -227,15 +297,28 @@ def main(args):
     scene_rows = build_summary_rows(scene_stats, modes, include_scene=True)
     overall_rows = build_summary_rows(overall_stats, modes, include_scene=False)
 
+    # 先落盘已有指标；即使随后 FID 权重下载或特征提取失败，也保留本次推理结果。
     write_csv(per_image_csv, per_image_rows, per_image_fields)
     write_csv(scene_csv, scene_rows, scene_fields)
     write_csv(overall_csv, overall_rows, overall_fields)
 
+    if fid_evaluator is not None:
+        print("\n===== Computing Dataset-level FID =====")
+        try:
+            fid_scores = fid_evaluator.compute(modes)
+        finally:
+            fid_evaluator.cleanup()
+        for row in overall_rows:
+            row["fid"] = fid_scores[row["mode"]]
+        write_csv(overall_csv, overall_rows, [*overall_fields, "fid"])
+
     print("\n===== Overall Average Metrics by Ablation Mode =====")
     for row in overall_rows:
+        fid_text = f" | FID={row['fid']:.4f}" if args.calculate_fid else ""
         print(
             f"{row['mode']} (n={row['count']}): "
-            f"PSNR={row['psnr']:.4f} | SSIM={row['ssim']:.4f} | LPIPS={row['lpips']:.4f}"
+            f"PSNR={row['psnr']:.4f} | SSIM={row['ssim']:.4f} | "
+            f"LPIPS={row['lpips']:.4f}{fid_text}"
         )
 
     print(f"[Done] Per-image metrics: {per_image_csv}")
