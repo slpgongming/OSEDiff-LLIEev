@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# slpchen / Stage2：默认训练 CBAM low-rank residual，只训练 EventEncoder 与调制分支。
+# hutao / Stage 2：使用 CBAM output gate，训练 EventEncoder 与事件调制分支。
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 export WANDB_INSECURE=true
 export WANDB_INSECURE_DISABLE_SSL=true
 
-PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/slpchen/stable-diffusion-2-1-base}"
-TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/public/home/slpchen/EvLight--main/SDE_dataset/SDE_indoor/sde_in_release/train}"
+PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/hutao/Chen_Project/PretrainedModel/stable-diffusion-2-1-base}"
+TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/public/home/hutao/Chen_Project/dataset/SDE_dataset/SDE_indoor/sde_in_release/train}"
 STAGE1_CKPT="${STAGE1_CKPT:-checkpoints/osediff_lle_5-14-1935/checkpoints/model_94001.pkl}"
-OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/OSEDiff_cbam_lowrank_residual_stage2_6-19}"
+OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/OSEDiff_clora_stage2_6-20-2320}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
-EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-cbam_lowrank_residual}"
-# Stage2 默认不使用 VSD regularizer，保留 original 可避免无意义地安装第二套 CBAM head。
-REGULARIZER_LORA_MODE="${REGULARIZER_LORA_MODE:-original}"
+EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-cbam_output_gate}"
+# finetuned regularizer 使用独立 Event-LoRA head；VSD 损失仍可由下方 lambda 开关控制。
+REGULARIZER_LORA_MODE="${REGULARIZER_LORA_MODE:-event_lora}"
 
 if [ ! -d "$PRETRAINED_MODEL" ]; then
   echo "[ERROR] PRETRAINED_MODEL does not exist: $PRETRAINED_MODEL" >&2
@@ -49,7 +49,7 @@ accelerate launch --num_processes "$NPROC_PER_NODE" train_event_film_lora_osedif
   --mixed_precision fp16 \
   --report_to wandb \
   --tracker_project_name OSEDiff_clora_stage2 \
-  --wandb_run_name "${WANDB_RUN_NAME:-cbam_lowrank_residual_stage2_6-19}" \
+  --wandb_run_name "${WANDB_RUN_NAME:-stage2_6-20-2320}" \
   --event_lora_variant "$EVENT_LORA_VARIANT" \
   --lora_rank "${LORA_RANK:-4}" \
   --mod_channels "${EVENT_LORA_MOD_CHANNELS:-32}" \
