@@ -1,6 +1,9 @@
 import argparse
 import csv
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -179,6 +182,140 @@ def write_csv(path, rows, fieldnames):
         writer.writerows(rows)
 
 
+def read_csv(path):
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return list(reader), reader.fieldnames
+
+
+def parse_ablation_modes(value):
+    modes = [mode.strip() for mode in value.split(",") if mode.strip()]
+    if not modes:
+        raise ValueError("--ablation_modes must contain at least one mode.")
+    if len(modes) != len(set(modes)):
+        raise ValueError(f"--ablation_modes contains duplicate modes: {modes}")
+    invalid_modes = sorted(set(modes) - {"correct", "zero"})
+    if invalid_modes:
+        raise ValueError(f"Unknown ablation modes: {invalid_modes}")
+    return modes
+
+
+def _worker_command(mode):
+    """构造单消融子进程命令，移除主进程专用参数并覆盖 mode。"""
+    source_args = sys.argv[1:]
+    worker_args = []
+    skip_next = False
+    options_with_value = {"--ablation_modes", "--_worker_mode"}
+    for arg in source_args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in options_with_value:
+            skip_next = True
+            continue
+        if arg == "--multi_gpu":
+            continue
+        if arg.startswith("--ablation_modes=") or arg.startswith("--_worker_mode="):
+            continue
+        worker_args.append(arg)
+    return [
+        sys.executable,
+        os.path.abspath(__file__),
+        *worker_args,
+        "--ablation_modes",
+        mode,
+        "--_worker_mode",
+        mode,
+    ]
+
+
+def _merge_multi_gpu_metrics(output_dir, modes):
+    """将两个 GPU 子进程的 mode 独立 CSV 合并回原有标准文件名。"""
+    worker_root = os.path.join(output_dir, ".multi_gpu_metrics")
+    csv_names = (
+        "metrics_event_film_ablation.csv",
+        "metrics_event_film_ablation_scene.csv",
+        "metrics_event_film_ablation_overall.csv",
+    )
+    for csv_name in csv_names:
+        merged_rows = []
+        merged_fields = None
+        for mode in modes:
+            worker_csv = os.path.join(worker_root, mode, csv_name)
+            if not os.path.isfile(worker_csv):
+                raise RuntimeError(f"Missing multi-GPU worker metrics: {worker_csv}")
+            rows, fieldnames = read_csv(worker_csv)
+            if merged_fields is None:
+                merged_fields = fieldnames
+            elif fieldnames != merged_fields:
+                raise RuntimeError(
+                    f"CSV fields mismatch while merging {csv_name}: "
+                    f"{merged_fields} vs {fieldnames}"
+                )
+            merged_rows.extend(rows)
+        write_csv(os.path.join(output_dir, csv_name), merged_rows, merged_fields)
+    shutil.rmtree(worker_root)
+
+
+def run_multi_gpu(args):
+    """GPU0/GPU1 分别运行 correct/zero，结束后由主进程合并指标。"""
+    modes = parse_ablation_modes(args.ablation_modes)
+    if len(modes) < 2:
+        raise ValueError("--multi_gpu requires both correct and zero modes.")
+    if not torch.cuda.is_available():
+        raise RuntimeError("--multi_gpu requires CUDA, but CUDA is not available.")
+    if torch.cuda.device_count() < len(modes):
+        raise RuntimeError(
+            f"--multi_gpu needs {len(modes)} GPUs, but PyTorch sees "
+            f"{torch.cuda.device_count()}."
+        )
+
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    gpu_ids = [item.strip() for item in visible_devices.split(",") if item.strip()]
+    if not gpu_ids:
+        gpu_ids = [str(index) for index in range(torch.cuda.device_count())]
+    if len(gpu_ids) < len(modes):
+        raise RuntimeError(
+            f"--multi_gpu needs {len(modes)} visible GPUs, but found {gpu_ids or 'none'}."
+        )
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    worker_root = os.path.join(args.output_dir, ".multi_gpu_metrics")
+    if os.path.isdir(worker_root):
+        shutil.rmtree(worker_root)
+
+    if args.calculate_fid:
+        # 在启动子进程前只下载/修复一次 FID 权重，避免双进程并发写同一缓存。
+        warmup = FIDEvaluator([], torch.device("cuda"))
+        try:
+            metric = warmup._create_metric_with_cache_repair()
+            del metric
+        finally:
+            warmup.cleanup()
+        torch.cuda.empty_cache()
+
+    processes = []
+    for mode, gpu_id in zip(modes, gpu_ids):
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = gpu_id
+        env["PYTHONUNBUFFERED"] = "1"
+        print(f"[MultiGPU] mode={mode} -> GPU {gpu_id}")
+        processes.append(
+            (mode, subprocess.Popen(_worker_command(mode), env=env))
+        )
+
+    failed = []
+    for mode, process in processes:
+        return_code = process.wait()
+        if return_code != 0:
+            failed.append((mode, return_code))
+    if failed:
+        raise RuntimeError(f"Multi-GPU inference worker failed: {failed}")
+
+    _merge_multi_gpu_metrics(args.output_dir, modes)
+    print(f"[MultiGPU] Combined metrics saved under: {args.output_dir}")
+
+
 def build_summary_rows(stats_by_mode, modes, include_scene):
     rows = []
     for mode in modes:
@@ -234,11 +371,21 @@ def parse_args():
         action="store_true",
         help="Compute dataset-level FID between generated images and GT for each ablation mode.",
     )
+    parser.add_argument(
+        "--multi_gpu",
+        action="store_true",
+        help="Run correct and zero concurrently on two visible GPUs, then merge metrics.",
+    )
+    parser.add_argument("--_worker_mode", type=str, default="", help=argparse.SUPPRESS)
     parser.add_argument("--save_debug_vis", action="store_true")
     return parser.parse_args()
 
 
 def main(args):
+    if args.multi_gpu and not args._worker_mode:
+        run_multi_gpu(args)
+        return
+
     os.makedirs(args.output_dir, exist_ok=True)
     dataset = SDEEventFilmDataset(split="test", args=args, root_dir=args.input_image)
     model = OSEDiffEventFiLMTest(args)
@@ -246,14 +393,7 @@ def main(args):
     psnr_metric = pyiqa.create_metric("psnr", test_y_channel=True, color_space="ycbcr").to(device)
     ssim_metric = pyiqa.create_metric("ssim", test_y_channel=True, color_space="ycbcr").to(device)
     lpips_metric = pyiqa.create_metric("lpips", device=device).to(device)
-    modes = [m.strip() for m in args.ablation_modes.split(",") if m.strip()]
-    if not modes:
-        raise ValueError("--ablation_modes must contain at least one mode.")
-    if len(modes) != len(set(modes)):
-        raise ValueError(f"--ablation_modes contains duplicate modes: {modes}")
-    invalid_modes = sorted(set(modes) - {"correct", "zero"})
-    if invalid_modes:
-        raise ValueError(f"Unknown ablation modes: {invalid_modes}")
+    modes = parse_ablation_modes(args.ablation_modes)
     fid_evaluator = FIDEvaluator(modes, device) if args.calculate_fid else None
 
     scene_counts = defaultdict(int)
@@ -325,9 +465,15 @@ def main(args):
                 f"LPIPS={metric_values['lpips']:.4f} | event_L1={active_l1:.6f}"
             )
 
-    per_image_csv = os.path.join(args.output_dir, "metrics_event_film_ablation.csv")
-    scene_csv = os.path.join(args.output_dir, "metrics_event_film_ablation_scene.csv")
-    overall_csv = os.path.join(args.output_dir, "metrics_event_film_ablation_overall.csv")
+    metrics_dir = args.output_dir
+    if args._worker_mode:
+        metrics_dir = os.path.join(
+            args.output_dir, ".multi_gpu_metrics", args._worker_mode
+        )
+        os.makedirs(metrics_dir, exist_ok=True)
+    per_image_csv = os.path.join(metrics_dir, "metrics_event_film_ablation.csv")
+    scene_csv = os.path.join(metrics_dir, "metrics_event_film_ablation_scene.csv")
+    overall_csv = os.path.join(metrics_dir, "metrics_event_film_ablation_overall.csv")
     per_image_fields = [
         "mode", "scene", "prefix", "frame_id", "psnr", "ssim", "lpips",
         "event_active_l1", "dgamma_abs_mean", "dbeta_abs_mean",

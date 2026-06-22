@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Stage3 测试：加载 Stage3 checkpoint，输出 correct/zero 事件消融指标。
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# Stage3 测试：GPU0/GPU1 并行运行 correct/zero，最后自动合并指标。
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
 PRETRAINED_MODEL="${PRETRAINED_MODEL:-/path/to/stable-diffusion-2-1-base}"
 TEST_DATA_ROOT="${TEST_DATA_ROOT:-/path/to/SDE_indoor/sde_in_release/test}"
@@ -12,6 +12,10 @@ EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-film}"
 FID_ARGS=()
 if [[ "${CALCULATE_FID:-1}" == "1" ]]; then
   FID_ARGS+=(--calculate_fid)
+fi
+MULTI_GPU_ARGS=()
+if [[ "${MULTI_GPU:-1}" == "1" ]]; then
+  MULTI_GPU_ARGS+=(--multi_gpu)
 fi
 
 if [ ! -d "$PRETRAINED_MODEL" ]; then
@@ -27,6 +31,9 @@ if [ ! -f "$CHECKPOINT_PATH" ]; then
   exit 1
 fi
 
+mkdir -p "$OUTPUT_DIR"
+cp -f "$0" "$OUTPUT_DIR/$(basename "$0")"
+
 python test_event_film_lora_osediff.py \
   --stage 3 \
   --input_image "$TEST_DATA_ROOT" \
@@ -39,4 +46,5 @@ python test_event_film_lora_osediff.py \
   --mixed_precision fp16 \
   --ablation_modes "${ABLATION_MODES:-correct,zero}" \
   "${FID_ARGS[@]}" \
+  "${MULTI_GPU_ARGS[@]}" \
   --save_debug_vis
