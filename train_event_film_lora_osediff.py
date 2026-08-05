@@ -126,7 +126,14 @@ def parse_args():
         "--event_lora_variant",
         type=str,
         default="film_affine",
-        choices=["film_affine", "cbam_lowrank_residual", "cbam_output_gate"],
+        choices=[
+            "film_affine",
+            "film",
+            "cbam_lowrank_residual",
+            "cbam_output_gate",
+            "residual_cross_attn",
+            "residual_cross_attn_bax",
+        ],
     )
     parser.add_argument(
         "--event_lora_cbam_reduction",
@@ -147,6 +154,8 @@ def parse_args():
         default="spatial",
         choices=["spatial", "channel_spatial"],
     )
+    parser.add_argument("--mod_num_heads", type=int, default=4)
+    parser.add_argument("--mod_window_size", type=int, default=8)
     parser.add_argument(
         "--regularizer_lora_mode",
         type=str,
@@ -505,8 +514,11 @@ def main(args):
                     logs.update({f"event_lora/{k}": v for k, v in debug_stats.items()})
                     logs["event_lora/variant_id"] = {
                         "film_affine": 0,
+                        "film": 0,
                         "cbam_lowrank_residual": 1,
                         "cbam_output_gate": 2,
+                        "residual_cross_attn": 3,
+                        "residual_cross_attn_bax": 4,
                     }[args.event_lora_variant]
                     progress_bar.set_postfix({
                         "loss": f"{logs['loss/total']:.4f}",

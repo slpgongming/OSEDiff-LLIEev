@@ -359,7 +359,14 @@ def parse_args():
         "--event_lora_variant",
         type=str,
         default="film_affine",
-        choices=["film_affine", "cbam_lowrank_residual", "cbam_output_gate"],
+        choices=[
+            "film_affine",
+            "film",
+            "cbam_lowrank_residual",
+            "cbam_output_gate",
+            "residual_cross_attn",
+            "residual_cross_attn_bax",
+        ],
     )
     parser.add_argument("--event_lora_cbam_reduction", type=int, default=8)
     parser.add_argument(
@@ -371,6 +378,8 @@ def parse_args():
         default="spatial",
         choices=["spatial", "channel_spatial"],
     )
+    parser.add_argument("--mod_num_heads", type=int, default=4)
+    parser.add_argument("--mod_window_size", type=int, default=8)
     parser.add_argument("--lora_rank", type=int, default=4)
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["fp16", "fp32"])
     parser.add_argument("--ablation_modes", type=str, default="correct,zero")

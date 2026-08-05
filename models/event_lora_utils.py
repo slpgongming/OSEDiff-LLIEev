@@ -3,7 +3,11 @@ import copy
 import torch
 import torch.nn as nn
 
-from models.event_film_lora import EventLoRAConfig, SpatialRGBEventLoRALinear
+from models.event_film_lora import (
+    EventLoRAConfig,
+    SharedResidualEventHeads,
+    SpatialRGBEventLoRALinear,
+)
 
 
 def get_parent_module(root, module_name):
@@ -47,9 +51,43 @@ def _extract_peft_linear(module):
     raise TypeError(f"Unsupported to_v module type: {type(module)}")
 
 
+def _infer_bax_query_channels_by_size(unet, event_channels_by_size):
+    """按 UNet 从高到低的 block channels 推导各事件尺度 BAx 通道。"""
+    unet_config = getattr(unet, "config", None)
+    block_channels = getattr(unet_config, "block_out_channels", None)
+    if block_channels is None and isinstance(unet_config, dict):
+        block_channels = unet_config.get("block_out_channels")
+    if block_channels is None:
+        raise ValueError("residual_cross_attn_bax requires unet.config.block_out_channels.")
+    sizes = sorted((int(size) for size in event_channels_by_size), reverse=True)
+    block_channels = [int(channels) for channels in block_channels]
+    if len(sizes) != len(block_channels):
+        raise ValueError(
+            "Cannot map event sizes to UNet channels: "
+            f"sizes={sizes}, block_channels={block_channels}."
+        )
+    return {str(size): channels for size, channels in zip(sizes, block_channels)}
+
+
 def replace_self_attn_to_v_with_event_lora(unet, config, event_channels_by_size):
     """只替换图像 self-attention 的 `attn1.to_v`，不触碰文本 cross-attention。"""
     replaced_names = []
+    shared_residual_heads = None
+    if config.variant in {"residual_cross_attn", "residual_cross_attn_bax"}:
+        shared_attr = f"_event_lora_shared_heads_{config.variant}"
+        shared_residual_heads = getattr(unet, shared_attr, None)
+        if shared_residual_heads is None:
+            query_channels_by_size = None
+            if config.variant == "residual_cross_attn_bax":
+                query_channels_by_size = _infer_bax_query_channels_by_size(
+                    unet, event_channels_by_size
+                )
+            shared_residual_heads = SharedResidualEventHeads(
+                config=config,
+                event_channels_by_size=event_channels_by_size,
+                query_channels_by_size=query_channels_by_size,
+            )
+            setattr(unet, shared_attr, shared_residual_heads)
     for name, module in list(unet.named_modules()):
         if not name.endswith("attn1.to_v"):
             continue
@@ -66,6 +104,7 @@ def replace_self_attn_to_v_with_event_lora(unet, config, event_channels_by_size)
             base_linear=base_linear,
             config=layer_config,
             event_channels_by_size=event_channels_by_size,
+            shared_residual_heads=shared_residual_heads,
         )
         if lora_a is not None:
             event_lora.lora_down.weight.data.copy_(lora_a)
@@ -117,7 +156,10 @@ def set_event_lora_trainable(unet, train_lora=False, train_modulation=True):
         module.base_linear.requires_grad_(False)
         module.lora_down.requires_grad_(train_lora)
         module.lora_up.requires_grad_(train_lora)
-        module.modulator.requires_grad_(train_modulation)
+        if module.modulator is not None:
+            module.modulator.requires_grad_(train_modulation)
+        if hasattr(module, "shared_residual_heads"):
+            module.shared_residual_heads.requires_grad_(train_modulation)
 
 
 def collect_event_lora_debug(unet):
@@ -130,6 +172,14 @@ def collect_event_lora_debug(unet):
         for key, values in values_by_key.items()
         if values
     }
+
+
+def collect_event_lora_visuals(unet):
+    """返回最近一次 forward 的首组空间调制热力图。"""
+    for _, module in iter_event_lora_modules(unet):
+        if module.last_visuals:
+            return {key: value.detach() for key, value in module.last_visuals.items()}
+    return {}
 
 
 def _total_variation(x):
@@ -167,10 +217,19 @@ def event_lora_state_keys():
         "lora_down",
         "lora_up",
         "modulator",
+        "_event_lora_shared_heads",
         # 兼容旧 idea2 Event-FiLM checkpoint 的 key。
         "event_proj",
         "z_proj",
         "modulation_head",
+        "core",
+        "out_proj",
+        "z_pos",
+        "event_pos",
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "attn_out",
     )
 
 
@@ -182,7 +241,12 @@ def remap_legacy_event_film_state_dict(state_dict):
     remapped = {}
     for key, value in state_dict.items():
         new_key = key
-        if ".modulator." not in new_key:
+        if "_event_film_shared_modulation_heads" in new_key:
+            new_key = new_key.replace(
+                "_event_film_shared_modulation_heads",
+                "_event_lora_shared_heads_film_affine",
+            )
+        elif ".modulator." not in new_key and "_event_lora_shared_heads" not in new_key:
             new_key = new_key.replace(".event_proj.", ".modulator.event_proj.")
             new_key = new_key.replace(".z_proj.", ".modulator.z_proj.")
             new_key = new_key.replace(".modulation_head.", ".modulator.fusion.")

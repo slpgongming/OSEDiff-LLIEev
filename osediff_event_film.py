@@ -12,7 +12,8 @@ from safetensors.torch import load_file
 import json
 
 from models.event_encoder import EventEncoder
-from models.event_film_lora import EventLoRAConfig
+from models.event_film_lora import EventLoRAConfig, normalize_event_lora_variant
+from models.rgb_event_encoder import RGBEventEncoder
 from models.event_lora_utils import (
     clear_event_feats_for_all_event_lora,
     collect_event_lora_debug,
@@ -36,6 +37,8 @@ def _event_lora_config_from_args(args):
         cbam_reduction=getattr(args, "event_lora_cbam_reduction", 8),
         cbam_spatial_kernel=getattr(args, "event_lora_cbam_spatial_kernel", 7),
         output_gate_channels=getattr(args, "event_lora_output_gate_channels", "spatial"),
+        mod_num_heads=getattr(args, "mod_num_heads", 4),
+        mod_window_size=getattr(args, "mod_window_size", 8),
     )
 
 
@@ -44,6 +47,16 @@ def _checkpoint_event_lora_config(checkpoint):
     if config is None:
         # 旧 idea2 checkpoint 只有 Event-FiLM，因此缺少配置时按 film_affine 解释。
         return EventLoRAConfig(variant="film_affine")
+    config = dict(config)
+    legacy_variant = checkpoint.get("event_lora_variant")
+    config.setdefault("variant", normalize_event_lora_variant(legacy_variant or "film_affine"))
+    rank = int(checkpoint.get("rank_unet", config.get("rank", 4)))
+    config.setdefault("rank", rank)
+    config.setdefault("alpha", float(rank))
+    # idea2-1 的 residual checkpoint 只记录以下三个 cross-attention 字段。
+    config.setdefault("mod_channels", 64 if legacy_variant in {
+        "residual_cross_attn", "residual_cross_attn_bax"
+    } else 32)
     return EventLoRAConfig(**config)
 
 
@@ -57,6 +70,8 @@ def _validate_event_lora_config(runtime_config, checkpoint_config, context):
         "cbam_reduction",
         "cbam_spatial_kernel",
         "output_gate_channels",
+        "mod_num_heads",
+        "mod_window_size",
     )
     mismatch = {
         key: (getattr(runtime_config, key), getattr(checkpoint_config, key))
@@ -137,6 +152,22 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             base_channels=getattr(args, "event_base_channels", 32),
         )
         self.event_lora_config = _event_lora_config_from_args(args)
+        self.decoder_refinement_enabled = bool(
+            getattr(args, "decoder_refinement_enabled", False)
+        )
+        self.decoder_fusion_enabled = bool(
+            getattr(args, "decoder_fusion_enabled", self.decoder_refinement_enabled)
+        )
+        self.decoder_fusion_weight = float(
+            getattr(args, "decoder_fusion_weight", 1.0)
+        )
+        self.refinement_fusion_mode = getattr(
+            args, "refinement_fusion_mode", "both"
+        )
+        self.last_refinement_stats = {}
+        self.rgb_event_encoder = None
+        if self.decoder_refinement_enabled:
+            self.install_decoder_refinement()
         self.event_film_installed = False
         self.event_film_replaced_names = []
         self.lora_rank_unet = args.lora_rank
@@ -145,9 +176,63 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         self.unet.to("cuda")
         self.vae.to("cuda")
         self.event_encoder.to("cuda")
+        if self.rgb_event_encoder is not None:
+            self.rgb_event_encoder.to("cuda")
         self.text_encoder.requires_grad_(False)
         self.vae.requires_grad_(False)
         self.unet.requires_grad_(False)
+
+    def install_decoder_refinement(self):
+        """安装单一 FeatureAwareDecoder，并按需加载冻结 RGB-event encoder。"""
+        self.vae.install_feature_aware_decoder(
+            condition_channels=(64, 128, 256, 512),
+            fusion_weight=self.decoder_fusion_weight,
+            fusion_init=getattr(self.args, "decoder_fusion_init", "near_zero"),
+        )
+        if self.rgb_event_encoder is None:
+            self.rgb_event_encoder = RGBEventEncoder(
+                event_channels=getattr(self.args, "event_channels", 5)
+            )
+        pretrained_root = getattr(self.args, "rgb_event_pretrained_root", None)
+        encoder_i_path = getattr(self.args, "rgb_event_encoder_i_path", None)
+        encoder_e_path = getattr(self.args, "rgb_event_encoder_e_path", None)
+        fusion_path = getattr(self.args, "rgb_event_fusion_path", None)
+        if pretrained_root or encoder_i_path or encoder_e_path or fusion_path:
+            self.rgb_event_encoder.load_pretrained(
+                pretrained_root=pretrained_root,
+                encoder_i_path=encoder_i_path,
+                encoder_e_path=encoder_e_path,
+                fusion_path=fusion_path,
+                strict=bool(getattr(self.args, "rgb_event_strict_load", True)),
+            )
+        vae_parameter = next(self.vae.parameters())
+        self.rgb_event_encoder.to(
+            device=vae_parameter.device, dtype=vae_parameter.dtype
+        )
+        self.rgb_event_encoder.requires_grad_(False)
+        self.decoder_refinement_enabled = True
+        return self.vae.decoder
+
+    def set_train_decoder_refinement(self):
+        """Phase 1B 显式冻结全模型，只解冻 decoder feature fusion blocks。"""
+        if not self.decoder_refinement_enabled or self.rgb_event_encoder is None:
+            raise RuntimeError("Decoder refinement has not been installed.")
+        self.requires_grad_(False)
+        self.vae.decoder.feature_fusion_blocks.requires_grad_(True)
+        self.rgb_event_encoder.eval()
+        self.event_encoder.eval()
+        self.unet.eval()
+        self.text_encoder.eval()
+        self.vae.train()
+        trainable = list(self.vae.decoder.feature_fusion_blocks.parameters())
+        trainable_ids = {id(param) for param in trainable}
+        stray = [
+            name for name, param in self.named_parameters()
+            if param.requires_grad and id(param) not in trainable_ids
+        ]
+        if stray:
+            raise RuntimeError(f"Unexpected trainable parameters: {stray}")
+        return trainable
 
     def install_event_lora(self):
         if self.event_film_installed:
@@ -221,11 +306,16 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         return params
 
     def get_event_params(self):
-        params = []
-        params += [p for p in self.event_encoder.parameters() if p.requires_grad]
+        # residual variant 的共享 head 注册在 UNet 顶层，名称不含 modulator；
+        # 因此以 trainable 且非 LoRA A/B 为准，并按参数 id 去重。
+        params = [p for p in self.event_encoder.parameters() if p.requires_grad]
+        seen = {id(param) for param in params}
         for name, param in self.unet.named_parameters():
-            if param.requires_grad and "modulator" in name:
+            if not param.requires_grad or "lora_down" in name or "lora_up" in name:
+                continue
+            if id(param) not in seen:
                 params.append(param)
+                seen.add(id(param))
         return params
 
     def encode_prompt(self, prompt_batch):
@@ -244,7 +334,8 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
                 prompt_embeds_list.append(prompt_embeds)
         return torch.cat(prompt_embeds_list, dim=0)
 
-    def forward(self, c_t, events, timesteps, batch=None):
+    def predict_denoised_latent(self, c_t, events, timesteps, batch):
+        """运行一次 VAE encode + event-cLoRA UNet，返回可复用的 z0。"""
         encoded_control = self.vae.encode(c_t).latent_dist.sample() * self.vae.config.scaling_factor
         prompt_embeds = self.encode_prompt(batch["prompt"])
         neg_prompt_embeds = self.encode_prompt(batch["neg_prompt"])
@@ -265,16 +356,102 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         x_denoised = self.noise_scheduler.step(
             model_pred, timesteps, encoded_control, return_dict=True
         ).prev_sample
+        return x_denoised, prompt_embeds, neg_prompt_embeds
+
+    def decode_denoised_latent(
+        self,
+        x_denoised,
+        c_t,
+        events_refinement=None,
+        decoder_fusion_enabled=None,
+        refinement_fusion_mode=None,
+    ):
+        """对固定 z0 只执行一次 decoder，供 off/on 公平对比复用。"""
         vae_dtype = _first_parameter_dtype(self.vae, default=x_denoised.dtype)
-        output_image = (
+        fusion_enabled = (
+            self.decoder_fusion_enabled
+            if decoder_fusion_enabled is None else bool(decoder_fusion_enabled)
+        )
+        fused_features = None
+        if self.decoder_refinement_enabled:
+            if events_refinement is None:
+                raise ValueError(
+                    "Decoder refinement requires the separately normalized "
+                    "events_refinement tensor."
+                )
+            fusion_mode = refinement_fusion_mode or self.refinement_fusion_mode
+            with torch.no_grad():
+                encoder_output = self.rgb_event_encoder(
+                    c_t,
+                    events_refinement,
+                    fusion_mode=fusion_mode,
+                )
+            fused_features = [
+                feature.detach() for feature in encoder_output.fused_features
+            ]
+            self.last_refinement_stats = {}
+            for family, features in (
+                ("rgb", encoder_output.rgb_features),
+                ("event", encoder_output.event_features),
+                ("fused", encoder_output.fused_features),
+            ):
+                for level, feature in enumerate(features):
+                    detached = feature.detach().float()
+                    prefix = f"{family}_level_{level}"
+                    self.last_refinement_stats[f"{prefix}/mean"] = detached.mean().item()
+                    self.last_refinement_stats[f"{prefix}/std"] = detached.std(unbiased=False).item()
+                    self.last_refinement_stats[f"{prefix}/abs_max"] = detached.abs().max().item()
+        output = (
             self.vae.decode(
-                x_denoised.to(dtype=vae_dtype) / self.vae.config.scaling_factor
+                x_denoised.to(dtype=vae_dtype) / self.vae.config.scaling_factor,
+                fused_features=fused_features,
+                fusion_enabled=fusion_enabled,
+                fusion_weight=self.decoder_fusion_weight,
             ).sample
         ).clamp(-1, 1)
+        detached_output = output.detach().float()
+        self.last_refinement_stats.update({
+            "output/min": detached_output.min().item(),
+            "output/max": detached_output.max().item(),
+            "output/mean": detached_output.mean().item(),
+            "output/std": detached_output.std(unbiased=False).item(),
+        })
+        return output
+
+    def forward(
+        self,
+        c_t,
+        events,
+        timesteps,
+        batch=None,
+        events_refinement=None,
+        decoder_fusion_enabled=None,
+        refinement_fusion_mode=None,
+    ):
+        x_denoised, prompt_embeds, neg_prompt_embeds = self.predict_denoised_latent(
+            c_t, events, timesteps, batch
+        )
+        output_image = self.decode_denoised_latent(
+            x_denoised,
+            c_t,
+            events_refinement=events_refinement,
+            decoder_fusion_enabled=decoder_fusion_enabled,
+            refinement_fusion_mode=refinement_fusion_mode,
+        )
         return output_image, x_denoised, prompt_embeds, neg_prompt_embeds
 
     def debug_stats(self):
-        return collect_event_lora_debug(self.unet)
+        stats = collect_event_lora_debug(self.unet)
+        if self.decoder_refinement_enabled:
+            stats.update({
+                f"decoder_refinement/{key}": value
+                for key, value in self.last_refinement_stats.items()
+            })
+            stats.update({
+                f"decoder_refinement/{key}": value
+                for key, value in self.vae.decoder.debug_stats().items()
+            })
+        return stats
 
     def save_model(
         self,
@@ -283,6 +460,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         lr_scheduler=None,
         optimizer_reg=None,
         lr_scheduler_reg=None,
+        scaler=None,
         global_step=0,
         epoch=0,
         stage=2,
@@ -320,18 +498,102 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             sd["optimizer_reg_state_dict"] = optimizer_reg.state_dict()
         if lr_scheduler_reg is not None:
             sd["lr_scheduler_reg_state_dict"] = lr_scheduler_reg.state_dict()
+        if scaler is not None:
+            sd["scaler_state_dict"] = scaler.state_dict()
         if additional_info is not None:
             sd["additional_info"] = additional_info
+        if self.decoder_refinement_enabled:
+            sd.update({
+                "checkpoint_version": "idea3_phase1_v1",
+                "state_dict_decoder_refinement": self.vae.decoder.feature_fusion_blocks.state_dict(),
+                "decoder_refinement_config": self.vae.decoder.refinement_config(),
+                "rgb_event_encoder_config": self.rgb_event_encoder.config.to_dict(),
+                "rgb_event_pretrained_manifest": self.rgb_event_encoder.pretrained_manifest,
+                # idea3 显式字段；保留旧字段以兼容现有 Stage 2/3 loader。
+                "state_dict_unet_event_lora": state_unet,
+                "state_dict_existing_event_encoder": self.event_encoder.state_dict(),
+            })
+            if bool(getattr(self.args, "bundle_rgb_event_encoder", False)):
+                sd["state_dict_rgb_event_encoder"] = self.rgb_event_encoder.state_dict()
         torch.save(sd, outf)
 
-    def load_event_checkpoint(self, checkpoint):
-        checkpoint_config = _checkpoint_event_lora_config(checkpoint)
-        _validate_event_lora_config(
-            self.event_lora_config, checkpoint_config, context="Generator"
+    def load_decoder_refinement_checkpoint(self, checkpoint, ignore_mismatch=False):
+        if "state_dict_decoder_refinement" not in checkpoint:
+            return 0, 0
+        if not self.decoder_refinement_enabled:
+            self.install_decoder_refinement()
+        runtime_config = self.vae.decoder.refinement_config()
+        checkpoint_config = checkpoint.get("decoder_refinement_config", {})
+        structural_keys = (
+            "condition_channels",
+            "decoder_channels",
+            "fusion_blocks",
+            "fusion_init",
         )
+        mismatch = {
+            key: (runtime_config.get(key), checkpoint_config.get(key))
+            for key in structural_keys
+            if checkpoint_config.get(key) is not None
+            and runtime_config.get(key) != checkpoint_config.get(key)
+        }
+        if mismatch and not ignore_mismatch:
+            raise ValueError(f"Decoder refinement config mismatch: {mismatch}")
+        refinement_state = checkpoint["state_dict_decoder_refinement"]
+        target_state = self.vae.decoder.feature_fusion_blocks.state_dict()
+        missing_keys = sorted(set(target_state) - set(refinement_state))
+        loaded, skipped = copy_compatible_state_dict(
+            self.vae.decoder.feature_fusion_blocks,
+            refinement_state,
+        )
+        if (missing_keys or skipped) and not ignore_mismatch:
+            raise RuntimeError(
+                "Decoder refinement state mismatch: "
+                f"missing={missing_keys}, skipped={skipped}"
+            )
+        bundled = checkpoint.get("state_dict_rgb_event_encoder")
+        if bundled is not None:
+            rgb_loaded, rgb_skipped = copy_compatible_state_dict(
+                self.rgb_event_encoder, bundled
+            )
+            if rgb_skipped and not ignore_mismatch:
+                raise RuntimeError(
+                    f"Bundled RGBEventEncoder load skipped {rgb_skipped} tensors."
+                )
+            print(
+                f"[Idea3 Load] bundled_rgb_event_encoder loaded={rgb_loaded}, "
+                f"skipped={rgb_skipped}"
+            )
+        elif self.rgb_event_encoder.pretrained_manifest is None:
+            raise RuntimeError(
+                "Checkpoint does not bundle RGBEventEncoder; provide "
+                "--rgb_event_pretrained_root (or three explicit weight paths)."
+            )
+        expected_manifest = checkpoint.get("rgb_event_pretrained_manifest")
+        actual_manifest = self.rgb_event_encoder.pretrained_manifest
+        if (
+            expected_manifest
+            and actual_manifest
+            and expected_manifest.get("sha256") != actual_manifest.get("sha256")
+            and not ignore_mismatch
+        ):
+            raise ValueError("RGB-event pretrained manifest hash mismatch.")
+        print(f"[Idea3 Load] decoder_refinement loaded={loaded}, skipped={skipped}")
+        return loaded, skipped
+
+    def load_event_checkpoint(self, checkpoint, ignore_config_mismatch=False):
+        checkpoint_config = _checkpoint_event_lora_config(checkpoint)
+        if ignore_config_mismatch:
+            print("[Event-LoRA Load] config mismatch checks are explicitly disabled.")
+        else:
+            _validate_event_lora_config(
+                self.event_lora_config, checkpoint_config, context="Generator"
+            )
         self.install_event_lora()
         unet_state = remap_legacy_event_film_state_dict(
-            checkpoint.get("state_dict_unet", {})
+            checkpoint.get(
+                "state_dict_unet",
+                checkpoint.get("state_dict_unet_event_lora", {}),
+            )
         )
         unet_loaded, unet_skipped = copy_compatible_state_dict(
             self.unet, unet_state
@@ -340,7 +602,11 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             self.vae, checkpoint.get("state_dict_vae", {})
         )
         enc_loaded, enc_skipped = copy_compatible_state_dict(
-            self.event_encoder, checkpoint.get("state_dict_event_encoder", {})
+            self.event_encoder,
+            checkpoint.get(
+                "state_dict_event_encoder",
+                checkpoint.get("state_dict_existing_event_encoder", {}),
+            ),
         )
         print(
             "[Event-FiLM Load] "
@@ -348,6 +614,11 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             f"vae_loaded={vae_loaded}, vae_skipped={vae_skipped}, "
             f"event_encoder_loaded={enc_loaded}, event_encoder_skipped={enc_skipped}"
         )
+        if "state_dict_decoder_refinement" in checkpoint:
+            self.load_decoder_refinement_checkpoint(
+                checkpoint,
+                ignore_mismatch=ignore_config_mismatch,
+            )
 
 
 class OSEDiffEventFiLMReg(torch.nn.Module):
@@ -639,18 +910,33 @@ class OSEDiffEventFiLMTest(torch.nn.Module):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.gen = OSEDiffEventFiLMGen(args)
         checkpoint = torch.load(args.osediff_path, map_location="cpu")
-        self.gen.load_event_checkpoint(checkpoint)
+        self.gen.load_event_checkpoint(
+            checkpoint,
+            ignore_config_mismatch=bool(
+                getattr(args, "resume_ignore_mismatch", False)
+            ),
+        )
         self.gen.eval()
         self.weight_dtype = torch.float16 if getattr(args, "mixed_precision", "fp16") == "fp16" else torch.float32
         self.gen.unet.to(self.device, dtype=self.weight_dtype)
         self.gen.vae.to(self.device, dtype=self.weight_dtype)
         self.gen.text_encoder.to(self.device, dtype=self.weight_dtype)
         self.gen.event_encoder.to(self.device, dtype=self.weight_dtype)
+        if self.gen.rgb_event_encoder is not None:
+            self.gen.rgb_event_encoder.to(self.device, dtype=self.weight_dtype)
         self.timesteps = torch.tensor([getattr(args, "generator_timestep", 999)], device=self.device).long()
         print(f"[INFO] Generator inference timestep: {self.timesteps.item()}")
 
     @torch.no_grad()
-    def forward(self, lq, events, prompt):
+    def forward(
+        self,
+        lq,
+        events,
+        prompt,
+        events_refinement=None,
+        decoder_fusion_enabled=None,
+        refinement_fusion_mode=None,
+    ):
         batch = {
             "prompt": [prompt],
             "neg_prompt": [getattr(self.args, "neg_prompt", "")],
@@ -660,6 +946,12 @@ class OSEDiffEventFiLMTest(torch.nn.Module):
             events.to(self.device, dtype=self.weight_dtype),
             self.timesteps,
             batch=batch,
+            events_refinement=(
+                events_refinement.to(self.device, dtype=self.weight_dtype)
+                if events_refinement is not None else None
+            ),
+            decoder_fusion_enabled=decoder_fusion_enabled,
+            refinement_fusion_mode=refinement_fusion_mode,
         )
         return out
 

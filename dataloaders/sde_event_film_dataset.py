@@ -50,6 +50,14 @@ class SDEEventFilmDataset(Dataset):
             )
         self.fixed_prompt = getattr(args, "fixed_prompt", "high quality, bright, detailed photo")
         self.neg_prompt = getattr(args, "neg_prompt", "")
+        self.event_ablation_mode = getattr(args, "event_ablation_mode", "correct")
+        if self.event_ablation_mode not in {"correct", "zero", "shuffled"}:
+            raise ValueError(
+                f"Unsupported event_ablation_mode={self.event_ablation_mode}."
+            )
+        self.return_raw_event_voxel = bool(
+            getattr(args, "return_raw_event_voxel", False)
+        )
         self.samples = self._scan_samples(self.root_dir)
         if not self.samples:
             raise RuntimeError(f"No SDE samples found under: {self.root_dir}")
@@ -65,6 +73,19 @@ class SDEEventFilmDataset(Dataset):
         width, height = low_img.size
 
         raw_or_voxel = self._load_event_for_sample(sample)
+        if self.event_ablation_mode == "shuffled":
+            donor_index = self._shuffled_event_index(index)
+            donor = self.samples[donor_index]
+            raw_or_voxel = self._load_event_for_sample(donor)
+            with Image.open(donor.low_path) as donor_image:
+                donor_width, donor_height = donor_image.size
+            raw_or_voxel = self._remap_event_extent(
+                raw_or_voxel,
+                source_width=donor_width,
+                source_height=donor_height,
+                target_width=width,
+                target_height=height,
+            )
         low_t = transforms.ToTensor()(low_img)
         normal_t = transforms.ToTensor()(normal_img)
 
@@ -82,12 +103,17 @@ class SDEEventFilmDataset(Dataset):
         # not image mean/std normalization, so using F.normalize here would crash.
         low_t = TF.normalize(low_t, mean=[0.5], std=[0.5])
         normal_t = TF.normalize(normal_t, mean=[0.5], std=[0.5])
-        event_t = self._normalize_event_voxel(event_t)
+        if self.event_ablation_mode == "zero":
+            event_t = torch.zeros_like(event_t)
+        raw_event_t = event_t
+        events_clora = self._normalize_event_voxel(event_t)
+        events_refinement = self._normalize_event_voxel_refinement(event_t)
 
-        return {
+        output = {
             "conditioning_pixel_values": low_t,
             "output_pixel_values": normal_t,
-            "events": event_t,
+            "events": events_clora,
+            "events_refinement": events_refinement,
             "prompt": [self.fixed_prompt],
             "neg_prompt": self.neg_prompt,
             "scene_name": sample.scene_name,
@@ -96,6 +122,40 @@ class SDEEventFilmDataset(Dataset):
             "low_path": sample.low_path,
             "normal_path": sample.normal_path,
         }
+        if self.return_raw_event_voxel:
+            output["event_voxel_raw"] = raw_event_t
+        return output
+
+    def _shuffled_event_index(self, index):
+        """batch size=1 时也使用固定、可复现且不等于自身的 dataset 错配。"""
+        if len(self.samples) < 2:
+            raise RuntimeError("shuffled ablation requires at least two samples.")
+        offset = max(1, len(self.samples) // 2)
+        donor_index = (int(index) + offset) % len(self.samples)
+        if donor_index == index:
+            donor_index = (int(index) + 1) % len(self.samples)
+        return donor_index
+
+    def _remap_event_extent(
+        self,
+        event,
+        source_width,
+        source_height,
+        target_width,
+        target_height,
+    ):
+        """把错配事件映射到目标图像坐标系，随后复用目标 RGB 的 crop/flip。"""
+        if event.ndim == 3:
+            return F.interpolate(
+                event.unsqueeze(0),
+                size=(target_height, target_width),
+                mode="nearest",
+            )[0]
+        event = event.clone()
+        if event.numel() > 0:
+            event[:, 1] *= target_width / max(float(source_width), 1.0)
+            event[:, 2] *= target_height / max(float(source_height), 1.0)
+        return event
 
     def _scan_samples(self, root_dir):
         samples = []
@@ -262,3 +322,19 @@ class SDEEventFilmDataset(Dataset):
         denom = event.abs().mean(dim=(1, 2), keepdim=True).clamp_min(1e-6)
         event = event / denom
         return event.clamp(-5.0, 5.0) / 5.0
+
+    @staticmethod
+    def _normalize_event_voxel_refinement(event, eps=1e-6):
+        """按预训练 EventPyramidEncoder 分布，仅标准化非零 voxel 值。"""
+        output = torch.zeros_like(event)
+        nonzero_mask = event != 0
+        values = event[nonzero_mask]
+        if values.numel() == 0:
+            return output
+        mean = values.mean()
+        std = values.std(unbiased=False)
+        if not torch.isfinite(std) or std < eps:
+            # 常数事件只携带计数而没有可稳定标准化的方差，置零最安全。
+            return output
+        output[nonzero_mask] = (values - mean) / (std + eps)
+        return output

@@ -30,6 +30,7 @@ from diffusers.models.attention_processor import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.autoencoders.vae import Decoder, DecoderOutput, DiagonalGaussianDistribution, Encoder
+from models.decoder_refinement import FeatureAwareDecoder
 
 class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
     r"""
@@ -155,6 +156,49 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
         """
         self.use_slicing = False
 
+    def install_feature_aware_decoder(
+        self,
+        condition_channels=(64, 128, 256, 512),
+        fusion_weight=1.0,
+        fusion_init="near_zero",
+    ):
+        """用单一条件 decoder 替换标准 decoder，并严格迁移全部 backbone 权重。"""
+        if isinstance(self.decoder, FeatureAwareDecoder):
+            return self.decoder
+        old_decoder = self.decoder
+        parameter = next(old_decoder.parameters())
+        new_decoder = FeatureAwareDecoder(
+            in_channels=self.config.latent_channels,
+            out_channels=self.config.out_channels,
+            up_block_types=tuple(self.config.up_block_types),
+            block_out_channels=tuple(self.config.block_out_channels),
+            layers_per_block=self.config.layers_per_block,
+            norm_num_groups=self.config.norm_num_groups,
+            act_fn=self.config.act_fn,
+            condition_channels=condition_channels,
+            fusion_weight=fusion_weight,
+            fusion_init=fusion_init,
+        )
+        load_result = new_decoder.load_state_dict(
+            old_decoder.state_dict(), strict=False
+        )
+        invalid_missing = [
+            key for key in load_result.missing_keys
+            if not key.startswith("feature_fusion_blocks.")
+        ]
+        if invalid_missing or load_result.unexpected_keys:
+            raise RuntimeError(
+                "VAE decoder backbone migration failed: "
+                f"missing={invalid_missing}, unexpected={load_result.unexpected_keys}"
+            )
+        new_decoder.to(device=parameter.device, dtype=parameter.dtype)
+        new_decoder.train(old_decoder.training)
+        new_decoder.gradient_checkpointing = getattr(
+            old_decoder, "gradient_checkpointing", False
+        )
+        self.decoder = new_decoder
+        return new_decoder
+
     @property
     # Copied from diffusers.models.unet_2d_condition.UNet2DConditionModel.attn_processors
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
@@ -266,12 +310,35 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
 
         return AutoencoderKLOutput(latent_dist=posterior)
 
-    def _decode(self, z: torch.FloatTensor, return_dict: bool = True) -> Union[DecoderOutput, torch.FloatTensor]:
+    def _decode(
+        self,
+        z: torch.FloatTensor,
+        return_dict: bool = True,
+        fused_features=None,
+        fusion_enabled=False,
+        fusion_weight=None,
+    ) -> Union[DecoderOutput, torch.FloatTensor]:
         if self.use_tiling and (z.shape[-1] > self.tile_latent_min_size or z.shape[-2] > self.tile_latent_min_size):
+            if fusion_enabled or fused_features is not None:
+                raise NotImplementedError(
+                    "Conditional tiled decode is not implemented; disable VAE tiling."
+                )
             return self.tiled_decode(z, return_dict=return_dict)
 
         z = self.post_quant_conv(z)
-        dec = self.decoder(z)
+        if isinstance(self.decoder, FeatureAwareDecoder):
+            dec = self.decoder(
+                z,
+                fused_features=fused_features,
+                fusion_enabled=fusion_enabled,
+                fusion_weight=fusion_weight,
+            )
+        else:
+            if fusion_enabled or fused_features is not None:
+                raise RuntimeError(
+                    "Decoder refinement was requested before installing FeatureAwareDecoder."
+                )
+            dec = self.decoder(z)
 
         if not return_dict:
             return (dec,)
@@ -280,7 +347,13 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
 
     @apply_forward_hook
     def decode(
-        self, z: torch.FloatTensor, return_dict: bool = True, generator=None
+        self,
+        z: torch.FloatTensor,
+        return_dict: bool = True,
+        generator=None,
+        fused_features=None,
+        fusion_enabled=False,
+        fusion_weight=None,
     ) -> Union[DecoderOutput, torch.FloatTensor]:
         """
         Decode a batch of images.
@@ -297,10 +370,31 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
 
         """
         if self.use_slicing and z.shape[0] > 1:
-            decoded_slices = [self._decode(z_slice).sample for z_slice in z.split(1)]
+            feature_slices = None
+            if fused_features is not None:
+                feature_slices = [feature.split(1) for feature in fused_features]
+            decoded_slices = []
+            for index, z_slice in enumerate(z.split(1)):
+                slice_features = (
+                    [level[index] for level in feature_slices]
+                    if feature_slices is not None else None
+                )
+                decoded_slices.append(
+                    self._decode(
+                        z_slice,
+                        fused_features=slice_features,
+                        fusion_enabled=fusion_enabled,
+                        fusion_weight=fusion_weight,
+                    ).sample
+                )
             decoded = torch.cat(decoded_slices)
         else:
-            decoded = self._decode(z).sample
+            decoded = self._decode(
+                z,
+                fused_features=fused_features,
+                fusion_enabled=fusion_enabled,
+                fusion_weight=fusion_weight,
+            ).sample
 
         if not return_dict:
             return (decoded,)
