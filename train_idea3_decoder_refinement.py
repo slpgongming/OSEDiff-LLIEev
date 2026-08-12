@@ -130,6 +130,7 @@ def parse_args():
     parser.add_argument("--log_steps", type=int, default=10)
     parser.add_argument("--report_to", default=None)
     parser.add_argument("--tracker_project_name", default="idea3-decoder-refinement")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases 运行名称")
 
     parser.add_argument("--lambda_l2", type=float, default=1.0)
     parser.add_argument("--lambda_lpips", type=float, default=1.0)
@@ -328,7 +329,13 @@ def main(args):
     lpips_metric = pyiqa.create_metric("lpips").to(accelerator.device).eval()
     lpips_metric.requires_grad_(False)
     if accelerator.is_main_process and args.report_to:
-        accelerator.init_trackers(args.tracker_project_name, config=vars(args))
+        tracker_config = vars(args).copy()
+        init_kwargs = {}
+        if "wandb" in args.report_to or args.report_to == "all":
+            init_kwargs["wandb"] = {}
+            if args.wandb_run_name:
+                init_kwargs["wandb"]["name"] = args.wandb_run_name
+        accelerator.init_trackers(args.tracker_project_name, config=tracker_config, init_kwargs=init_kwargs)
 
     start_epoch = int(resume_checkpoint.get("epoch", 0)) if resume_checkpoint else 0
     global_step = int(resume_checkpoint.get("global_step", 0)) if resume_checkpoint else 0

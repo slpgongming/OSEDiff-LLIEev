@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>idea3 model architecture</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&family=Playfair+Display:ital,wght@0,600;0,700;1,600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --ink: #17343a;
+      --muted: #65777a;
+      --paper: #fbfcf8;
+      --paper-2: #eef5ee;
+      --edge: #d5e1d7;
+      --blue: #4b82c7;
+      --blue-soft: #dbeafa;
+      --event: #e36d4d;
+      --event-soft: #fae1d8;
+      --green: #68a46c;
+      --green-soft: #dcefd9;
+      --purple: #8a71b5;
+      --purple-soft: #e7dff2;
+      --gold: #e4a55c;
+      --gold-soft: #fde2c3;
+      --signal: .72;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; color: var(--ink); background:
+        radial-gradient(circle at 2% 0%, rgba(227,109,77,.13), transparent 24rem),
+        radial-gradient(circle at 97% 5%, rgba(75,130,199,.13), transparent 24rem),
+        var(--paper-2);
+      font-family: Manrope, sans-serif;
+    }
+    .page { width: min(1560px, calc(100% - 30px)); margin: 18px auto 40px; padding: 30px clamp(16px,3vw,44px) 34px; background: var(--paper); border: 1px solid var(--edge); box-shadow: 0 17px 44px rgba(31,64,45,.12); }
+    header { display:flex; justify-content:space-between; align-items:end; gap:20px; padding-bottom:20px; border-bottom:1px solid var(--edge); }
+    .eyebrow { margin:0 0 8px; color:var(--green); font:500 11px "IBM Plex Mono",monospace; letter-spacing:.12em; text-transform:uppercase; }
+    h1 { margin:0; font:700 clamp(30px,4vw,54px)/1 "Playfair Display",serif; letter-spacing:-.045em; }
+    h1 em { color:var(--green); }
+    .intro { margin:12px 0 0; max-width:770px; color:var(--muted); font-size:14px; line-height:1.5; }
+    .phase-buttons { display:flex; gap:5px; padding:5px; border:1px solid var(--edge); background:#f0f4ef; }
+    button { border:0; cursor:pointer; font-family:Manrope,sans-serif; }
+    .phase-buttons button { padding:10px 13px; color:var(--muted); background:transparent; font-size:12px; font-weight:700; }
+    .phase-buttons button[aria-pressed="true"] { color:white; background:var(--ink); }
+    .toolbar { display:flex; flex-wrap:wrap; justify-content:space-between; gap:14px; padding:15px 0; }
+    .tool-group { display:flex; align-items:center; flex-wrap:wrap; gap:7px; }
+    .micro { color:var(--muted); font:500 10px "IBM Plex Mono",monospace; letter-spacing:.09em; text-transform:uppercase; }
+    .event-btn { padding:6px 8px; color:var(--muted); background:transparent; border-bottom:2px solid transparent; font:500 11px "IBM Plex Mono",monospace; }
+    .event-btn[aria-pressed="true"] { color:var(--event); border-color:var(--event); }
+    .strength { display:flex; align-items:center; gap:8px; color:var(--muted); font:500 10px "IBM Plex Mono",monospace; }
+    input[type=range] { width:130px; accent-color:var(--green); }
+    output { min-width:36px; color:var(--green); }
+    .visual-grid { display:grid; grid-template-columns:minmax(0,1fr) 270px; gap:22px; align-items:start; }
+    .figure { overflow:auto hidden; padding:12px 0 5px; }
+    .diagram { min-width:1040px; width:100%; display:none; background:#fbfdf9; border:1px solid var(--edge); }
+    .diagram.active { display:block; animation:fade .26s ease-out; }
+    @keyframes fade { from {opacity:0; transform:translateY(6px)} to {opacity:1; transform:none} }
+    .module { cursor:pointer; outline:none; }
+    .module .card { stroke:#afc1b7; stroke-width:1.2; transition:filter .15s,stroke-width .15s; }
+    .module:hover .card, .module.focused .card { stroke:var(--ink); stroke-width:3; filter:url(#shadow); }
+    .module text { font-family:Manrope,sans-serif; fill:var(--ink); text-anchor:middle; }
+    .module .name { font-size:15px; font-weight:800; }
+    .module .sub { font-size:11px; fill:var(--muted); }
+    .module .tag { font:500 9px "IBM Plex Mono",monospace; letter-spacing:.08em; }
+    .decoder-shell { stroke:#ce783c; stroke-width:3; }
+    .decoder-stage { stroke:#c77a41; stroke-width:1.5; }
+    .label { font:500 11px "IBM Plex Mono",monospace; fill:var(--muted); letter-spacing:.05em; }
+    .arrow { fill:none; stroke:#556166; stroke-width:3; marker-end:url(#arrow); }
+    .arrow.rgb { stroke:var(--blue); } .arrow.event { stroke:var(--event); } .arrow.green { stroke:var(--green); stroke-width:calc(2px + var(--signal) * 3px); } .arrow.purple { stroke:var(--purple); }
+    .skip { fill:none; stroke:var(--blue); stroke-width:3.5; marker-end:url(#arrow-blue); }
+    .event-dots { transition:opacity .2s; } .event-flow { transition:opacity .2s,stroke-dasharray .2s; }
+    .event-zero .event-dots, .event-zero .event-flow { opacity:.18; }
+    .event-shuffled .event-flow { stroke-dasharray:7 6; }
+    .event-shuffled .event-dots { filter:hue-rotate(120deg); }
+    .inject { fill:none; stroke:var(--green); stroke-width:calc(1.8px + var(--signal) * 3px); marker-end:url(#arrow-green); }
+    .legend { display:flex; flex-wrap:wrap; gap:13px; padding:11px 2px 0; color:var(--muted); font-size:11px; }
+    .legend i { width:10px; height:10px; display:inline-block; margin-right:4px; vertical-align:-1px; border:1px solid rgba(23,52,58,.22); }
+    .inspector { position:sticky; top:15px; padding:18px; border-left:4px solid var(--ink); background:#edf3ed; min-height:420px; }
+    .inspector h2 { margin:8px 0; font:700 26px/1 "Playfair Display",serif; letter-spacing:-.03em; }
+    .inspector p { margin:0 0 15px; color:var(--muted); font-size:13px; line-height:1.5; }
+    .facts { margin:0; padding:0; list-style:none; }
+    .facts li { display:grid; grid-template-columns:70px 1fr; gap:8px; padding:8px 0; border-top:1px solid #cfdbd1; font-size:11px; line-height:1.35; }
+    .facts b { color:var(--muted); font:500 9px "IBM Plex Mono",monospace; letter-spacing:.07em; text-transform:uppercase; }
+    .formula { margin-top:14px; padding:11px; background:white; border-left:3px solid var(--green); color:var(--ink); font:500 11px/1.55 "IBM Plex Mono",monospace; }
+    .below { display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-top:22px; padding-top:15px; border-top:1px solid var(--edge); }
+    .below h3 { margin:0 0 6px; font-size:15px; } .below p { margin:0; color:var(--muted); font-size:12px; line-height:1.5; }
+    @media(max-width:1050px){.visual-grid{grid-template-columns:1fr}.inspector{position:static;min-height:0}header{align-items:start;flex-direction:column}.phase-buttons{width:max-content}}
+    @media(max-width:600px){.page{width:calc(100% - 14px);margin-top:7px;padding:22px 12px}.toolbar{align-items:flex-start;flex-direction:column}.below{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <main class="page" id="page" data-event="correct">
+    <header>
+      <div>
+        <p class="eyebrow">idea3 · architecture explorer</p>
+        <h1>Preserve the diffusion prior.<br><em>Recover the detail.</em></h1>
+        <p class="intro">点击网络模块查看它在当前 Phase 1 或最终目标中的职责。两张图刻意保持同一视觉语言：输入图像、事件点云、feature stack、one-step diffusion 与多尺度 decoder refinement。</p>
+      </div>
+      <div class="phase-buttons" role="group" aria-label="模型阶段">
+        <button type="button" data-phase="current" aria-pressed="true">Current · Phase 1</button>
+        <button type="button" data-phase="final" aria-pressed="false">Final target</button>
+      </div>
+    </header>
+
+    <section class="toolbar">
+      <div class="tool-group" role="group" aria-label="事件消融">
+        <span class="micro">event evidence</span>
+        <button type="button" class="event-btn" data-event="correct" aria-pressed="true">correct</button>
+        <button type="button" class="event-btn" data-event="zero" aria-pressed="false">zero</button>
+        <button type="button" class="event-btn" data-event="shuffled" aria-pressed="false">shuffled</button>
+      </div>
+      <label class="strength">decoder detail injection
+        <input id="strength" type="range" min="0" max="100" value="72">
+        <output id="strength-value">0.72×</output>
+      </label>
+    </section>
+
+    <section class="visual-grid">
+      <div>
+        <div class="figure">
+          <svg class="diagram active" id="current" viewBox="0 0 1580 750" role="img" aria-label="Current Phase 1 architecture">
+            <defs>
+              <linearGradient id="photo" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#384330"/><stop offset=".42" stop-color="#bc9149"/><stop offset=".7" stop-color="#ffe4a2"/><stop offset="1" stop-color="#314650"/></linearGradient>
+              <linearGradient id="feature" x1="0" x2="1"><stop stop-color="#315c9f"/><stop offset=".55" stop-color="#75a0dc"/><stop offset="1" stop-color="#c2dafb"/></linearGradient>
+              <linearGradient id="latent" x1="0" x2="1"><stop stop-color="#477d2e"/><stop offset="1" stop-color="#b4d598"/></linearGradient>
+              <linearGradient id="decoder" x1="0" x2="1"><stop stop-color="#e2975e"/><stop offset="1" stop-color="#ffd2a8"/></linearGradient>
+              <filter id="shadow" x="-25%" y="-25%" width="150%" height="160%"><feDropShadow dx="0" dy="4" stdDeviation="3" flood-color="#294b39" flood-opacity=".25"/></filter>
+              <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10z" fill="#556166"/></marker>
+              <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10z" fill="#4b82c7"/></marker>
+              <marker id="arrow-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10z" fill="#68a46c"/></marker>
+            </defs>
+            <text x="38" y="37" class="label">CURRENT MODEL · PHASE 1</text>
+            <text x="1170" y="37" class="label">ONLY DECODER FUSION BLOCKS ARE TRAINABLE</text>
+            <line x1="38" y1="50" x2="1542" y2="50" stroke="#d5e1d7"/>
+
+            <g class="module" data-key="rgb" tabindex="0" role="button">
+              <rect class="card" x="40" y="96" width="190" height="132" rx="4" fill="url(#photo)"/>
+              <path d="M58 200 C85 166 125 177 146 142 C160 120 173 123 190 112 L210 112 L210 207 L58 207z" fill="rgba(26,42,35,.36)"/>
+              <ellipse cx="127" cy="161" rx="23" ry="35" fill="#664e2f"/><path d="M110 137 Q127 111 145 137" fill="none" stroke="#d1b06f" stroke-width="6"/>
+              <circle cx="184" cy="130" r="30" fill="rgba(255,243,178,.6)"/>
+              <text x="135" y="250" class="name">Low-light RGB</text><text x="135" y="269" class="sub">[−1,1] · 3×H×W</text>
+            </g>
+            <g class="module" data-key="events" tabindex="0" role="button">
+              <rect class="card" x="40" y="330" width="190" height="125" rx="4" fill="#fff8f5"/>
+              <g class="event-dots" fill="#e36d4d"><circle cx="68" cy="373" r="3"/><circle cx="88" cy="400" r="2"/><circle cx="110" cy="359" r="4"/><circle cx="129" cy="409" r="3"/><circle cx="148" cy="375" r="2"/><circle cx="171" cy="402" r="4"/><circle cx="198" cy="366" r="3"/><circle cx="92" cy="428" r="3"/><circle cx="155" cy="434" r="2"/></g>
+              <g class="event-dots" fill="#4b82c7"><circle cx="75" cy="415" r="3"/><circle cx="98" cy="381" r="4"/><circle cx="121" cy="428" r="2"/><circle cx="143" cy="365" r="3"/><circle cx="166" cy="416" r="3"/><circle cx="193" cy="390" r="2"/><circle cx="205" cy="434" r="4"/><circle cx="111" cy="400" r="2"/></g>
+              <text x="135" y="486" class="name">Aligned events</text><text x="135" y="505" class="sub">same raw voxel · 5×H×W</text>
+            </g>
+
+            <path class="arrow rgb" d="M230 160 H320"/>
+            <path class="arrow event event-flow" d="M230 392 H286 V294 H455"/>
+            <g class="module" data-key="vae" tabindex="0" role="button">
+              <polygon class="card" points="320,103 418,103 438,125 438,212 418,232 320,232" fill="#dbeafa"/>
+              <text x="379" y="149" class="name">VAE RGB</text><text x="379" y="168" class="name">Encoder</text><text x="379" y="192" class="sub">frozen · original path</text>
+            </g>
+            <path class="arrow purple" d="M438 167 H505"/>
+            <g class="module" data-key="latent" tabindex="0" role="button">
+              <polygon class="card" points="505,129 569,118 576,198 512,208" fill="url(#latent)"/>
+              <text x="541" y="232" class="name">zᵥₐₑ</text><text x="541" y="250" class="sub">diffusion input</text>
+            </g>
+            <path class="arrow purple" d="M576 164 H642"/>
+            <g class="module" data-key="unet" tabindex="0" role="button">
+              <polygon class="card" points="642,92 755,129 755,205 642,242 675,167" fill="#c3dda9"/>
+              <polygon class="card" points="868,92 755,129 755,205 868,242 835,167" fill="#b0d394"/>
+              <text x="755" y="161" class="name">Diffusion UNet</text><text x="755" y="181" class="sub">one-step denoiser</text>
+            </g>
+            <g class="module" data-key="events" tabindex="0" role="button">
+              <rect class="card" x="455" y="257" width="145" height="72" rx="4" fill="#fae1d8"/>
+              <text x="527" y="287" class="name">EventEncoder</text><text x="527" y="307" class="sub">legacy event path</text>
+            </g>
+            <path class="arrow event event-flow" d="M600 293 H620"/>
+            <g class="module" data-key="clora" tabindex="0" role="button">
+              <rect class="card" x="693" y="270" width="125" height="72" rx="4" fill="#e7dff2"/>
+              <text x="755" y="300" class="name">cLoRA</text><text x="755" y="320" class="sub">chosen variant</text>
+            </g>
+            <path class="arrow event event-flow" d="M600 293 H693"/>
+            <path class="arrow event event-flow" d="M755 270 V228"/>
+            <text x="824" y="254" class="label">modulates UNet</text>
+            <path class="arrow purple" d="M868 167 H939"/>
+            <g class="module" data-key="z0" tabindex="0" role="button">
+              <polygon class="card" points="939,133 1004,123 1012,203 947,213" fill="url(#latent)"/>
+              <text x="974" y="242" class="name">z₀</text><text x="974" y="260" class="sub">denoised latent</text>
+            </g>
+
+            <path class="arrow rgb" d="M230 160 V548 H320"/>
+            <path class="arrow event event-flow" d="M230 392 V624 H320"/>
+            <g class="module" data-key="rgb-event" tabindex="0" role="button">
+              <polygon class="card" points="320,510 467,510 490,533 490,651 467,674 320,674" fill="#dcefd9"/>
+              <text x="405" y="552" class="name">RGB-event</text><text x="405" y="572" class="name">Encoder</text><text x="405" y="597" class="sub">RGB + event pyramids</text><text x="405" y="616" class="sub">+ MultiScaleFusion</text><text x="405" y="642" class="tag" fill="#68a46c">FROZEN</text>
+            </g>
+            <path class="arrow green" d="M490 590 H550"/>
+            <g class="module" data-key="fused" tabindex="0" role="button">
+              <g transform="translate(550 522)">
+                <polygon class="card" points="40,0 91,0 84,22 47,22" fill="url(#feature)"/>
+                <polygon class="card" points="27,38 102,38 92,64 37,64" fill="url(#feature)"/>
+                <polygon class="card" points="13,78 112,78 100,108 24,108" fill="url(#feature)"/>
+                <polygon class="card" points="0,122 120,122 106,156 16,156" fill="url(#feature)"/>
+              </g>
+              <text x="649" y="542" class="sub" text-anchor="start">f₃ · 512 @ 1/8</text>
+              <text x="660" y="580" class="sub" text-anchor="start">f₂ · 256 @ 1/4</text>
+              <text x="670" y="622" class="sub" text-anchor="start">f₁ · 128 @ 1/2</text>
+              <text x="680" y="668" class="sub" text-anchor="start">f₀ · 64 @ 1×</text>
+              <text x="613" y="688" class="name">Fused features</text><text x="613" y="706" class="sub">512 → 64 · coarse to fine</text>
+            </g>
+
+            <path class="arrow" d="M1012 167 H1305 V331"/>
+            <g class="module" data-key="decoder" tabindex="0" role="button">
+              <polygon class="decoder-shell" points="1238,284 1372,284 1475,637 1135,637" fill="#fff0df"/>
+              <text x="1305" y="267" class="name">FeatureAware Decoder</text>
+              <text x="1305" y="287" class="sub">frozen VAE backbone · trainable fusion blocks</text>
+              <line x1="1238" y1="307" x2="1372" y2="307" stroke="#d88c50"/>
+              <text x="1305" y="324" class="label" fill="#7b8580">FROZEN VAE DECODER</text>
+              <polygon class="decoder-stage" points="1245,331 1365,331 1353,361 1257,361" fill="url(#decoder)"/>
+              <text x="1305" y="351" class="sub">mid block · 1/8</text>
+              <path class="arrow" d="M1305 361 V380"/>
+              <rect x="1203" y="380" width="62" height="30" rx="3" fill="#f2bd8a"/><text x="1234" y="400" class="tag">Fusion 3</text>
+              <polygon class="decoder-stage" points="1238,380 1372,380 1357,418 1253,418" fill="url(#decoder)"/>
+              <text x="1305" y="404" class="sub">UpBlock 3 · 1/8</text>
+              <path class="arrow" d="M1305 418 V440"/>
+              <rect x="1188" y="440" width="62" height="30" rx="3" fill="#f2bd8a"/><text x="1219" y="460" class="tag">Fusion 2</text>
+              <polygon class="decoder-stage" points="1218,440 1392,440 1374,480 1236,480" fill="url(#decoder)"/>
+              <text x="1305" y="466" class="sub">UpBlock 2 · 1/4</text>
+              <path class="arrow" d="M1305 480 V502"/>
+              <rect x="1173" y="502" width="62" height="30" rx="3" fill="#f2bd8a"/><text x="1204" y="522" class="tag">Fusion 1</text>
+              <polygon class="decoder-stage" points="1196,502 1414,502 1392,544 1218,544" fill="url(#decoder)"/>
+              <text x="1305" y="529" class="sub">UpBlock 1 · 1/2</text>
+              <path class="arrow" d="M1305 544 V566"/>
+              <rect x="1158" y="566" width="62" height="30" rx="3" fill="#f2bd8a"/><text x="1189" y="586" class="tag">Fusion 0</text>
+              <polygon class="decoder-stage" points="1170,566 1440,566 1414,612 1196,612" fill="url(#decoder)"/>
+              <text x="1305" y="595" class="sub">UpBlock 0 · 1×</text>
+              <text x="1305" y="628" class="label" fill="#bf7144">FOUR TRAINABLE RESIDUAL FUSION BLOCKS</text>
+            </g>
+            <path class="arrow" d="M1305 612 V657"/>
+            <g class="module" data-key="output" tabindex="0" role="button">
+              <rect class="card" x="1214" y="657" width="182" height="70" rx="4" fill="url(#photo)"/>
+              <path d="M1232 714 C1258 690 1290 699 1308 680 C1325 664 1351 665 1378 672 L1378 718z" fill="rgba(26,42,35,.23)"/>
+              <ellipse cx="1294" cy="692" rx="18" ry="25" fill="#6e5533"/><path d="M1280 676 Q1294 658 1308 676" fill="none" stroke="#e4bf73" stroke-width="5"/>
+              <text x="1305" y="744" class="name">Refined RGB</text>
+            </g>
+            <path class="inject" d="M641 533 C820 500 1035 426 1203 395"/>
+            <path class="inject" d="M652 570 C820 557 1034 486 1188 455"/>
+            <path class="inject" d="M662 609 C815 610 1024 550 1173 517"/>
+            <path class="inject" d="M670 647 C820 658 1025 614 1158 581"/>
+            <text x="816" y="492" class="label" fill="#68a46c">four-scale detail injection</text>
+          </svg>
+
+          <svg class="diagram" id="final" viewBox="0 0 1580 750" role="img" aria-label="Final expected architecture">
+            <defs>
+              <linearGradient id="final-photo" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#384330"/><stop offset=".42" stop-color="#bc9149"/><stop offset=".7" stop-color="#ffe4a2"/><stop offset="1" stop-color="#314650"/></linearGradient>
+              <linearGradient id="final-feature" x1="0" x2="1"><stop stop-color="#315c9f"/><stop offset=".55" stop-color="#75a0dc"/><stop offset="1" stop-color="#c2dafb"/></linearGradient>
+              <linearGradient id="final-latent" x1="0" x2="1"><stop stop-color="#477d2e"/><stop offset="1" stop-color="#b4d598"/></linearGradient>
+              <linearGradient id="final-decoder" x1="0" x2="1"><stop stop-color="#e2975e"/><stop offset="1" stop-color="#ffd2a8"/></linearGradient>
+              <filter id="final-shadow" x="-25%" y="-25%" width="150%" height="160%"><feDropShadow dx="0" dy="4" stdDeviation="3" flood-color="#294b39" flood-opacity=".25"/></filter>
+              <marker id="final-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10z" fill="#556166"/></marker>
+              <marker id="final-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10z" fill="#68a46c"/></marker>
+            </defs>
+            <style>.arrow{marker-end:url(#final-arrow)}.inject{marker-end:url(#final-green)}.module:hover .card,.module.focused .card{filter:url(#final-shadow)}</style>
+            <text x="38" y="37" class="label">FINAL EXPECTED MODEL · SHARED REPRESENTATION</text>
+            <text x="1050" y="37" class="label">REPLACE TWO LEGACY ENCODERS AFTER POSTERIOR VALIDATION</text>
+            <line x1="38" y1="50" x2="1542" y2="50" stroke="#d5e1d7"/>
+
+            <g class="module" data-key="rgb" tabindex="0" role="button">
+              <rect class="card" x="40" y="106" width="190" height="132" rx="4" fill="url(#final-photo)"/>
+              <path d="M58 210 C85 176 125 187 146 152 C160 130 173 133 190 122 L210 122 L210 217 L58 217z" fill="rgba(26,42,35,.36)"/>
+              <ellipse cx="127" cy="171" rx="23" ry="35" fill="#664e2f"/><path d="M110 147 Q127 121 145 147" fill="none" stroke="#d1b06f" stroke-width="6"/>
+              <text x="135" y="260" class="name">Low-light RGB</text><text x="135" y="279" class="sub">input frame</text>
+            </g>
+            <g class="module" data-key="events" tabindex="0" role="button">
+              <rect class="card" x="40" y="350" width="190" height="125" rx="4" fill="#fff8f5"/>
+              <g class="event-dots" fill="#e36d4d"><circle cx="68" cy="393" r="3"/><circle cx="88" cy="420" r="2"/><circle cx="110" cy="379" r="4"/><circle cx="129" cy="429" r="3"/><circle cx="148" cy="395" r="2"/><circle cx="171" cy="422" r="4"/><circle cx="198" cy="386" r="3"/></g>
+              <g class="event-dots" fill="#4b82c7"><circle cx="75" cy="435" r="3"/><circle cx="98" cy="401" r="4"/><circle cx="121" cy="448" r="2"/><circle cx="143" cy="385" r="3"/><circle cx="166" cy="436" r="3"/><circle cx="193" cy="410" r="2"/></g>
+              <text x="135" y="506" class="name">Aligned events</text><text x="135" y="525" class="sub">shared event stream</text>
+            </g>
+            <path class="arrow rgb" d="M230 172 H316 V222"/>
+            <path class="arrow event event-flow" d="M230 412 H270 V311 H316"/>
+
+            <g class="module" data-key="rgb-event" tabindex="0" role="button">
+              <polygon class="card" points="300,90 510,90 538,119 538,456 510,485 300,485" fill="#dcefd9"/>
+              <text x="419" y="125" class="name">RGB-event Encoder</text><text x="419" y="145" class="sub">outer representation container</text>
+              <line x1="323" y1="158" x2="514" y2="158" stroke="#89b892" stroke-width="1.5"/>
+              <text x="419" y="174" class="tag" fill="#5a8e61">CONTAINS</text>
+              <rect x="316" y="190" width="92" height="64" rx="5" fill="#f2f9f0" stroke="#82af8a" stroke-width="1.3"/>
+              <text x="362" y="215" class="name">RGB</text><text x="362" y="233" class="name">Encoder</text><text x="362" y="248" class="sub">image pyramid</text>
+              <rect x="316" y="280" width="92" height="64" rx="5" fill="#f2f9f0" stroke="#82af8a" stroke-width="1.3"/>
+              <text x="362" y="305" class="name">Event</text><text x="362" y="323" class="name">Encoder</text><text x="362" y="338" class="sub">event pyramid</text>
+              <rect x="425" y="214" width="94" height="128" rx="5" fill="#e1f1de" stroke="#68a46c" stroke-width="1.5"/>
+              <text x="472" y="259" class="name">MultiScale</text><text x="472" y="278" class="name">Fusion</text><text x="472" y="298" class="sub">aligned detail</text><text x="472" y="314" class="sub">feature pyramid</text>
+              <path d="M408 222 H425" fill="none" stroke="#82af8a" stroke-width="1.5" marker-end="url(#final-arrow)"/>
+              <path d="M408 311 H425" fill="none" stroke="#82af8a" stroke-width="1.5" marker-end="url(#final-arrow)"/>
+              <rect x="430" y="321" width="84" height="14" fill="#68a46c"/><text x="472" y="332" class="tag">SHARED OUTPUT</text>
+            </g>
+
+            <path class="arrow purple" d="M408 222 H415 V168 H615"/>
+            <g class="module" data-key="posterior" tabindex="0" role="button">
+              <polygon class="card" points="615,111 742,111 764,133 764,204 742,226 615,226" fill="#e7dff2"/>
+              <text x="689" y="153" class="name">Posterior Head</text><text x="689" y="174" class="sub">VAE-compatible</text><text x="689" y="195" class="sub">replaces VAE Encoder</text>
+            </g>
+            <path class="arrow purple" d="M764 168 H826"/>
+            <g class="module" data-key="latent" tabindex="0" role="button">
+              <polygon class="card" points="826,135 890,124 898,204 834,215" fill="url(#final-latent)"/>
+              <text x="862" y="246" class="name">zᵥₐₑ</text>
+            </g>
+
+            <path class="arrow event event-flow" d="M408 311 H414 V180 H560 V290 H615"/>
+            <g class="module" data-key="condition" tabindex="0" role="button">
+              <rect class="card" x="615" y="254" width="149" height="72" rx="4" fill="#fae1d8"/>
+              <text x="689" y="284" class="name">Condition Pyramid</text><text x="689" y="305" class="sub">event scales for cLoRA</text>
+            </g>
+            <path class="arrow event event-flow" d="M764 290 H850 V356 H1052"/>
+            <g class="module" data-key="clora" tabindex="0" role="button">
+              <rect class="card" x="1052" y="320" width="113" height="72" rx="4" fill="#e7dff2"/>
+              <text x="1108" y="350" class="name">cLoRA</text><text x="1108" y="371" class="sub">variant</text>
+            </g>
+            <path class="arrow purple" d="M898 168 H990 V213"/>
+            <path class="arrow event event-flow" d="M1108 320 V280"/>
+            <g class="module" data-key="unet" tabindex="0" role="button">
+              <polygon class="card" points="990,137 1108,176 1108,250 990,289 1022,213" fill="#c3dda9"/>
+              <polygon class="card" points="1226,137 1108,176 1108,250 1226,289 1194,213" fill="#b0d394"/>
+              <text x="1108" y="207" class="name">Diffusion UNet</text><text x="1108" y="228" class="sub">one-step denoiser</text>
+            </g>
+            <path class="arrow purple" d="M1226 213 H1292"/>
+            <g class="module" data-key="z0" tabindex="0" role="button">
+              <polygon class="card" points="1292,178 1356,168 1364,248 1300,258" fill="url(#final-latent)"/>
+              <text x="1327" y="287" class="name">z₀</text>
+            </g>
+
+            <path class="arrow green" d="M519 278 V373 H655"/>
+            <g class="module" data-key="fused" tabindex="0" role="button">
+              <g transform="translate(608 360)">
+                <polygon class="card" points="47,0 99,0 92,22 54,22" fill="url(#final-feature)"/>
+                <polygon class="card" points="31,38 110,38 100,64 41,64" fill="url(#final-feature)"/>
+                <polygon class="card" points="16,78 121,78 108,108 29,108" fill="url(#final-feature)"/>
+                <polygon class="card" points="0,122 130,122 115,156 17,156" fill="url(#final-feature)"/>
+              </g>
+              <text x="677" y="542" class="name">Fused features</text><text x="677" y="561" class="sub">f₃→f₀ · coarse to fine</text>
+            </g>
+            <path class="inject" d="M707 371 C940 344 1190 355 1390 370"/>
+            <path class="inject" d="M718 410 C950 390 1200 394 1377 404"/>
+            <path class="inject" d="M729 450 C960 443 1210 430 1360 443"/>
+            <path class="inject" d="M738 499 C980 496 1215 474 1346 487"/>
+            <path class="arrow" d="M1364 213 H1440 V315"/>
+            <g class="module" data-key="decoder" tabindex="0" role="button">
+              <text x="1440" y="293" class="name">FeatureAware Decoder</text>
+              <polygon class="card" points="1408,315 1472,315 1530,520 1350,520" fill="#fff0df" stroke="#ce783c" stroke-width="2.5"/>
+              <text x="1440" y="340" class="sub">frozen VAE backbone</text>
+              <polygon points="1412,359 1468,359 1464,377 1416,377" fill="url(#final-decoder)" stroke="#c77a41"/>
+              <rect x="1390" y="365" width="18" height="10" fill="#e4a55c"/><text x="1440" y="374" class="tag">Up 3 · 1/8</text>
+              <path d="M1440 377 V392" fill="none" stroke="#7a6b5c" stroke-width="1.5" marker-end="url(#final-arrow)"/>
+              <polygon points="1398,393 1482,393 1477,415 1403,415" fill="url(#final-decoder)" stroke="#c77a41"/>
+              <rect x="1377" y="399" width="21" height="10" fill="#e4a55c"/><text x="1440" y="407" class="tag">Up 2 · 1/4</text>
+              <path d="M1440 415 V430" fill="none" stroke="#7a6b5c" stroke-width="1.5" marker-end="url(#final-arrow)"/>
+              <polygon points="1383,431 1497,431 1491,456 1389,456" fill="url(#final-decoder)" stroke="#c77a41"/>
+              <rect x="1360" y="438" width="23" height="10" fill="#e4a55c"/><text x="1440" y="447" class="tag">Up 1 · 1/2</text>
+              <path d="M1440 456 V471" fill="none" stroke="#7a6b5c" stroke-width="1.5" marker-end="url(#final-arrow)"/>
+              <polygon points="1365,472 1515,472 1508,502 1372,502" fill="url(#final-decoder)" stroke="#c77a41"/>
+              <rect x="1346" y="482" width="19" height="10" fill="#e4a55c"/><text x="1440" y="491" class="tag">Up 0 · 1×</text>
+              <text x="1440" y="514" class="tag" fill="#bf7144">FOUR FUSION INJECTIONS</text>
+            </g>
+            <path class="arrow" d="M1440 520 V570"/>
+            <g class="module" data-key="output" tabindex="0" role="button">
+              <rect class="card" x="1350" y="570" width="180" height="125" rx="4" fill="url(#final-photo)"/>
+              <path d="M1368 671 C1397 636 1440 649 1455 612 C1468 583 1490 585 1512 590 L1512 677z" fill="rgba(26,42,35,.23)"/>
+              <ellipse cx="1433" cy="637" rx="22" ry="34" fill="#6e5533"/><path d="M1417 614 Q1433 590 1449 614" fill="none" stroke="#e4bf73" stroke-width="6"/>
+              <text x="1440" y="725" class="name">Refined RGB</text>
+            </g>
+
+            <g class="module" data-key="retired" tabindex="0" role="button">
+              <rect class="card" x="315" y="606" width="620" height="66" rx="4" fill="#f2f3ef" stroke-dasharray="6 5"/>
+              <text x="625" y="635" class="name" fill="#79817d">Retired after Phase 2 validation</text>
+              <text x="625" y="655" class="sub">original VAE RGB Encoder and legacy EventEncoder are replaced by the shared encoder</text>
+            </g>
+          </svg>
+        </div>
+        <div class="legend"><span><i style="background:var(--blue-soft)"></i>RGB path</span><span><i style="background:var(--event-soft)"></i>event path</span><span><i style="background:var(--green-soft)"></i>fused feature path</span><span><i style="background:var(--gold-soft)"></i>decoder refinement</span></div>
+      </div>
+
+      <aside class="inspector" aria-live="polite">
+        <div class="micro" id="panel-kicker">selected module</div>
+        <h2 id="panel-title">FeatureAwareDecoder</h2>
+        <p id="panel-copy">The single VAE decoder remains structurally intact. Four residual feature-fusion blocks are the only trainable parameters in Phase 1B.</p>
+        <ul class="facts" id="panel-facts">
+          <li><b>input</b><span>z0 + fused features</span></li>
+          <li><b>train</b><span>feature fusion blocks only</span></li>
+          <li><b>output</b><span>refined RGB in one pass</span></li>
+        </ul>
+        <div class="formula" id="panel-formula"><i>h</i><sub>i</sub> ← <i>h</i><sub>i</sub> + <i>w</i> · <i>F</i><sub>i</sub>(<i>f</i><sub>i</sub>, <i>h</i><sub>i</sub>)<br>then <i>h</i><sub>i</sub> ← UpBlock<sub>i</sub>(<i>h</i><sub>i</sub>)</div>
+      </aside>
+    </section>
+
+    <section class="below">
+      <article><h3>Current Phase 1</h3><p>保留原 VAE RGB Encoder 和旧 EventEncoder → cLoRA，以固定 diffusion latent 与 cLoRA 条件；新 RGB-event Encoder 只提供 decoder detail features。</p></article>
+      <article><h3>Final target</h3><p>一个 RGB-event Encoder 输出 posterior、cLoRA condition 与 fused detail features，最终替代原 VAE encoder 和旧 event encoder。</p></article>
+    </section>
+  </main>
+  <script>
+    (() => {
+      const page = document.getElementById("page");
+      const current = document.getElementById("current");
+      const final = document.getElementById("final");
+      const title = document.getElementById("panel-title");
+      const copy = document.getElementById("panel-copy");
+      const facts = document.getElementById("panel-facts");
+      const formula = document.getElementById("panel-formula");
+      const kicker = document.getElementById("panel-kicker");
+      const strength = document.getElementById("strength");
+      const strengthValue = document.getElementById("strength-value");
+      const info = {
+        rgb:["Low-light RGB","同一张低照度 RGB 在 Phase 1 同时进入原 VAE encoder 和新的 RGB pyramid。最终只进入 RGB-event Encoder。",[["tensor","[B,3,H,W]"],["current","two RGB consumers"],["final","one shared encoder"]],"<i>I</i><sub>low</sub> → representation"],
+        events:["Aligned events","同一份严格对齐的 event voxel 在当前阶段派生两个 normalization view，分别保证旧 cLoRA 与新预训练 pyramid 的输入分布。",[["views","legacy + nonzero z-score"],["ablation","correct / zero / shuffled"],["alignment","shared crop / flip / resize"]],"<i>E</i><sub>raw</sub> → {<i>E</i><sub>cLoRA</sub>, <i>E</i><sub>refinement</sub>}"],
+        vae:["VAE RGB Encoder","Phase 1 中保留它，确保 diffusion latent 分布不变；Phase 2 由 RGB-event Encoder 的 posterior head 替代。",[["status","frozen"],["role","stable diffusion input"],["final","retired"]],"<i>z</i><sub>vae</sub> = <i>E</i><sub>VAE</sub>(<i>I</i><sub>low</sub>)"],
+        latent:["Diffusion latent","作为 decoder refinement 对照实验中的固定变量，refinement off/on 必须解码同一 latent。",[["shape","[B,4,H/8,W/8]"],["source","VAE posterior"],["consumer","one-step UNet"]],"<i>z</i><sub>vae</sub> = <i>E</i>(<i>I</i><sub>low</sub>)"],
+        clora:["cLoRA condition","每次 run 选择一个互斥 variant：FiLM affine、两种 CBAM 或两种 residual cross-attention。",[["variants","five exclusive choices"],["location","UNet attn1.to_v"],["Phase 1","frozen checkpoint"]],"LoRA ← Modulate(LoRA, event condition)"],
+        unet:["Diffusion UNet","one-step denoising prior 在两个阶段都保持不变；更换的是 representation source，不是 scheduler。",[["input","VAE-compatible latent"],["condition","cLoRA"],["status","frozen in Phase 1B"]],"<i>z</i><sub>0</sub> = Denoise(<i>z</i><sub>vae</sub>, cLoRA)"],
+        z0:["Denoised latent z0","它是 diffusion 输出，进入唯一的 FeatureAwareDecoder。",[["held fixed","off/on comparison"],["decoder","single pass"],["scale","latent resolution"]],"<i>z</i><sub>0</sub> → Decoder(<i>z</i><sub>0</sub>, fused features)"],
+        "rgb-event":["RGB-event Encoder","Phase 1 的新 encoder 包含 RGB pyramid、event pyramid 与 MultiScaleFusion；它只服务 decoder refinement。",[["weights","Encoder_I / Encoder_E / Merge"],["outputs","four fused features"],["status","frozen in Phase 1B"]],"{<i>R</i>,<i>E</i>,<i>f</i>} = RGBEventEncoder(<i>I</i>,<i>E</i>)"],
+        fused:["Fused feature pyramid","从最粗的 512@1/8 到最细的 64@1，每一级都在 decoder 同尺度 up-block 前注入。",[["order","coarse → fine"],["channels","512 / 256 / 128 / 64"],["consumer","four fusion blocks"]],"[<i>f</i><sub>3</sub>,<i>f</i><sub>2</sub>,<i>f</i><sub>1</sub>,<i>f</i><sub>0</sub>] → Decoder"],
+        decoder:["FeatureAwareDecoder","不是第二个 decoder。原 VAE decoder backbone 保持一套并冻结，只有多尺度 fusion blocks 学习将 detail features 融入上采样过程。",[["input","z0 + four feature levels"],["train","fusion blocks only"],["output","refined RGB, one pass"]],"<i>h</i><sub>i</sub> ← <i>h</i><sub>i</sub> + <i>w</i> · <i>F</i><sub>i</sub>(<i>f</i><sub>i</sub>, <i>h</i><sub>i</sub>)<br>then <i>h</i><sub>i</sub> ← UpBlock<sub>i</sub>(<i>h</i><sub>i</sub>)"],
+        posterior:["VAE-compatible Posterior Head","最终由 unified encoder 的 RGB 表征生成满足 diffusion 需要的 posterior，从而替代原 VAE RGB encoder。",[["input","deep RGB feature"],["output","posterior statistics"],["phase","after Phase 1 proof"]],"<i>q</i>(<i>z</i>|<i>I</i>) = PosteriorHead(<i>R</i><sub>deep</sub>)"],
+        condition:["Condition Pyramid","最终将 unified event features 投影到 cLoRA 所需尺度，替代 legacy EventEncoder。",[["input","unified event features"],["output","cLoRA scales"],["purpose","remove old event encoder"]],"<i>C</i><sub>event</sub> = <i>P</i><sub>condition</sub>(<i>E</i><sub>unified</sub>)"],
+        output:["Refined RGB","输出保持 diffusion prior 的全局亮度/颜色，再以 RGB-event feature 恢复细粒度结构。",[["resolution","same as RGB input"],["decode","single pass"],["measure","detail + event ablations"]],"<i>I</i><sub>refined</sub> = <i>D</i>(<i>z</i><sub>0</sub>,<i>f</i>)"],
+        retired:["Retired encoders","完成 posterior 验证后，原 VAE RGB Encoder 与 legacy EventEncoder 不再参与推理。",[["removed","VAE RGB Encoder"],["removed","legacy EventEncoder"],["replacement","unified RGBEventEncoder"]],"two encoders → one representation hub"]
+      };
+      function select(key) {
+        const value = info[key] || info.decoder;
+        kicker.textContent = current.classList.contains("active") ? "current model module" : "final model module";
+        title.textContent = value[0]; copy.textContent = value[1]; formula.innerHTML = value[3];
+        facts.innerHTML = value[2].map(row => "<li><b>"+row[0]+"</b><span>"+row[1]+"</span></li>").join("");
+        document.querySelectorAll(".module").forEach(el => el.classList.toggle("focused", el.dataset.key === key));
+      }
+      document.querySelectorAll(".phase-buttons button").forEach(btn => btn.addEventListener("click", () => {
+        const isCurrent = btn.dataset.phase === "current";
+        current.classList.toggle("active",isCurrent); final.classList.toggle("active",!isCurrent);
+        document.querySelectorAll(".phase-buttons button").forEach(x => x.setAttribute("aria-pressed",String(x===btn)));
+        select(isCurrent ? "decoder" : "posterior");
+      }));
+      document.querySelectorAll(".event-btn").forEach(btn => btn.addEventListener("click", () => {
+        const mode = btn.dataset.event; page.classList.toggle("event-zero",mode==="zero"); page.classList.toggle("event-shuffled",mode==="shuffled");
+        document.querySelectorAll(".event-btn").forEach(x => x.setAttribute("aria-pressed",String(x===btn)));
+      }));
+      strength.addEventListener("input",() => { const v=Number(strength.value)/100; page.style.setProperty("--signal",v); strengthValue.textContent=v.toFixed(2)+"×"; });
+      document.querySelectorAll(".module").forEach(el => {
+        el.addEventListener("click",()=>select(el.dataset.key));
+        el.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();select(el.dataset.key);}});
+      });
+      select("decoder");
+    })();
+  </script>
+</body>
+</html>

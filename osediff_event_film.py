@@ -85,11 +85,19 @@ def _validate_event_lora_config(runtime_config, checkpoint_config, context):
 
 
 def _normalize_prompt_batch(prompt_batch):
+    """将 DataLoader 对字符串/单元素列表的多种 collate 结果统一为字符串列表。"""
     if prompt_batch is None:
         return []
     if isinstance(prompt_batch, str):
         return [prompt_batch]
     if len(prompt_batch) > 0 and isinstance(prompt_batch[0], (list, tuple)):
+        # 默认 collate 会把每个样本的 ``[prompt]`` 转置为 ``[(p1, p2, ...)]``。
+        # 这里必须还原整个 batch，不能只取 tuple 的第一个元素，否则文本 batch
+        # 与图像 batch 不一致，会在 UNet cross-attention 中触发序列维度错误。
+        if len(prompt_batch) == 1 and all(
+            isinstance(item, str) for item in prompt_batch[0]
+        ):
+            return list(prompt_batch[0])
         return [p[0] for p in prompt_batch]
     return list(prompt_batch)
 
