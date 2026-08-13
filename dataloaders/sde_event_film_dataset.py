@@ -12,6 +12,15 @@ from torchvision import transforms
 import torchvision.transforms.functional as TF
 
 
+def _timestamp_sort_key(path):
+    """按文件名中的数值时间戳排序，避免字符串排序导致 10 排在 2 前面。"""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    try:
+        return (0, int(stem))
+    except ValueError:
+        return (1, stem)
+
+
 @dataclass
 class EventFilmSample:
     low_path: str
@@ -168,12 +177,20 @@ class SDEEventFilmDataset(Dataset):
             if not (os.path.isdir(low_dir) and os.path.isdir(normal_dir)):
                 continue
 
-            low_files = sorted(glob.glob(os.path.join(low_dir, "*.png")))
-            normal_files = sorted(glob.glob(os.path.join(normal_dir, "*.png")))
+            low_files = sorted(
+                glob.glob(os.path.join(low_dir, "*.png")), key=_timestamp_sort_key
+            )
+            normal_files = sorted(
+                glob.glob(os.path.join(normal_dir, "*.png")), key=_timestamp_sort_key
+            )
             whole_event_path = os.path.join(low_dir, "lowlight_event.npz")
             split_event_files = sorted(
-                p for p in glob.glob(os.path.join(low_dir, "*.npz"))
-                if os.path.basename(p) not in {"lowlight_event.npz", "normalight_event.npz"}
+                (
+                    p for p in glob.glob(os.path.join(low_dir, "*.npz"))
+                    if os.path.basename(p)
+                    not in {"lowlight_event.npz", "normalight_event.npz"}
+                ),
+                key=_timestamp_sort_key,
             )
 
             pair_count = min(len(low_files), len(normal_files))
@@ -230,7 +247,9 @@ class SDEEventFilmDataset(Dataset):
         if events.ndim == 3:
             return events
         low_dir = os.path.dirname(sample.low_path)
-        low_files = sorted(glob.glob(os.path.join(low_dir, "*.png")))
+        low_files = sorted(
+            glob.glob(os.path.join(low_dir, "*.png")), key=_timestamp_sort_key
+        )
         idx = sample.frame_index
         if len(events) == 0:
             return events

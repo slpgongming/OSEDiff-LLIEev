@@ -17,6 +17,18 @@ OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/OSEDiff_cbam_lowrank_residual_stage4}"
 EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-cbam_lowrank_residual}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 
+# residual_cross_attn 系列 checkpoint 的融合中间通道默认为 64，其他当前
+# Stage4 变体沿用 32；仍可通过环境变量显式覆盖，且覆盖优先级最高。
+if [ -z "${EVENT_LORA_MOD_CHANNELS:-}" ]; then
+  if [[ "$EVENT_LORA_VARIANT" == residual_cross_attn* ]]; then
+    EVENT_LORA_MOD_CHANNELS=64
+  else
+    EVENT_LORA_MOD_CHANNELS=32
+  fi
+else
+  EVENT_LORA_MOD_CHANNELS="$EVENT_LORA_MOD_CHANNELS"
+fi
+
 for required_dir in "$PRETRAINED_MODEL_NAME_OR_PATH" "$TRAIN_DATA_ROOT" "$RGB_EVENT_PRETRAINED_ROOT"; do
   if [ ! -d "$required_dir" ]; then
     echo "[ERROR] Required directory does not exist: $required_dir" >&2
@@ -52,6 +64,7 @@ if [ -n "${REPORT_TO:-wandb}" ]; then
 fi
 
 echo "[Stage4] variant=$EVENT_LORA_VARIANT"
+echo "[Stage4] mod_channels=$EVENT_LORA_MOD_CHANNELS"
 echo "[Stage4] output=$OUTPUT_DIR"
 echo "[Stage4] freeze scope=vae.decoder.feature_fusion_blocks.* only"
 echo "[Stage4] losses: l2=${LAMBDA_L2:-1.0}, lpips=${LAMBDA_LPIPS:-1.0}, edge=${LAMBDA_EDGE:-0.1}, vsd/vsd_lora/smooth/mod=0"
@@ -65,7 +78,7 @@ accelerate launch --num_processes "$NPROC_PER_NODE" train_idea3_decoder_refineme
   --output_dir "$OUTPUT_DIR" \
   --event_lora_variant "$EVENT_LORA_VARIANT" \
   --lora_rank "${LORA_RANK:-4}" \
-  --mod_channels "${EVENT_LORA_MOD_CHANNELS:-32}" \
+  --mod_channels "$EVENT_LORA_MOD_CHANNELS" \
   --modulation_scale "${EVENT_LORA_MODULATION_SCALE:-0.1}" \
   --event_lora_cbam_reduction "${EVENT_LORA_CBAM_REDUCTION:-8}" \
   --event_lora_cbam_spatial_kernel "${EVENT_LORA_CBAM_SPATIAL_KERNEL:-7}" \

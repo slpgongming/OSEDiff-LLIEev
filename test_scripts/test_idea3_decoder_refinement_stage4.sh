@@ -4,10 +4,10 @@ set -euo pipefail
 # Stage4 A-F 评估：A/B 使用同一 correct-event z0，只比较 decoder fusion 开关。
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
-PRETRAINED_MODEL_NAME_OR_PATH="${PRETRAINED_MODEL_NAME_OR_PATH:-/public/home/zyx111/Chen_Project/PretrainedModel/stable-diffusion-2-1-base}"
-TEST_DATA_ROOT="${TEST_DATA_ROOT:-/public/home/zyx111/Chen_Project/dataset/SDE_dataset/SDE_indoor/sde_in_release/test}"
+PRETRAINED_MODEL_NAME_OR_PATH="${PRETRAINED_MODEL_NAME_OR_PATH:-/public/home/slpchen/stable-diffusion-2-1-base}"
+TEST_DATA_ROOT="${TEST_DATA_ROOT:-/public/home/slpchen/EvLight--main/SDE_dataset/SDE_indoor/sde_in_release/test}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-checkpoints/OSEDiff_cbam_lowrank_residual_stage4/checkpoints/model_final.pkl}"
-RGB_EVENT_PRETRAINED_ROOT="${RGB_EVENT_PRETRAINED_ROOT:-/public/home/zyx111/Chen_Project/TrainingWeights/HDRev}"
+RGB_EVENT_PRETRAINED_ROOT="${RGB_EVENT_PRETRAINED_ROOT:-/public/home/slpchen/Chen_Project/TrainingWeights/HDRev}"
 OUTPUT_DIR="${OUTPUT_DIR:-test_results/OSEDiff_cbam_lowrank_residual_stage4}"
 EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-cbam_lowrank_residual}"
 

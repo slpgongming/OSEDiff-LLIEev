@@ -185,13 +185,24 @@ def main(args):
             scene_counts[experiment][correct["scene_name"]] += 1
             result_path = ""
             if args.save_images:
+                # 同一场景共享 low/gt；不同实验只在推理结果文件名中用实验字母区分。
+                # frame_index 已按场景内时间戳顺序生成，因此从 1 开始使用三位序号。
                 result_dir = os.path.join(
-                    args.output_dir, experiment, correct["scene_name"]
+                    args.output_dir, correct["scene_name"]
                 )
                 os.makedirs(result_dir, exist_ok=True)
+                frame_number = int(correct["frame_index"]) + 1
+                frame_stem = f"{frame_number:03d}"
+                ll_path = os.path.join(result_dir, f"{frame_stem}_ll.png")
+                gt_path = os.path.join(result_dir, f"{frame_stem}_gt.png")
                 result_path = os.path.join(
-                    result_dir, f"{index:08d}_{correct['frame_id']}.png"
+                    result_dir, f"{frame_stem}_{experiment}_result.png"
                 )
+                # low/gt 对同一帧只需保存一次，避免 A/B/E 等实验重复写盘。
+                if not os.path.exists(ll_path):
+                    tensor_to_pil(rgb[0]).save(ll_path)
+                if not os.path.exists(gt_path):
+                    tensor_to_pil(target[0]).save(gt_path)
                 tensor_to_pil(prediction[0]).save(result_path)
             if fid is not None:
                 fid.add_prediction(experiment, index, tensor_to_pil(prediction[0]))
