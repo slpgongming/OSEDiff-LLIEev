@@ -19,6 +19,7 @@ from models.event_lora_utils import (
     collect_event_lora_debug,
     copy_compatible_state_dict,
     event_lora_state_keys,
+    iter_event_lora_modules,
     remap_legacy_event_film_state_dict,
     replace_self_attn_to_v_with_event_lora,
     set_event_feats_for_all_event_lora,
@@ -240,6 +241,102 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         ]
         if stray:
             raise RuntimeError(f"Unexpected trainable parameters: {stray}")
+        return trainable
+
+    def activate_lora_adapters(self):
+        """显式激活 Stage1/Stage3 使用的全部 UNet/VAE LoRA adapter。"""
+        # add_adapter 只负责注册 adapter；未激活的 adapter 不会进入 forward，
+        # 即使成功加载权重也不会产生输出或梯度。
+        self.unet.set_adapter(
+            ["default_encoder", "default_decoder", "default_others"]
+        )
+        self.vae.set_adapter(["default_encoder"])
+
+    def set_train_stage5(self):
+        """Stage5 的联合微调解冻策略。
+
+        保持 Stable Diffusion UNet 主干、原始 VAE decoder 主体、文本编码器和
+        RGB/Event 辅助编码器冻结；只训练已有 LoRA、Event-FiLM 分支、EventEncoder、
+        VAE encoder LoRA，以及 refinement decoder 的 feature-fusion blocks。
+        """
+        if not self.decoder_refinement_enabled or self.rgb_event_encoder is None:
+            raise RuntimeError("Stage5 requires an installed decoder refinement module.")
+
+        # initialize_unet 注册了三组 PEFT adapter，但 add_adapter 不保证它们同时
+        # 处于 active 状态。未激活的 adapter 不会进入 forward，也不会得到梯度。
+        self.activate_lora_adapters()
+
+        # 先统一冻结，避免 Stage1/Stage3 的 requires_grad 状态泄漏到 Stage5。
+        self.requires_grad_(False)
+        self.unet.train()
+        self.vae.train()
+        self.event_encoder.train()
+        self.text_encoder.eval()
+        self.rgb_event_encoder.eval()
+
+        # 解冻 UNet 中所有 PEFT/Event-LoRA 参数，但不解冻 base UNet 权重。
+        for name, parameter in self.unet.named_parameters():
+            if "lora_" in name:
+                parameter.requires_grad_(True)
+        set_event_lora_trainable(
+            self.unet,
+            train_lora=True,
+            train_modulation=True,
+        )
+        set_modulation_enabled_for_all_event_lora(self.unet, True)
+
+        # EventEncoder 是 Stage2/3 已训练的事件条件分支，Stage5 继续联合适配。
+        self.event_encoder.requires_grad_(True)
+
+        # VAE 只开放 encoder LoRA；原始 decoder backbone 保持冻结。
+        for name, parameter in self.vae.named_parameters():
+            if "lora_" in name:
+                parameter.requires_grad_(True)
+        self.vae.decoder.feature_fusion_blocks.requires_grad_(True)
+
+        trainable = [parameter for parameter in self.parameters() if parameter.requires_grad]
+        allowed_ids = {
+            id(parameter)
+            for parameter in self.event_encoder.parameters()
+        }
+        allowed_ids.update(
+            id(parameter)
+            for parameter in self.vae.decoder.feature_fusion_blocks.parameters()
+        )
+        allowed_ids.update(
+            id(parameter)
+            for name, parameter in self.vae.named_parameters()
+            if "lora_" in name
+        )
+        # Event-LoRA 的 modulation/shared-head 参数名称不一定包含 lora_。
+        allowed_ids.update(
+            id(parameter)
+            for _, module in iter_event_lora_modules(self.unet)
+            for parameter in module.parameters()
+            if parameter.requires_grad
+        )
+        allowed_ids.update(
+            id(parameter)
+            for name, parameter in self.unet.named_parameters()
+            if "lora_" in name
+        )
+        allowed_prefixes = (
+            "event_encoder.",
+            "vae.decoder.feature_fusion_blocks.",
+        )
+        stray = []
+        for name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if id(parameter) in allowed_ids and (
+                name.startswith(allowed_prefixes)
+                or name.startswith("vae.") and "lora_" in name
+                or name.startswith("unet.")
+            ):
+                continue
+            stray.append(name)
+        if stray:
+            raise RuntimeError(f"Unexpected Stage5 trainable parameters: {stray}")
         return trainable
 
     def install_event_lora(self):
@@ -627,6 +724,8 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
                 checkpoint,
                 ignore_mismatch=ignore_config_mismatch,
             )
+        # 测试模型也必须激活完整 adapter 组合，否则 Stage5 LoRA 权重会被遗漏。
+        self.activate_lora_adapters()
 
 
 class OSEDiffEventFiLMReg(torch.nn.Module):
