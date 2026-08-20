@@ -241,7 +241,10 @@ class SDEEventFilmDataset(Dataset):
             if event_t.shape[0] != self.event_channels and event_t.shape[-1] == self.event_channels:
                 event_t = event_t.permute(2, 0, 1).contiguous()
             return event_t
-        return torch.from_numpy(np.asarray(event)).float()
+        # 原始 SDE 时间戳约为 1e15。必须保留 npz 的 int64 精度，
+        # 裁剪后先减去起始时间，再转 float32 做时间 binning；否则 float32
+        # 会截断低位，导致绝大多数事件都落入同一个时间 bin。
+        return torch.from_numpy(np.asarray(event))
 
     def _slice_whole_event(self, events, sample):
         if events.ndim == 3:
@@ -320,13 +323,18 @@ class SDEEventFilmDataset(Dataset):
             return torch.zeros(self.event_channels, crop_h, crop_w, dtype=torch.float32)
         crop_event[:, 1] -= left
         crop_event[:, 2] -= top
+        # 在 int64 精度下先转为相对时间，避免绝对时间戳转 float32 后低位丢失。
+        event_start = crop_event[0, 0].clone()
+        crop_event[:, 0] -= event_start
         return self._generate_voxel_grid(crop_event, crop_h, crop_w)
 
     def _generate_voxel_grid(self, event, height, width):
         event_start = event[0, 0]
         event_end = event[-1, 0]
-        denom = torch.clamp(event_end - event_start, min=1.0)
-        ch = ((event[:, 0].float() - event_start) / denom * self.event_bins).long()
+        relative_t = event[:, 0] - event_start
+        # 此处时间戳已经相对化，可安全转换为 float32 计算时间 bin。
+        denom = torch.clamp((event_end - event_start).to(torch.float32), min=1.0)
+        ch = (relative_t.to(torch.float32) / denom * self.event_bins).long()
         ch.clamp_(0, self.event_bins - 1)
         ex = event[:, 1].long().clamp_(0, width - 1)
         ey = event[:, 2].long().clamp_(0, height - 1)
