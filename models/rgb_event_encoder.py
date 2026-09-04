@@ -33,7 +33,7 @@ class RGBEventEncoderConfig:
 class RGBEventEncoderOutput:
     rgb_features: List[torch.Tensor]
     event_features: List[torch.Tensor]
-    fused_features: List[torch.Tensor]
+    fused_features: Optional[List[torch.Tensor]]
 
 
 @dataclass(frozen=True)
@@ -327,6 +327,7 @@ class RGBEventEncoder(nn.Module):
         self.rgb_encoder = RGBPyramidEncoder()
         self.event_encoder = EventPyramidEncoder(event_channels=event_channels)
         self.fusion = MultiScaleFusion()
+        self.fusion_enabled = True
         self.pretrained_manifest = None
 
     @staticmethod
@@ -345,7 +346,7 @@ class RGBEventEncoder(nn.Module):
             fusion_event = [torch.zeros_like(feature) for feature in event_features]
         elif fusion_mode == "event":
             fusion_rgb = [torch.zeros_like(feature) for feature in rgb_features]
-        fused_features = self.fusion(fusion_event, fusion_rgb)
+        fused_features = self.fusion(fusion_event, fusion_rgb) if self.fusion_enabled else None
         return RGBEventEncoderOutput(
             rgb_features=rgb_features,
             event_features=event_features,
@@ -359,7 +360,9 @@ class RGBEventEncoder(nn.Module):
         encoder_e_path=None,
         fusion_path=None,
         strict=True,
+        load_fusion=True,
     ):
+        """加载 RGB/event 编码器；CGDRS 可显式跳过未参与前向的 Merge。"""
         def resolve(explicit_path, key):
             if explicit_path:
                 return explicit_path
@@ -372,7 +375,6 @@ class RGBEventEncoder(nn.Module):
         paths = {
             "encoder_i": resolve(encoder_i_path, "encoder_i"),
             "encoder_e": resolve(encoder_e_path, "encoder_e"),
-            "fusion": resolve(fusion_path, "fusion"),
         }
         reports = {
             "encoder_i": _load_component(
@@ -381,14 +383,21 @@ class RGBEventEncoder(nn.Module):
             "encoder_e": _load_component(
                 self.event_encoder, paths["encoder_e"], "Encoder_E", strict=strict
             ),
-            "fusion": _load_component(
-                self.fusion, paths["fusion"], "Merge", strict=strict
-            ),
         }
+        if load_fusion:
+            paths["fusion"] = resolve(fusion_path, "fusion")
+            reports["fusion"] = _load_component(
+                self.fusion, paths["fusion"], "Merge", strict=strict
+            )
+        self.fusion_enabled = bool(load_fusion)
         self.pretrained_manifest = {
             "encoder_i_filename": os.path.basename(paths["encoder_i"]),
             "encoder_e_filename": os.path.basename(paths["encoder_e"]),
-            "fusion_filename": os.path.basename(paths["fusion"]),
+            "fusion_filename": (
+                os.path.basename(paths["fusion"]) if load_fusion else None
+            ),
+            "loaded_components": ["encoder_i", "encoder_e"]
+            + (["fusion"] if load_fusion else []),
             "sha256": {key: sha256_file(path) for key, path in paths.items()},
         }
         return reports, self.pretrained_manifest

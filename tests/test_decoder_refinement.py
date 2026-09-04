@@ -26,6 +26,16 @@ def build_features(batch=1):
     ]
 
 
+def build_rgb_event_conditions(batch=1):
+    rgb = build_features(batch)
+    event = [feature.clone() for feature in rgb]
+    activity = [
+        torch.ones(batch, 1, feature.shape[-2], feature.shape[-1])
+        for feature in rgb
+    ]
+    return rgb, event, activity
+
+
 class DecoderRefinementTest(unittest.TestCase):
     def test_disabled_parity_near_zero_and_four_level_consumption(self):
         torch.manual_seed(3)
@@ -115,6 +125,41 @@ class DecoderRefinementTest(unittest.TestCase):
             [block.forward_count for block in vae.decoder.feature_fusion_blocks],
             [1, 1, 1, 1],
         )
+
+    def test_cgdrs_zero_activity_blocks_event_residual(self):
+        torch.manual_seed(11)
+        vae = build_small_vae().eval()
+        vae.install_feature_aware_decoder(refinement_variant="cgdrs")
+        latent = torch.randn(1, 4, 4, 4)
+        rgb, event, activity = build_rgb_event_conditions()
+        with torch.no_grad():
+            rgb_only = vae.decode(
+                latent,
+                rgb_features=rgb,
+                event_features=event,
+                event_activity=activity,
+                fusion_enabled=True,
+                fusion_mode="rgb",
+            ).sample
+            zero_activity = vae.decode(
+                latent,
+                rgb_features=rgb,
+                event_features=event,
+                event_activity=[torch.zeros_like(item) for item in activity],
+                fusion_enabled=True,
+                fusion_mode="both",
+            ).sample
+        torch.testing.assert_close(rgb_only, zero_activity, rtol=0, atol=0)
+
+    def test_cgdrs_event_levels_and_config_are_serializable(self):
+        vae = build_small_vae()
+        vae.install_feature_aware_decoder(
+            refinement_variant="cgdrs", cgdrs_event_levels="2,3", cgdrs_gate_bias=-1.5
+        )
+        config = vae.decoder.refinement_config()
+        self.assertEqual(config["variant"], "cgdrs")
+        self.assertEqual(config["cgdrs_event_levels"], [2, 3])
+        self.assertEqual(config["cgdrs_gate_bias"], -1.5)
 
 
 if __name__ == "__main__":

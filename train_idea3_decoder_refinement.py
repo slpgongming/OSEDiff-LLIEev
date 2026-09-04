@@ -104,6 +104,23 @@ def parse_args():
     parser.add_argument("--decoder_fusion_weight", type=float, default=1.0)
     parser.add_argument("--decoder_fusion_init", default="near_zero", choices=("near_zero",))
     parser.add_argument(
+        "--decoder_refinement_variant",
+        default="legacy_fused",
+        choices=("legacy_fused", "cgdrs"),
+        help="Decoder refinement implementation; legacy_fused preserves the previous path.",
+    )
+    parser.add_argument(
+        "--cgdrs_event_levels",
+        default="1,2,3",
+        help="CGDRS encoder pyramid levels that may receive event residuals (0-based).",
+    )
+    parser.add_argument("--cgdrs_gate_bias", type=float, default=-2.0)
+    parser.add_argument(
+        "--cgdrs_activity_mode",
+        choices=("abs_mean", "abs_sum"),
+        default="abs_mean",
+    )
+    parser.add_argument(
         "--refinement_fusion_mode", default="both", choices=("both", "rgb", "event")
     )
     parser.add_argument("--bundle_rgb_event_encoder", action="store_true")

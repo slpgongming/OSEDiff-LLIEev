@@ -8,6 +8,9 @@ export NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 export WANDB_INSECURE="${WANDB_INSECURE:-true}"
 export WANDB_INSECURE_DISABLE_SSL="${WANDB_INSECURE_DISABLE_SSL:-true}"
 
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO_ROOT/scripts/archive_run_context.sh"
+
 PRETRAINED_MODEL_NAME_OR_PATH="${PRETRAINED_MODEL_NAME_OR_PATH:-/public/home/slpchen/stable-diffusion-2-1-base}"
 TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/public/home/slpchen/EvLight--main/SDE_dataset/SDE_indoor/sde_in_release/train}"
 STAGE1_CHECKPOINT="${STAGE1_CHECKPOINT:-/public/home/slpchen/Chen_Project/TrainingWeights/osediff_lle_5-14-1935/checkpoints/model_94001.pkl}"
@@ -15,6 +18,10 @@ EVENT_LORA_CHECKPOINT="${EVENT_LORA_CHECKPOINT:-/public/home/slpchen/Chen_Projec
 RGB_EVENT_PRETRAINED_ROOT="${RGB_EVENT_PRETRAINED_ROOT:-/public/home/slpchen/Chen_Project/TrainingWeights/HDRev}"
 OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/OSEDiff_cbam_lowrank_residual_stage4}"
 EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-cbam_lowrank_residual}"
+DECODER_REFINEMENT_VARIANT="${DECODER_REFINEMENT_VARIANT:-legacy_fused}"
+CGDRS_EVENT_LEVELS="${CGDRS_EVENT_LEVELS:-1,2,3}"
+CGDRS_GATE_BIAS="${CGDRS_GATE_BIAS:--2.0}"
+CGDRS_ACTIVITY_MODE="${CGDRS_ACTIVITY_MODE:-abs_mean}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 
 # residual_cross_attn 系列 checkpoint 的融合中间通道默认为 64，其他当前
@@ -37,8 +44,7 @@ for required_dir in "$PRETRAINED_MODEL_NAME_OR_PATH" "$TRAIN_DATA_ROOT" "$RGB_EV
 done
 for required_file in "$STAGE1_CHECKPOINT" "$EVENT_LORA_CHECKPOINT" \
   "$RGB_EVENT_PRETRAINED_ROOT/Encoder_I.pth" \
-  "$RGB_EVENT_PRETRAINED_ROOT/Encoder_E.pth" \
-  "$RGB_EVENT_PRETRAINED_ROOT/Merge.pth"; do
+  "$RGB_EVENT_PRETRAINED_ROOT/Encoder_E.pth"; do
   if [ ! -f "$required_file" ]; then
     echo "[ERROR] Required file does not exist: $required_file" >&2
     exit 1
@@ -63,7 +69,19 @@ if [ -n "${REPORT_TO:-wandb}" ]; then
   TRACKER_ARGS+=(--report_to "${REPORT_TO:-wandb}")
 fi
 
+mkdir -p "$OUTPUT_DIR"
+archive_run_context "$OUTPUT_DIR" "${BASH_SOURCE[0]}" stage4 train \
+  "PRETRAINED_MODEL_NAME_OR_PATH=$PRETRAINED_MODEL_NAME_OR_PATH" \
+  "TRAIN_DATA_ROOT=$TRAIN_DATA_ROOT" "STAGE1_CHECKPOINT=$STAGE1_CHECKPOINT" \
+  "EVENT_LORA_CHECKPOINT=$EVENT_LORA_CHECKPOINT" "RGB_EVENT_PRETRAINED_ROOT=$RGB_EVENT_PRETRAINED_ROOT" \
+  "EVENT_LORA_VARIANT=$EVENT_LORA_VARIANT" "DECODER_REFINEMENT_VARIANT=$DECODER_REFINEMENT_VARIANT" \
+  "CGDRS_EVENT_LEVELS=$CGDRS_EVENT_LEVELS" "CGDRS_GATE_BIAS=$CGDRS_GATE_BIAS" \
+  "CGDRS_ACTIVITY_MODE=$CGDRS_ACTIVITY_MODE" \
+  "IMAGE_SIZE=${IMAGE_SIZE:-256}" "GENERATOR_TIMESTEP=${GENERATOR_TIMESTEP:-999}" \
+  "MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-100000}" "LEARNING_RATE=${LEARNING_RATE:-1e-4}"
+
 echo "[Stage4] variant=$EVENT_LORA_VARIANT"
+echo "[Stage4] decoder_refinement_variant=$DECODER_REFINEMENT_VARIANT"
 echo "[Stage4] mod_channels=$EVENT_LORA_MOD_CHANNELS"
 echo "[Stage4] output=$OUTPUT_DIR"
 echo "[Stage4] freeze scope=vae.decoder.feature_fusion_blocks.* only"
@@ -77,6 +95,10 @@ accelerate launch --num_processes "$NPROC_PER_NODE" train_idea3_decoder_refineme
   --rgb_event_pretrained_root "$RGB_EVENT_PRETRAINED_ROOT" \
   --output_dir "$OUTPUT_DIR" \
   --event_lora_variant "$EVENT_LORA_VARIANT" \
+  --decoder_refinement_variant "$DECODER_REFINEMENT_VARIANT" \
+  --cgdrs_event_levels "$CGDRS_EVENT_LEVELS" \
+  --cgdrs_gate_bias "$CGDRS_GATE_BIAS" \
+  --cgdrs_activity_mode "$CGDRS_ACTIVITY_MODE" \
   --lora_rank "${LORA_RANK:-4}" \
   --mod_channels "$EVENT_LORA_MOD_CHANNELS" \
   --modulation_scale "${EVENT_LORA_MODULATION_SCALE:-0.1}" \

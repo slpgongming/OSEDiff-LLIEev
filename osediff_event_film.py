@@ -14,6 +14,11 @@ import json
 from models.event_encoder import EventEncoder
 from models.event_film_lora import EventLoRAConfig, normalize_event_lora_variant
 from models.rgb_event_encoder import RGBEventEncoder
+from models.decoder_refinement import (
+    normalize_activity_mode,
+    normalize_refinement_levels,
+    normalize_refinement_variant,
+)
 from models.event_lora_utils import (
     clear_event_feats_for_all_event_lora,
     collect_event_lora_debug,
@@ -59,6 +64,54 @@ def _checkpoint_event_lora_config(checkpoint):
         "residual_cross_attn", "residual_cross_attn_bax"
     } else 32)
     return EventLoRAConfig(**config)
+
+
+def resolve_decoder_refinement_variant(value, checkpoint_path=None):
+    """解析 CLI variant；``auto`` 从已有 refinement checkpoint 继承配置。
+
+    这样 Stage5/推理在不显式指定 variant 时，能够安全复用 Stage4 权重，
+    同时避免在模型构造后才发现结构不匹配。
+    """
+    variant = normalize_refinement_variant(value, allow_auto=True)
+    if variant != "auto":
+        return variant
+    if not checkpoint_path:
+        raise ValueError("decoder_refinement_variant=auto requires a checkpoint path.")
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    config = checkpoint.get("decoder_refinement_config") or {}
+    # 旧 checkpoint 没有 variant 字段时，历史实现就是 legacy_fused。
+    return normalize_refinement_variant(config.get("variant", "legacy_fused"))
+
+
+def resolve_decoder_refinement_args(args, checkpoint_path):
+    """``auto`` 时把 checkpoint 中的 CGDRS 结构参数一并带入运行参数。"""
+    requested = normalize_refinement_variant(
+        getattr(args, "decoder_refinement_variant", "legacy_fused"), allow_auto=True
+    )
+    if requested != "auto":
+        args.decoder_refinement_variant = requested
+        return args
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    config = checkpoint.get("decoder_refinement_config") or {}
+    args.decoder_refinement_variant = normalize_refinement_variant(
+        config.get("variant", "legacy_fused")
+    )
+    if args.decoder_refinement_variant == "cgdrs":
+        if "cgdrs_event_levels" in config:
+            args.cgdrs_event_levels = ",".join(
+                str(level) for level in config["cgdrs_event_levels"]
+            )
+        if "cgdrs_gate_bias" in config:
+            args.cgdrs_gate_bias = float(config["cgdrs_gate_bias"])
+        if "cgdrs_activity_mode" in config:
+            args.cgdrs_activity_mode = config["cgdrs_activity_mode"]
+    return args
 
 
 def _validate_event_lora_config(runtime_config, checkpoint_config, context):
@@ -164,6 +217,16 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         self.decoder_refinement_enabled = bool(
             getattr(args, "decoder_refinement_enabled", False)
         )
+        self.decoder_refinement_variant = normalize_refinement_variant(
+            getattr(args, "decoder_refinement_variant", "legacy_fused")
+        )
+        self.cgdrs_event_levels = normalize_refinement_levels(
+            getattr(args, "cgdrs_event_levels", (1, 2, 3))
+        )
+        self.cgdrs_gate_bias = float(getattr(args, "cgdrs_gate_bias", -2.0))
+        self.cgdrs_activity_mode = normalize_activity_mode(
+            getattr(args, "cgdrs_activity_mode", "abs_mean")
+        )
         self.decoder_fusion_enabled = bool(
             getattr(args, "decoder_fusion_enabled", self.decoder_refinement_enabled)
         )
@@ -197,6 +260,10 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             condition_channels=(64, 128, 256, 512),
             fusion_weight=self.decoder_fusion_weight,
             fusion_init=getattr(self.args, "decoder_fusion_init", "near_zero"),
+            refinement_variant=self.decoder_refinement_variant,
+            cgdrs_event_levels=self.cgdrs_event_levels,
+            cgdrs_gate_bias=self.cgdrs_gate_bias,
+            cgdrs_activity_mode=self.cgdrs_activity_mode,
         )
         if self.rgb_event_encoder is None:
             self.rgb_event_encoder = RGBEventEncoder(
@@ -213,6 +280,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
                 encoder_e_path=encoder_e_path,
                 fusion_path=fusion_path,
                 strict=bool(getattr(self.args, "rgb_event_strict_load", True)),
+                load_fusion=self.decoder_refinement_variant == "legacy_fused",
             )
         vae_parameter = next(self.vae.parameters())
         self.rgb_event_encoder.to(
@@ -477,29 +545,56 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             self.decoder_fusion_enabled
             if decoder_fusion_enabled is None else bool(decoder_fusion_enabled)
         )
+        fusion_mode = refinement_fusion_mode or self.refinement_fusion_mode
         fused_features = None
+        rgb_features = None
+        event_features = None
+        event_activity = None
         if self.decoder_refinement_enabled:
             if events_refinement is None:
                 raise ValueError(
                     "Decoder refinement requires the separately normalized "
                     "events_refinement tensor."
                 )
-            fusion_mode = refinement_fusion_mode or self.refinement_fusion_mode
             with torch.no_grad():
                 encoder_output = self.rgb_event_encoder(
                     c_t,
                     events_refinement,
                     fusion_mode=fusion_mode,
                 )
-            fused_features = [
-                feature.detach() for feature in encoder_output.fused_features
-            ]
+            if self.decoder_refinement_variant == "legacy_fused":
+                fused_features = [
+                    feature.detach() for feature in encoder_output.fused_features
+                ]
+            else:
+                rgb_features = [feature.detach() for feature in encoder_output.rgb_features]
+                event_features = [feature.detach() for feature in encoder_output.event_features]
+                # 沿 event-bin 聚合得到稳定的空间活动图，避免 gate 依赖具体 bin 分布。
+                activity_reduce = (
+                    events_refinement.detach().float().abs().sum
+                    if self.cgdrs_activity_mode == "abs_sum"
+                    else events_refinement.detach().float().abs().mean
+                )
+                activity = activity_reduce(dim=1, keepdim=True)
+                activity = activity / activity.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+                activity = activity.clamp(0.0, 4.0).div(4.0)
+                event_activity = [
+                    F.interpolate(
+                        activity.to(device=feature.device),
+                        size=feature.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    ).to(dtype=feature.dtype).detach()
+                    for feature in event_features
+                ]
             self.last_refinement_stats = {}
             for family, features in (
                 ("rgb", encoder_output.rgb_features),
                 ("event", encoder_output.event_features),
                 ("fused", encoder_output.fused_features),
             ):
+                if features is None:
+                    continue
                 for level, feature in enumerate(features):
                     detached = feature.detach().float()
                     prefix = f"{family}_level_{level}"
@@ -510,8 +605,12 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             self.vae.decode(
                 x_denoised.to(dtype=vae_dtype) / self.vae.config.scaling_factor,
                 fused_features=fused_features,
+                rgb_features=rgb_features,
+                event_features=event_features,
+                event_activity=event_activity,
                 fusion_enabled=fusion_enabled,
                 fusion_weight=self.decoder_fusion_weight,
+                fusion_mode=fusion_mode,
             ).sample
         ).clamp(-1, 1)
         detached_output = output.detach().float()
@@ -609,7 +708,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             sd["additional_info"] = additional_info
         if self.decoder_refinement_enabled:
             sd.update({
-                "checkpoint_version": "idea3_phase1_v1",
+                "checkpoint_version": "idea3_phase1_v2",
                 "state_dict_decoder_refinement": self.vae.decoder.feature_fusion_blocks.state_dict(),
                 "decoder_refinement_config": self.vae.decoder.refinement_config(),
                 "rgb_event_encoder_config": self.rgb_event_encoder.config.to_dict(),
@@ -629,11 +728,31 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             self.install_decoder_refinement()
         runtime_config = self.vae.decoder.refinement_config()
         checkpoint_config = checkpoint.get("decoder_refinement_config", {})
+        checkpoint_variant = normalize_refinement_variant(
+            checkpoint_config.get("variant", "legacy_fused")
+        )
+        runtime_variant = normalize_refinement_variant(
+            runtime_config.get("variant", "legacy_fused")
+        )
+        if checkpoint_variant != runtime_variant:
+            raise ValueError(
+                "Decoder refinement variant mismatch: "
+                f"runtime={runtime_variant}, checkpoint={checkpoint_variant}. "
+                "Start a new Stage4 run instead of cross-variant resume."
+            )
+        # CGDRS 不需要 Merge 前向；显式关闭可避免无效计算。
+        self.rgb_event_encoder.fusion_enabled = runtime_variant == "legacy_fused"
         structural_keys = (
+            "variant",
+            "config_version",
             "condition_channels",
             "decoder_channels",
             "fusion_blocks",
             "fusion_init",
+            "cgdrs_event_levels",
+            "cgdrs_gate_bias",
+            "cgdrs_activity_mode",
+            "cgdrs_activity_clip",
         )
         mismatch = {
             key: (runtime_config.get(key), checkpoint_config.get(key))

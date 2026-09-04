@@ -30,7 +30,11 @@ from diffusers.models.attention_processor import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.autoencoders.vae import Decoder, DecoderOutput, DiagonalGaussianDistribution, Encoder
-from models.decoder_refinement import FeatureAwareDecoder
+from models.decoder_refinement import (
+    FeatureAwareDecoder,
+    normalize_refinement_variant,
+    normalize_activity_mode,
+)
 
 class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
     r"""
@@ -161,9 +165,30 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
         condition_channels=(64, 128, 256, 512),
         fusion_weight=1.0,
         fusion_init="near_zero",
+        refinement_variant="legacy_fused",
+        cgdrs_event_levels=(1, 2, 3),
+        cgdrs_gate_bias=-2.0,
+        cgdrs_activity_mode="abs_mean",
     ):
         """用单一条件 decoder 替换标准 decoder，并严格迁移全部 backbone 权重。"""
         if isinstance(self.decoder, FeatureAwareDecoder):
+            requested_variant = normalize_refinement_variant(refinement_variant)
+            current_variant = normalize_refinement_variant(
+                self.decoder.refinement_config().get("variant", "legacy_fused")
+            )
+            if current_variant != requested_variant:
+                raise ValueError(
+                    "FeatureAwareDecoder is already installed with variant="
+                    f"{current_variant}, requested={requested_variant}."
+                )
+            current_activity_mode = self.decoder.refinement_config().get(
+                "cgdrs_activity_mode", "abs_mean"
+            )
+            if normalize_activity_mode(cgdrs_activity_mode) != current_activity_mode:
+                raise ValueError(
+                    "FeatureAwareDecoder is already installed with "
+                    f"activity_mode={current_activity_mode}, requested={cgdrs_activity_mode}."
+                )
             return self.decoder
         old_decoder = self.decoder
         parameter = next(old_decoder.parameters())
@@ -178,6 +203,10 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
             condition_channels=condition_channels,
             fusion_weight=fusion_weight,
             fusion_init=fusion_init,
+            refinement_variant=normalize_refinement_variant(refinement_variant),
+            cgdrs_event_levels=cgdrs_event_levels,
+            cgdrs_gate_bias=cgdrs_gate_bias,
+            cgdrs_activity_mode=normalize_activity_mode(cgdrs_activity_mode),
         )
         load_result = new_decoder.load_state_dict(
             old_decoder.state_dict(), strict=False
@@ -315,11 +344,18 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
         z: torch.FloatTensor,
         return_dict: bool = True,
         fused_features=None,
+        rgb_features=None,
+        event_features=None,
+        event_activity=None,
         fusion_enabled=False,
         fusion_weight=None,
+        fusion_mode="both",
     ) -> Union[DecoderOutput, torch.FloatTensor]:
         if self.use_tiling and (z.shape[-1] > self.tile_latent_min_size or z.shape[-2] > self.tile_latent_min_size):
-            if fusion_enabled or fused_features is not None:
+            if fusion_enabled or any(
+                value is not None
+                for value in (fused_features, rgb_features, event_features, event_activity)
+            ):
                 raise NotImplementedError(
                     "Conditional tiled decode is not implemented; disable VAE tiling."
                 )
@@ -330,11 +366,18 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
             dec = self.decoder(
                 z,
                 fused_features=fused_features,
+                rgb_features=rgb_features,
+                event_features=event_features,
+                event_activity=event_activity,
                 fusion_enabled=fusion_enabled,
                 fusion_weight=fusion_weight,
+                fusion_mode=fusion_mode,
             )
         else:
-            if fusion_enabled or fused_features is not None:
+            if fusion_enabled or any(
+                value is not None
+                for value in (fused_features, rgb_features, event_features, event_activity)
+            ):
                 raise RuntimeError(
                     "Decoder refinement was requested before installing FeatureAwareDecoder."
                 )
@@ -352,8 +395,12 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
         return_dict: bool = True,
         generator=None,
         fused_features=None,
+        rgb_features=None,
+        event_features=None,
+        event_activity=None,
         fusion_enabled=False,
         fusion_weight=None,
+        fusion_mode="both",
     ) -> Union[DecoderOutput, torch.FloatTensor]:
         """
         Decode a batch of images.
@@ -370,21 +417,40 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
 
         """
         if self.use_slicing and z.shape[0] > 1:
-            feature_slices = None
-            if fused_features is not None:
-                feature_slices = [feature.split(1) for feature in fused_features]
+            feature_slices = {
+                "fused": [feature.split(1) for feature in fused_features]
+                if fused_features is not None else None,
+                "rgb": [feature.split(1) for feature in rgb_features]
+                if rgb_features is not None else None,
+                "event": [feature.split(1) for feature in event_features]
+                if event_features is not None else None,
+                "activity": [feature.split(1) for feature in event_activity]
+                if event_activity is not None else None,
+            }
             decoded_slices = []
             for index, z_slice in enumerate(z.split(1)):
-                slice_features = (
-                    [level[index] for level in feature_slices]
-                    if feature_slices is not None else None
-                )
                 decoded_slices.append(
                     self._decode(
                         z_slice,
-                        fused_features=slice_features,
+                        fused_features=(
+                            [level[index] for level in feature_slices["fused"]]
+                            if feature_slices["fused"] is not None else None
+                        ),
+                        rgb_features=(
+                            [level[index] for level in feature_slices["rgb"]]
+                            if feature_slices["rgb"] is not None else None
+                        ),
+                        event_features=(
+                            [level[index] for level in feature_slices["event"]]
+                            if feature_slices["event"] is not None else None
+                        ),
+                        event_activity=(
+                            [level[index] for level in feature_slices["activity"]]
+                            if feature_slices["activity"] is not None else None
+                        ),
                         fusion_enabled=fusion_enabled,
                         fusion_weight=fusion_weight,
+                        fusion_mode=fusion_mode,
                     ).sample
                 )
             decoded = torch.cat(decoded_slices)
@@ -392,8 +458,12 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
             decoded = self._decode(
                 z,
                 fused_features=fused_features,
+                rgb_features=rgb_features,
+                event_features=event_features,
+                event_activity=event_activity,
                 fusion_enabled=fusion_enabled,
                 fusion_weight=fusion_weight,
+                fusion_mode=fusion_mode,
             ).sample
 
         if not return_dict:

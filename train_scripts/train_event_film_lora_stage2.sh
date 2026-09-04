@@ -7,6 +7,9 @@ export NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 export WANDB_INSECURE=true
 export WANDB_INSECURE_DISABLE_SSL=true
 
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO_ROOT/scripts/archive_run_context.sh"
+
 PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/hutao/Chen_Project/PretrainedModel/stable-diffusion-2-1-base}"
 TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/public/home/hutao/Chen_Project/dataset/SDE_dataset/SDE_indoor/sde_in_release/train}"
 STAGE1_CKPT="${STAGE1_CKPT:-checkpoints/osediff_lle_5-14-1935/checkpoints/model_94001.pkl}"
@@ -33,6 +36,15 @@ EXTRA_ARGS=()
 if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
   EXTRA_ARGS+=(--resume_from_checkpoint "$RESUME_FROM_CHECKPOINT")
 fi
+
+mkdir -p "$OUTPUT_DIR"
+archive_run_context "$OUTPUT_DIR" "${BASH_SOURCE[0]}" stage2 train \
+  "PRETRAINED_MODEL=$PRETRAINED_MODEL" "TRAIN_DATA_ROOT=$TRAIN_DATA_ROOT" \
+  "STAGE1_CKPT=$STAGE1_CKPT" "OUTPUT_DIR=$OUTPUT_DIR" \
+  "EVENT_LORA_VARIANT=$EVENT_LORA_VARIANT" "IMAGE_SIZE=256" \
+  "GENERATOR_TRAIN_TIMESTEP=${GENERATOR_TRAIN_TIMESTEP:-400,600}" \
+  "MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-100000}" \
+  "LR_EVENT=${LR_EVENT:-1e-4}" "LR_LORA=${LR_LORA:-1e-5}"
 
 accelerate launch --num_processes "$NPROC_PER_NODE" train_event_film_lora_osediff.py \
   --stage 2 \

@@ -4,6 +4,9 @@ set -euo pipefail
 # Stage3 测试：GPU0/GPU1 并行运行 correct/zero，最后自动合并指标。
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO_ROOT/scripts/archive_run_context.sh"
+
 PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/slpchen/stable-diffusion-2-1-base}"
 TEST_DATA_ROOT="${TEST_DATA_ROOT:-/public/home/slpchen/EvLight--main/SDE_dataset/SDE_indoor/sde_in_release/test}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-checkpoints/OSEDiff_cbam_lowrank_residual_stage3_6-19/checkpoints/model_final.pkl}"
@@ -31,7 +34,12 @@ if [ ! -f "$CHECKPOINT_PATH" ]; then
 fi
 
 mkdir -p "$OUTPUT_DIR"
-cp -f "$0" "$OUTPUT_DIR/$(basename "$0")"
+archive_run_context "$OUTPUT_DIR" "${BASH_SOURCE[0]}" stage3 test \
+  "PRETRAINED_MODEL=$PRETRAINED_MODEL" "TEST_DATA_ROOT=$TEST_DATA_ROOT" \
+  "CHECKPOINT_PATH=$CHECKPOINT_PATH" "OUTPUT_DIR=$OUTPUT_DIR" \
+  "EVENT_LORA_VARIANT=${EVENT_LORA_VARIANT:-cbam_lowrank_residual}" \
+  "IMAGE_SIZE=256" "GENERATOR_TIMESTEP=${GENERATOR_TIMESTEP:-999}" \
+  "ABLATION_MODES=${ABLATION_MODES:-correct,zero}"
 
 python test_event_film_lora_osediff.py \
   --stage 3 \

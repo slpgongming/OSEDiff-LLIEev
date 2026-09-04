@@ -9,7 +9,10 @@ import pyiqa
 import torch
 
 from dataloaders.sde_event_film_dataset import SDEEventFilmDataset
-from osediff_event_film import OSEDiffEventFiLMTest
+from osediff_event_film import (
+    OSEDiffEventFiLMTest,
+    resolve_decoder_refinement_args,
+)
 from test_event_film_lora_osediff import FIDEvaluator, tensor_to_pil
 
 
@@ -67,6 +70,17 @@ def parse_args():
     parser.add_argument("--event_lora_output_gate_channels", default="spatial")
     parser.add_argument("--decoder_fusion_weight", type=float, default=1.0)
     parser.add_argument("--decoder_fusion_init", default="near_zero")
+    parser.add_argument(
+        "--decoder_refinement_variant",
+        default="auto",
+        choices=("auto", "legacy_fused", "cgdrs"),
+        help="Refinement path; auto inherits the checkpoint configuration.",
+    )
+    parser.add_argument("--cgdrs_event_levels", default="1,2,3")
+    parser.add_argument("--cgdrs_gate_bias", type=float, default=-2.0)
+    parser.add_argument(
+        "--cgdrs_activity_mode", choices=("abs_mean", "abs_sum"), default="abs_mean"
+    )
     parser.add_argument("--experiments", default="A,B,C,D,E,F")
     parser.add_argument("--generator_timestep", type=int, default=999)
     parser.add_argument("--image_size", type=int, default=256)
@@ -107,6 +121,7 @@ def main(args):
         raise NotADirectoryError(args.input_image)
     if not os.path.isfile(args.event_lora_checkpoint):
         raise FileNotFoundError(args.event_lora_checkpoint)
+    resolve_decoder_refinement_args(args, args.event_lora_checkpoint)
     os.makedirs(args.output_dir, exist_ok=True)
 
     required_event_modes = sorted({EXPERIMENTS[item]["events"] for item in experiments})

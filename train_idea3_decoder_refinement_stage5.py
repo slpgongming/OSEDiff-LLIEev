@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from dataloaders.sde_event_film_dataset import SDEEventFilmDataset
-from osediff_event_film import OSEDiffEventFiLMGen
+from osediff_event_film import OSEDiffEventFiLMGen, resolve_decoder_refinement_args
 from train_idea3_decoder_refinement import (
     build_scheduler,
     event_edge_loss,
@@ -70,6 +70,17 @@ def parse_args():
     )
     parser.add_argument("--decoder_fusion_weight", type=float, default=1.0)
     parser.add_argument("--decoder_fusion_init", default="near_zero", choices=("near_zero",))
+    parser.add_argument(
+        "--decoder_refinement_variant",
+        default="auto",
+        choices=("auto", "legacy_fused", "cgdrs"),
+        help="Refinement path; auto inherits the Stage4 checkpoint configuration.",
+    )
+    parser.add_argument("--cgdrs_event_levels", default="1,2,3")
+    parser.add_argument("--cgdrs_gate_bias", type=float, default=-2.0)
+    parser.add_argument(
+        "--cgdrs_activity_mode", choices=("abs_mean", "abs_sum"), default="abs_mean"
+    )
     parser.add_argument("--refinement_fusion_mode", default="both",
                         choices=("both", "rgb", "event"))
     parser.add_argument("--bundle_rgb_event_encoder", action="store_true")
@@ -187,6 +198,7 @@ def save_stage5_checkpoint(accelerator, model, optimizer, lr_scheduler, args,
 
 def main(args):
     validate_paths(args)
+    resolve_decoder_refinement_args(args, args.event_lora_checkpoint)
     os.makedirs(args.output_dir, exist_ok=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
