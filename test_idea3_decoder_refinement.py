@@ -34,7 +34,7 @@ def parse_experiments(value):
     return experiments
 
 
-def parse_args():
+def build_parser(include_experiments=True):
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_image", required=True)
     parser.add_argument("--output_dir", required=True)
@@ -81,7 +81,8 @@ def parse_args():
     parser.add_argument(
         "--cgdrs_activity_mode", choices=("abs_mean", "abs_sum"), default="abs_mean"
     )
-    parser.add_argument("--experiments", default="A,B,C,D,E,F")
+    if include_experiments:
+        parser.add_argument("--experiments", default="A,B,C,D,E,F")
     parser.add_argument("--generator_timestep", type=int, default=999)
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--fixed_prompt", default="high quality, bright, detailed photo")
@@ -91,12 +92,20 @@ def parse_args():
     parser.add_argument("--calculate_fid", action="store_true")
     parser.add_argument("--save_images", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume_ignore_mismatch", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def finalize_args(args):
+    """补全 idea3/idea4 共用的模型构造参数。"""
     args.osediff_path = args.event_lora_checkpoint
     args.decoder_refinement_enabled = True
     args.decoder_fusion_enabled = True
     args.refinement_fusion_mode = "both"
     return args
+
+
+def parse_args():
+    return finalize_args(build_parser().parse_args())
 
 
 def quality_metrics(prediction, target, metrics):
