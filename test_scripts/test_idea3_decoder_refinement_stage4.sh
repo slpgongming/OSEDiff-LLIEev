@@ -7,12 +7,12 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$REPO_ROOT/scripts/archive_run_context.sh"
 
-PRETRAINED_MODEL_NAME_OR_PATH="${PRETRAINED_MODEL_NAME_OR_PATH:-/public/home/slpchen/stable-diffusion-2-1-base}"
-TEST_DATA_ROOT="${TEST_DATA_ROOT:-/public/home/slpchen/EvLight--main/SDE_dataset/SDE_indoor/sde_in_release/test}"
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-checkpoints/OSEDiff_cbam_lowrank_residual_stage4/checkpoints/model_final.pkl}"
-RGB_EVENT_PRETRAINED_ROOT="${RGB_EVENT_PRETRAINED_ROOT:-/public/home/slpchen/Chen_Project/TrainingWeights/HDRev}"
-OUTPUT_DIR="${OUTPUT_DIR:-test_results/OSEDiff_cbam_lowrank_residual_stage4}"
-EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-cbam_lowrank_residual}"
+PRETRAINED_MODEL_NAME_OR_PATH="${PRETRAINED_MODEL_NAME_OR_PATH:-/home/data1/cjl/PretrainedModel/stable-diffusion-2-1-base/}"
+TEST_DATA_ROOT="${TEST_DATA_ROOT:-/home/data/Chen_data/SDE_dataset/sde_in_release/test}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-/home/data1/cjl/OSEDiff_Project/TrainedWeights/OSEDiff_stage4_9-4-1930/checkpoints/model_final.pkl}"
+RGB_EVENT_PRETRAINED_ROOT="${RGB_EVENT_PRETRAINED_ROOT:-/home/data1/cjl/OSEDiff_Project/TrainedWeights/REencoder/SDE_indoor}"
+OUTPUT_DIR="${OUTPUT_DIR:-/home/data1/cjl/OSEDiff_Project/Test_results/stage4_cgdrs_test_0}"
+EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-residual_cross_attn}"
 DECODER_REFINEMENT_VARIANT="${DECODER_REFINEMENT_VARIANT:-auto}"
 CGDRS_EVENT_LEVELS="${CGDRS_EVENT_LEVELS:-1,2,3}"
 CGDRS_GATE_BIAS="${CGDRS_GATE_BIAS:--2.0}"
@@ -54,8 +54,8 @@ archive_run_context "$OUTPUT_DIR" "${BASH_SOURCE[0]}" stage4 test \
   "EVENT_LORA_VARIANT=$EVENT_LORA_VARIANT" "DECODER_REFINEMENT_VARIANT=$DECODER_REFINEMENT_VARIANT" \
   "CGDRS_EVENT_LEVELS=$CGDRS_EVENT_LEVELS" "CGDRS_GATE_BIAS=$CGDRS_GATE_BIAS" \
   "CGDRS_ACTIVITY_MODE=$CGDRS_ACTIVITY_MODE" \
-  "IMAGE_SIZE=${IMAGE_SIZE:-256}" "GENERATOR_TIMESTEP=${GENERATOR_TIMESTEP:-999}"
-echo "[Stage4 Test] variant=$EVENT_LORA_VARIANT | decoder_refinement_variant=$DECODER_REFINEMENT_VARIANT | experiments=${EXPERIMENTS:-A,B,C,D,E,F}"
+  "IMAGE_SIZE=${IMAGE_SIZE:-256}" "GENERATOR_TIMESTEP=${GENERATOR_TIMESTEP:-500}"
+echo "[Stage4 Test] variant=$EVENT_LORA_VARIANT | decoder_refinement_variant=$DECODER_REFINEMENT_VARIANT | experiments=${EXPERIMENTS:-A,B,E}"
 
 python test_idea3_decoder_refinement.py \
   --input_image "$TEST_DATA_ROOT" \
@@ -73,10 +73,10 @@ python test_idea3_decoder_refinement.py \
   --modulation_scale "${EVENT_LORA_MODULATION_SCALE:-0.1}" \
   --event_lora_cbam_reduction "${EVENT_LORA_CBAM_REDUCTION:-8}" \
   --event_lora_cbam_spatial_kernel "${EVENT_LORA_CBAM_SPATIAL_KERNEL:-7}" \
-  --generator_timestep "${GENERATOR_TIMESTEP:-999}" \
+  --generator_timestep "${GENERATOR_TIMESTEP:-500}" \
   --image_size "${IMAGE_SIZE:-256}" \
   --mixed_precision "${MIXED_PRECISION:-fp16}" \
-  --experiments "${EXPERIMENTS:-A,B,C,D,E,F}" \
+  --experiments "${EXPERIMENTS:-A,B,E}" \
   "${FID_ARGS[@]}" \
   "${SAVE_ARGS[@]}" \
   "${RESUME_ARGS[@]}"

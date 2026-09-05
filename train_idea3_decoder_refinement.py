@@ -7,7 +7,7 @@ import os
 import time
 
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 import pyiqa
 import torch
 import torch.nn.functional as F
@@ -147,7 +147,14 @@ def parse_args():
     parser.add_argument("--log_steps", type=int, default=10)
     parser.add_argument("--report_to", default=None)
     parser.add_argument("--tracker_project_name", default="idea3-decoder-refinement")
-    parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases 运行名称")
+    parser.add_argument(
+        "--run_name",
+        "--wandb_run_name",
+        dest="run_name",
+        type=str,
+        default=None,
+        help="Tracker run name (legacy --wandb_run_name alias is retained).",
+    )
 
     parser.add_argument("--lambda_l2", type=float, default=1.0)
     parser.add_argument("--lambda_lpips", type=float, default=1.0)
@@ -265,6 +272,10 @@ def main(args):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
+        # CGDRS 默认屏蔽 level 0 event 分支；DDP 需允许该分支参数本轮无梯度。
+        kwargs_handlers=[
+            DistributedDataParallelKwargs(find_unused_parameters=True)
+        ],
     )
     logging.basicConfig(
         level=logging.INFO if accelerator.is_main_process else logging.WARNING,
@@ -350,8 +361,8 @@ def main(args):
         init_kwargs = {}
         if "wandb" in args.report_to or args.report_to == "all":
             init_kwargs["wandb"] = {}
-            if args.wandb_run_name:
-                init_kwargs["wandb"]["name"] = args.wandb_run_name
+            if args.run_name:
+                init_kwargs["wandb"]["name"] = args.run_name
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config, init_kwargs=init_kwargs)
 
     start_epoch = int(resume_checkpoint.get("epoch", 0)) if resume_checkpoint else 0
