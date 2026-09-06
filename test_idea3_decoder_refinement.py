@@ -76,6 +76,12 @@ def build_parser(include_experiments=True):
         choices=("auto", "legacy_fused", "cgdrs"),
         help="Refinement path; auto inherits the checkpoint configuration.",
     )
+    parser.add_argument(
+        "--decoder_refinement_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the trained decoder-refinement path. Disable for Stage3 checkpoints without its weights.",
+    )
     parser.add_argument("--cgdrs_event_levels", default="1,2,3")
     parser.add_argument("--cgdrs_gate_bias", type=float, default=-2.0)
     parser.add_argument(
@@ -98,8 +104,8 @@ def build_parser(include_experiments=True):
 def finalize_args(args):
     """补全 idea3/idea4 共用的模型构造参数。"""
     args.osediff_path = args.event_lora_checkpoint
-    args.decoder_refinement_enabled = True
-    args.decoder_fusion_enabled = True
+    args.decoder_refinement_enabled = bool(args.decoder_refinement_enabled)
+    args.decoder_fusion_enabled = args.decoder_refinement_enabled
     args.refinement_fusion_mode = "both"
     return args
 

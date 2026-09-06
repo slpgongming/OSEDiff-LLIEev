@@ -221,9 +221,13 @@ def main(args):
                 prediction = model.gen.decode_denoised_latent(
                     denoised,
                     rgb,
-                    events_refinement=refinement_events,
-                    decoder_fusion_enabled=True,
-                    refinement_fusion_mode="both",
+                    events_refinement=(
+                        refinement_events if args.decoder_refinement_enabled else None
+                    ),
+                    decoder_fusion_enabled=args.decoder_refinement_enabled,
+                    refinement_fusion_mode=(
+                        "both" if args.decoder_refinement_enabled else None
+                    ),
                 )
                 _sync(device)
                 decoder_ms = (time.perf_counter() - decode_start) * 1000.0
