@@ -475,6 +475,11 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         return checkpoint
 
     def set_train_stage(self, stage):
+        # Stage2/3 都必须和后续 checkpoint 测试保持相同的 PEFT adapter 组合。
+        # 否则从 Stage1 全新启动 Stage2 时，会沿用 PEFT 的默认单 adapter 状态，
+        # 导致已注册的 encoder/decoder LoRA 不参与前向和梯度更新。
+        if stage in {2, 3, "2", "3"}:
+            self.activate_lora_adapters()
         self.unet.train()
         self.vae.train()
         self.event_encoder.train()
