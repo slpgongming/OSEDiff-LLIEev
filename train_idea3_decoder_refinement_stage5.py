@@ -57,6 +57,14 @@ def parse_args():
     parser.add_argument("--event_channels", type=int, default=5)
     parser.add_argument("--event_bins", type=int, default=5)
     parser.add_argument("--event_base_channels", type=int, default=32)
+    parser.add_argument(
+        "--clora_event_active_bins", type=int, default=5,
+        help="cLoRA 输入使用的前置有效 event bin 数；1 将全部事件聚集到 bin 0，通道数仍为 5。",
+    )
+    parser.add_argument(
+        "--rgb_event_active_bins", type=int, default=5,
+        help="RGB-event encoder 输入使用的前置有效 event bin 数；1 将全部事件聚集到 bin 0，通道数仍为 5。",
+    )
     parser.add_argument("--mod_channels", type=int, default=64)
     parser.add_argument("--modulation_scale", type=float, default=0.1)
     parser.add_argument("--mod_num_heads", type=int, default=4)
@@ -188,6 +196,11 @@ def save_stage5_checkpoint(accelerator, model, optimizer, lr_scheduler, args,
         additional_info={
             "step_in_epoch": step_in_epoch,
             "event_normalization": "dual_view_clora_plus_nonzero_global_mean_std_v1",
+            "event_active_bins": {
+                "clora": args.clora_event_active_bins,
+                "rgb_event_encoder": args.rgb_event_active_bins,
+                "total_channels": args.event_bins,
+            },
             "stage5_trainable_scope": (
                 "unet_lora,event_encoder,vae_encoder_lora,decoder_feature_fusion"
             ),

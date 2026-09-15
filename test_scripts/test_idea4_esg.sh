@@ -38,6 +38,8 @@ MOD_NUM_HEADS="${MOD_NUM_HEADS:-4}"
 MOD_WINDOW_SIZE="${MOD_WINDOW_SIZE:-8}"
 EVENT_LORA_CBAM_REDUCTION="${EVENT_LORA_CBAM_REDUCTION:-8}"
 EVENT_LORA_CBAM_SPATIAL_KERNEL="${EVENT_LORA_CBAM_SPATIAL_KERNEL:-7}"
+CLORA_EVENT_ACTIVE_BINS="${CLORA_EVENT_ACTIVE_BINS:-5}"
+RGB_EVENT_ACTIVE_BINS="${RGB_EVENT_ACTIVE_BINS:-5}"
 CGDRS_EVENT_LEVELS="${CGDRS_EVENT_LEVELS:-1,2,3}"
 CGDRS_GATE_BIAS="${CGDRS_GATE_BIAS:--2.0}"
 CGDRS_ACTIVITY_MODE="${CGDRS_ACTIVITY_MODE:-abs_mean}"
@@ -56,6 +58,13 @@ if [[ "$EVENT_LORA_VARIANT" == residual_cross_attn* ]]; then
 else
   EVENT_LORA_MOD_CHANNELS=32
 fi
+
+for active_bin_setting in "$CLORA_EVENT_ACTIVE_BINS" "$RGB_EVENT_ACTIVE_BINS"; do
+  if [[ ! "$active_bin_setting" =~ ^[1-5]$ ]]; then
+    echo "[ERROR] Active event bins must be an integer from 1 to 5, got: $active_bin_setting" >&2
+    exit 1
+  fi
+done
 
 REQUIRED_DIRS=("$PRETRAINED_MODEL_NAME_OR_PATH" "$TEST_DATA_ROOT")
 REQUIRED_FILES=("$CHECKPOINT_PATH")
@@ -125,6 +134,8 @@ archive_run_context "$OUTPUT_DIR" "${BASH_SOURCE[0]}" idea4 esg_test \
   "CALCULATE_FID=$CALCULATE_FID" \
   "EVENT_LORA_VARIANT=$EVENT_LORA_VARIANT" \
   "DECODER_REFINEMENT_VARIANT=$DECODER_REFINEMENT_VARIANT" \
+  "CLORA_EVENT_ACTIVE_BINS=$CLORA_EVENT_ACTIVE_BINS" \
+  "RGB_EVENT_ACTIVE_BINS=$RGB_EVENT_ACTIVE_BINS" \
   "ESG_GUIDANCE_SCALES=$ESG_GUIDANCE_SCALES" \
   "ESG_SWAP_RATIOS=$ESG_SWAP_RATIOS" \
   "ESG_SWAP_MODES=$ESG_SWAP_MODES" \
@@ -136,6 +147,7 @@ echo "[Idea4 ESG] checkpoint=$CHECKPOINT_PATH"
 echo "[Idea4 ESG] output=$OUTPUT_DIR"
 echo "[Idea4 ESG] calculate_fid=$CALCULATE_FID"
 echo "[Idea4 ESG] decoder_refinement_enabled=$DECODER_REFINEMENT_ENABLED"
+echo "[Idea4 ESG] active event bins: cLoRA=$CLORA_EVENT_ACTIVE_BINS, RGB-event=$RGB_EVENT_ACTIVE_BINS (total channels=5)"
 echo "[Idea4 ESG] guidance=$ESG_GUIDANCE_SCALES ratio=$ESG_SWAP_RATIOS"
 echo "[Idea4 ESG] mode=$ESG_SWAP_MODES policy=$ESG_PAIR_POLICIES scales=$ESG_FEATURE_SCALES"
 
@@ -146,6 +158,8 @@ python "$REPO_ROOT/test_idea4_esg.py" \
   --event_lora_checkpoint "$CHECKPOINT_PATH" \
   --event_lora_variant "$EVENT_LORA_VARIANT" \
   "${DECODER_ARGS[@]}" \
+  --clora_event_active_bins "$CLORA_EVENT_ACTIVE_BINS" \
+  --rgb_event_active_bins "$RGB_EVENT_ACTIVE_BINS" \
   --cgdrs_event_levels "$CGDRS_EVENT_LEVELS" \
   --cgdrs_gate_bias "$CGDRS_GATE_BIAS" \
   --cgdrs_activity_mode "$CGDRS_ACTIVITY_MODE" \

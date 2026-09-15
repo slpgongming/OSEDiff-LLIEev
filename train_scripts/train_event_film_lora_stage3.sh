@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# slpchen / Stage3：从同 variant 的 Stage2 checkpoint 初始化，联合训练 Event branch 与 LoRA A/B。
+# whb / Stage3：从同 variant 的 Stage2 checkpoint 初始化，联合训练 Event branch 与 LoRA A/B。
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 export WANDB_INSECURE=true
@@ -10,13 +10,15 @@ export WANDB_INSECURE_DISABLE_SSL=true
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$REPO_ROOT/scripts/archive_run_context.sh"
 
-PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/slpchen/stable-diffusion-2-1-base}"
-TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/public/home/slpchen/EvLight--main/SDE_dataset/SDE_indoor/sde_in_release/train}"
-STAGE1_CKPT="${STAGE1_CKPT:-checkpoints/osediff_lle_5-14-1935/checkpoints/model_94001.pkl}"
-INIT_FROM_EVENT_CHECKPOINT="${INIT_FROM_EVENT_CHECKPOINT:-checkpoints/OSEDiff_cbam_lowrank_residual_stage2_6-19/checkpoints/model_final.pkl}"
-OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/OSEDiff_cbam_lowrank_residual_stage3_6-19}"
+PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/whb/Chen_Project/PretrainedModel/stable-diffusion-2-1-base}"
+TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/public/home/whb/Chen_Project/dataset/SDE_dataset/SDE_indoor/sde_in_release/train}"
+STAGE1_CKPT="${STAGE1_CKPT:-/public/home/whb/Chen_Project/OSEDiff_project/TrainingWeights/osediff_lle_5-14-1935/checkpoints/model_94001.pkl}"
+# 请在启动前填写 Stage2 checkpoint；Stage3 将从该 Event-LoRA 权重初始化。
+INIT_FROM_EVENT_CHECKPOINT="${INIT_FROM_EVENT_CHECKPOINT:-}"
+# 请在启动前填写本次 Stage3 权重输出目录，或通过同名环境变量覆盖。
+OUTPUT_DIR="${OUTPUT_DIR:-}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
-EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-cbam_lowrank_residual}"
+EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-residual_cross_attn}"
 REGULARIZER_LORA_MODE="${REGULARIZER_LORA_MODE:-same_as_generator}"
 
 if [ ! -d "$PRETRAINED_MODEL" ]; then
@@ -29,6 +31,14 @@ if [ ! -d "$TRAIN_DATA_ROOT" ]; then
 fi
 if [ ! -f "$STAGE1_CKPT" ]; then
   echo "[ERROR] STAGE1_CKPT does not exist: $STAGE1_CKPT" >&2
+  exit 1
+fi
+if [ -z "$OUTPUT_DIR" ]; then
+  echo "[ERROR] OUTPUT_DIR is empty. Set the Stage3 output directory before training." >&2
+  exit 1
+fi
+if [ -z "$RESUME_FROM_CHECKPOINT" ] && [ -z "$INIT_FROM_EVENT_CHECKPOINT" ]; then
+  echo "[ERROR] INIT_FROM_EVENT_CHECKPOINT is empty. Set the Stage2 checkpoint before Stage3 training." >&2
   exit 1
 fi
 if [ -z "$RESUME_FROM_CHECKPOINT" ] && [ ! -f "$INIT_FROM_EVENT_CHECKPOINT" ]; then
@@ -63,14 +73,14 @@ accelerate launch --num_processes "$NPROC_PER_NODE" train_event_film_lora_osedif
   --dataloader_num_workers "${DATALOADER_NUM_WORKERS:-2}" \
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-1}" \
   --max_train_steps "${MAX_TRAIN_STEPS:-100000}" \
-  --checkpointing_steps "${CHECKPOINTING_STEPS:-500}" \
+  --checkpointing_steps "${CHECKPOINTING_STEPS:-1000}" \
   --mixed_precision fp16 \
   --report_to wandb \
   --tracker_project_name event_film_lora_stage3 \
   --wandb_run_name "${WANDB_RUN_NAME:-cbam_lowrank_residual_stage3_6-19}" \
   --event_lora_variant "$EVENT_LORA_VARIANT" \
   --lora_rank "${LORA_RANK:-4}" \
-  --mod_channels "${EVENT_LORA_MOD_CHANNELS:-32}" \
+  --mod_channels "${EVENT_LORA_MOD_CHANNELS:-64}" \
   --modulation_scale "${EVENT_LORA_MODULATION_SCALE:-0.1}" \
   --event_lora_cbam_reduction "${EVENT_LORA_CBAM_REDUCTION:-8}" \
   --event_lora_cbam_spatial_kernel "${EVENT_LORA_CBAM_SPATIAL_KERNEL:-7}" \

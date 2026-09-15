@@ -11,6 +11,8 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 import torchvision.transforms.functional as TF
 
+from dataloaders.event_voxel_layout import concentrate_event_voxel
+
 
 def _timestamp_sort_key(path):
     """按文件名中的数值时间戳排序，避免字符串排序导致 10 排在 2 前面。"""
@@ -57,6 +59,17 @@ class SDEEventFilmDataset(Dataset):
             raise ValueError(
                 "当前实现参考 references/eglol.py，要求 event_channels == event_bins。"
             )
+        # 两条事件分支保持固定的 5 通道输入，但可以独立压缩有效时间 bin 数。
+        # n=1 会把全部事件累加到 channel/bin 0，用于复现旧版 timestamp float32
+        # 精度丢失时的 voxel 布局；n=5 则保持修复后的标准 5-bin 表示。
+        self.clora_event_active_bins = self._validate_active_bins(
+            getattr(args, "clora_event_active_bins", self.event_bins),
+            "clora_event_active_bins",
+        )
+        self.rgb_event_active_bins = self._validate_active_bins(
+            getattr(args, "rgb_event_active_bins", self.event_bins),
+            "rgb_event_active_bins",
+        )
         self.fixed_prompt = getattr(args, "fixed_prompt", "high quality, bright, detailed photo")
         self.neg_prompt = getattr(args, "neg_prompt", "")
         self.event_ablation_mode = getattr(args, "event_ablation_mode", "correct")
@@ -70,7 +83,11 @@ class SDEEventFilmDataset(Dataset):
         self.samples = self._scan_samples(self.root_dir)
         if not self.samples:
             raise RuntimeError(f"No SDE samples found under: {self.root_dir}")
-        print(f"[SDEEventFilmDataset] Loaded {len(self.samples)} samples from {self.root_dir}")
+        print(
+            f"[SDEEventFilmDataset] Loaded {len(self.samples)} samples from "
+            f"{self.root_dir}; active bins: cLoRA={self.clora_event_active_bins}/"
+            f"{self.event_bins}, RGB-event={self.rgb_event_active_bins}/{self.event_bins}"
+        )
 
     def __len__(self):
         return len(self.samples)
@@ -114,9 +131,19 @@ class SDEEventFilmDataset(Dataset):
         normal_t = TF.normalize(normal_t, mean=[0.5], std=[0.5])
         if self.event_ablation_mode == "zero":
             event_t = torch.zeros_like(event_t)
+        # 同一份原始 5-bin voxel 在归一化前分别重排，确保 cLoRA 与 RGB-event
+        # encoder 可以独立复现实验条件，同时两路的输入通道数始终为 event_bins=5。
+        # edge loss 只使用跨 bin 的空间活动区域，因此继续保存未压缩 voxel，避免
+        # 两个模型输入分支选择不同 n 时让辅助损失的空间监督也随之漂移。
         raw_event_t = event_t
-        events_clora = self._normalize_event_voxel(event_t)
-        events_refinement = self._normalize_event_voxel_refinement(event_t)
+        clora_event_t = self._concentrate_event_voxel(
+            event_t, self.clora_event_active_bins
+        )
+        refinement_event_t = self._concentrate_event_voxel(
+            event_t, self.rgb_event_active_bins
+        )
+        events_clora = self._normalize_event_voxel(clora_event_t)
+        events_refinement = self._normalize_event_voxel_refinement(refinement_event_t)
 
         output = {
             "conditioning_pixel_values": low_t,
@@ -134,6 +161,20 @@ class SDEEventFilmDataset(Dataset):
         if self.return_raw_event_voxel:
             output["event_voxel_raw"] = raw_event_t
         return output
+
+    def _validate_active_bins(self, value, name):
+        """校验有效 bin 数；通道维固定不变，因此只允许 1 到 event_bins。"""
+        value = int(value)
+        if not 1 <= value <= self.event_bins:
+            raise ValueError(
+                f"{name} must be in [1, {self.event_bins}], got {value}."
+            )
+        return value
+
+    @staticmethod
+    def _concentrate_event_voxel(event, active_bins):
+        """保留数据集内部调用入口，具体实现位于可独立测试的轻量模块。"""
+        return concentrate_event_voxel(event, active_bins)
 
     def _shuffled_event_index(self, index):
         """batch size=1 时也使用固定、可复现且不等于自身的 dataset 错配。"""

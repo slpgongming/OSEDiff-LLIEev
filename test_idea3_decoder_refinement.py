@@ -60,6 +60,14 @@ def build_parser(include_experiments=True):
     parser.add_argument("--lora_rank", type=int, default=4)
     parser.add_argument("--event_channels", type=int, default=5)
     parser.add_argument("--event_bins", type=int, default=5)
+    parser.add_argument(
+        "--clora_event_active_bins", type=int, default=5,
+        help="cLoRA 输入使用的前置有效 event bin 数；1 将全部事件聚集到 bin 0，通道数仍为 5。",
+    )
+    parser.add_argument(
+        "--rgb_event_active_bins", type=int, default=5,
+        help="RGB-event encoder 输入使用的前置有效 event bin 数；1 将全部事件聚集到 bin 0，通道数仍为 5。",
+    )
     parser.add_argument("--event_base_channels", type=int, default=32)
     parser.add_argument("--mod_channels", type=int, default=32)
     parser.add_argument("--modulation_scale", type=float, default=0.1)

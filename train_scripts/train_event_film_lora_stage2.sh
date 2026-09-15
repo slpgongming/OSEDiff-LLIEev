@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# hutao / Stage 2：使用 CBAM output gate，训练 EventEncoder 与事件调制分支。
+# whb / Stage 2：使用 CBAM output gate，训练 EventEncoder 与事件调制分支。
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 export WANDB_INSECURE=true
@@ -10,12 +10,13 @@ export WANDB_INSECURE_DISABLE_SSL=true
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$REPO_ROOT/scripts/archive_run_context.sh"
 
-PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/hutao/Chen_Project/PretrainedModel/stable-diffusion-2-1-base}"
-TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/public/home/hutao/Chen_Project/dataset/SDE_dataset/SDE_indoor/sde_in_release/train}"
-STAGE1_CKPT="${STAGE1_CKPT:-checkpoints/osediff_lle_5-14-1935/checkpoints/model_94001.pkl}"
-OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/OSEDiff_clora_stage2_6-20-2320}"
+PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/whb/Chen_Project/PretrainedModel/stable-diffusion-2-1-base}"
+TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/public/home/whb/Chen_Project/dataset/SDE_dataset/SDE_indoor/sde_in_release/train}"
+STAGE1_CKPT="${STAGE1_CKPT:-/public/home/whb/Chen_Project/OSEDiff_project/TrainingWeights/osediff_lle_5-14-1935/checkpoints/model_94001.pkl}"
+# 请在启动前填写本次 Stage2 权重输出目录，或通过同名环境变量覆盖。
+OUTPUT_DIR="${OUTPUT_DIR:-/public/home/whb/Chen_Project/OSEDiff_project/TrainingWeights/OSEDiff_clora_stage2_9-14-2310}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
-EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-cbam_output_gate}"
+EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-residual_cross_attn}"
 # finetuned regularizer 使用独立 Event-LoRA head；VSD 损失仍可由下方 lambda 开关控制。
 REGULARIZER_LORA_MODE="${REGULARIZER_LORA_MODE:-event_lora}"
 
@@ -29,6 +30,10 @@ if [ ! -d "$TRAIN_DATA_ROOT" ]; then
 fi
 if [ ! -f "$STAGE1_CKPT" ]; then
   echo "[ERROR] STAGE1_CKPT does not exist: $STAGE1_CKPT" >&2
+  exit 1
+fi
+if [ -z "$OUTPUT_DIR" ]; then
+  echo "[ERROR] OUTPUT_DIR is empty. Set the Stage2 output directory before training." >&2
   exit 1
 fi
 
@@ -61,10 +66,10 @@ accelerate launch --num_processes "$NPROC_PER_NODE" train_event_film_lora_osedif
   --mixed_precision fp16 \
   --report_to wandb \
   --tracker_project_name OSEDiff_clora_stage2 \
-  --wandb_run_name "${WANDB_RUN_NAME:-stage2_6-20-2320}" \
+  --wandb_run_name "${WANDB_RUN_NAME:-stage2_9-14-2310}" \
   --event_lora_variant "$EVENT_LORA_VARIANT" \
   --lora_rank "${LORA_RANK:-4}" \
-  --mod_channels "${EVENT_LORA_MOD_CHANNELS:-32}" \
+  --mod_channels "${EVENT_LORA_MOD_CHANNELS:-64}" \
   --modulation_scale "${EVENT_LORA_MODULATION_SCALE:-0.1}" \
   --event_lora_cbam_reduction "${EVENT_LORA_CBAM_REDUCTION:-8}" \
   --event_lora_cbam_spatial_kernel "${EVENT_LORA_CBAM_SPATIAL_KERNEL:-7}" \

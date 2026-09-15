@@ -114,6 +114,14 @@ def parse_args():
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--event_bins", type=int, default=5)
     parser.add_argument("--event_channels", type=int, default=5)
+    parser.add_argument(
+        "--clora_event_active_bins", type=int, default=5,
+        help="cLoRA 输入使用的前置有效 event bin 数；1 将全部事件聚集到 bin 0，通道数仍为 5。",
+    )
+    parser.add_argument(
+        "--rgb_event_active_bins", type=int, default=5,
+        help="RGB-event encoder 输入使用的前置有效 event bin 数；仅 Stage4/5 refinement 使用。",
+    )
     parser.add_argument("--event_base_channels", type=int, default=32)
     parser.add_argument(
         "--mod_channels",
@@ -546,7 +554,12 @@ def main(args):
                                 "regularizer_train_timestep": args.regularizer_train_timestep,
                             },
                             additional_info={
-                                "reg_checkpoint": accelerator.unwrap_model(model_reg).checkpoint_state()
+                                "reg_checkpoint": accelerator.unwrap_model(model_reg).checkpoint_state(),
+                                "event_active_bins": {
+                                    "clora": args.clora_event_active_bins,
+                                    "rgb_event_encoder": args.rgb_event_active_bins,
+                                    "total_channels": args.event_bins,
+                                },
                             },
                         )
                         logging.info(f"[Checkpoint] Saved: {outf}")
@@ -576,7 +589,12 @@ def main(args):
                 "regularizer_train_timestep": args.regularizer_train_timestep,
             },
             additional_info={
-                "reg_checkpoint": accelerator.unwrap_model(model_reg).checkpoint_state()
+                "reg_checkpoint": accelerator.unwrap_model(model_reg).checkpoint_state(),
+                "event_active_bins": {
+                    "clora": args.clora_event_active_bins,
+                    "rgb_event_encoder": args.rgb_event_active_bins,
+                    "total_channels": args.event_bins,
+                },
             },
         )
         logging.info(f"[Final] Saved: {final_path}")
