@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# whb / Stage 2：使用 CBAM output gate，训练 EventEncoder 与事件调制分支。
+# zwy / Stage 2：普通 UNet LoRA 关闭并冻结，Event-LoRA A/B 冻结；训练 EventEncoder 与事件调制分支。
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
-export WANDB_INSECURE=true
-export WANDB_INSECURE_DISABLE_SSL=true
 
-REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+REPO_ROOT="$(cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd)"
 source "$REPO_ROOT/scripts/archive_run_context.sh"
+cd "$REPO_ROOT"
 
-PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/whb/Chen_Project/PretrainedModel/stable-diffusion-2-1-base}"
-TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/public/home/whb/Chen_Project/dataset/SDE_dataset/SDE_indoor/sde_in_release/train}"
-STAGE1_CKPT="${STAGE1_CKPT:-/public/home/whb/Chen_Project/OSEDiff_project/TrainingWeights/osediff_lle_5-14-1935/checkpoints/model_94001.pkl}"
-# 请在启动前填写本次 Stage2 权重输出目录，或通过同名环境变量覆盖。
-OUTPUT_DIR="${OUTPUT_DIR:-/public/home/whb/Chen_Project/OSEDiff_project/TrainingWeights/OSEDiff_clora_stage2_9-14-2310}"
+PRETRAINED_MODEL="${PRETRAINED_MODEL:-/public/home/zhouweiyu/Chen_Project/PretrainedModel/stable-diffusion-2-1-base}"
+TRAIN_DATA_ROOT="${TRAIN_DATA_ROOT:-/public/home/zhouweiyu/Chen_Project/dataset/SDE/indoor/sde_in_release/train}"
+STAGE1_CKPT="${STAGE1_CKPT:-/public/home/zhouweiyu/Chen_Project/OSEDiff_project/TrainingWeights/osediff_lle_5-14-1935/checkpoints/model_94001.pkl}"
+OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/OSEDiff_stage2_9-30-1140}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-residual_cross_attn}"
-# finetuned regularizer 使用独立 Event-LoRA head；VSD 损失仍可由下方 lambda 开关控制。
-REGULARIZER_LORA_MODE="${REGULARIZER_LORA_MODE:-event_lora}"
+REGULARIZER_LORA_MODE="${REGULARIZER_LORA_MODE:-same_as_generator}"
+UNET_LORA_ACTIVE_PARTS="${UNET_LORA_ACTIVE_PARTS:-none}"
+UNET_LORA_TRAINABLE_PARTS="${UNET_LORA_TRAINABLE_PARTS:-none}"
+CLORA_EVENT_ACTIVE_BINS="${CLORA_EVENT_ACTIVE_BINS:-5}"
 
 if [ ! -d "$PRETRAINED_MODEL" ]; then
   echo "[ERROR] PRETRAINED_MODEL does not exist: $PRETRAINED_MODEL" >&2
@@ -43,13 +44,18 @@ if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
 fi
 
 mkdir -p "$OUTPUT_DIR"
-archive_run_context "$OUTPUT_DIR" "${BASH_SOURCE[0]}" stage2 train \
+archive_run_context "$OUTPUT_DIR" "$SCRIPT_PATH" stage2 train \
   "PRETRAINED_MODEL=$PRETRAINED_MODEL" "TRAIN_DATA_ROOT=$TRAIN_DATA_ROOT" \
   "STAGE1_CKPT=$STAGE1_CKPT" "OUTPUT_DIR=$OUTPUT_DIR" \
-  "EVENT_LORA_VARIANT=$EVENT_LORA_VARIANT" "IMAGE_SIZE=256" \
+  "EVENT_LORA_VARIANT=$EVENT_LORA_VARIANT" "REGULARIZER_LORA_MODE=$REGULARIZER_LORA_MODE" \
+  "UNET_LORA_ACTIVE_PARTS=$UNET_LORA_ACTIVE_PARTS" \
+  "UNET_LORA_TRAINABLE_PARTS=$UNET_LORA_TRAINABLE_PARTS" \
+  "CLORA_EVENT_ACTIVE_BINS=$CLORA_EVENT_ACTIVE_BINS" "IMAGE_SIZE=256" \
   "GENERATOR_TRAIN_TIMESTEP=${GENERATOR_TRAIN_TIMESTEP:-400,600}" \
   "MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-100000}" \
-  "LR_EVENT=${LR_EVENT:-1e-4}" "LR_LORA=${LR_LORA:-1e-5}"
+  "CHECKPOINTING_STEPS=${CHECKPOINTING_STEPS:-2000}" \
+  "LOCAL_LOG_DIR=$OUTPUT_DIR/logs" \
+  "LR_EVENT=${LR_EVENT:-5e-5}" "LR_LORA=${LR_LORA:-1e-5}"
 
 accelerate launch --num_processes "$NPROC_PER_NODE" train_event_film_lora_osediff.py \
   --stage 2 \
@@ -62,12 +68,15 @@ accelerate launch --num_processes "$NPROC_PER_NODE" train_event_film_lora_osedif
   --dataloader_num_workers "${DATALOADER_NUM_WORKERS:-2}" \
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-1}" \
   --max_train_steps "${MAX_TRAIN_STEPS:-100000}" \
-  --checkpointing_steps "${CHECKPOINTING_STEPS:-500}" \
+  --checkpointing_steps "${CHECKPOINTING_STEPS:-2000}" \
   --mixed_precision fp16 \
-  --report_to wandb \
-  --tracker_project_name OSEDiff_clora_stage2 \
-  --wandb_run_name "${WANDB_RUN_NAME:-stage2_9-14-2310}" \
+  --report_to tensorboard \
+  --logging_dir logs \
+  --tracker_project_name stage2_9-30-1140 \
   --event_lora_variant "$EVENT_LORA_VARIANT" \
+  --unet_lora_active_parts "$UNET_LORA_ACTIVE_PARTS" \
+  --unet_lora_trainable_parts "$UNET_LORA_TRAINABLE_PARTS" \
+  --clora_event_active_bins "$CLORA_EVENT_ACTIVE_BINS" \
   --lora_rank "${LORA_RANK:-4}" \
   --mod_channels "${EVENT_LORA_MOD_CHANNELS:-64}" \
   --modulation_scale "${EVENT_LORA_MODULATION_SCALE:-0.1}" \
@@ -78,11 +87,11 @@ accelerate launch --num_processes "$NPROC_PER_NODE" train_event_film_lora_osedif
   --regularizer_train_timestep "${REGULARIZER_TRAIN_TIMESTEP:-400,600}" \
   --lambda_vsd "${LAMBDA_VSD:-0.0}" \
   --lambda_vsd_lora "${LAMBDA_VSD_LORA:-0.0}" \
-  --learning_rate_event "${LR_EVENT:-1e-4}" \
+  --learning_rate_event "${LR_EVENT:-5e-5}" \
   --learning_rate_lora "${LR_LORA:-1e-5}" \
   --learning_rate_reg "${LR_REG:-5e-5}" \
   --lambda_lpips "${LAMBDA_LPIPS:-1.0}" \
-  --lambda_edge "${LAMBDA_EDGE:-0.05}" \
-  --lambda_smooth "${LAMBDA_SMOOTH:-0.001}" \
-  --lambda_mod "${LAMBDA_MOD:-0.001}" \
+  --lambda_edge "${LAMBDA_EDGE:-0.02}" \
+  --lambda_smooth "${LAMBDA_SMOOTH:-0.005}" \
+  --lambda_mod "${LAMBDA_MOD:-0.01}" \
   "${EXTRA_ARGS[@]}"

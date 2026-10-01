@@ -474,6 +474,7 @@ class SpatialRGBEventLoRALinear(nn.Module):
         self.last_debug = {}
         self.last_aux = {}
         self.last_visuals = {}
+        self.last_z_delta = None
 
         self.lora_down = nn.Linear(base_linear.in_features, self.rank, bias=False)
         self.lora_up = nn.Linear(self.rank, base_linear.out_features, bias=False)
@@ -519,6 +520,7 @@ class SpatialRGBEventLoRALinear(nn.Module):
         z = self.lora_down(hidden_states)
         if not self.modulation_enabled or self.event_feats is None or hidden_states.dim() != 3:
             lora_out = self.lora_up(z) * self.scaling
+            self.last_z_delta = None
             self._record_debug({}, base_out, lora_out)
             return base_out + lora_out
 
@@ -535,6 +537,7 @@ class SpatialRGBEventLoRALinear(nn.Module):
         if self.variant == "residual_cross_attn":
             delta_z = self.shared_residual_heads(z_map, self.event_feats)
             z_mod = z_map + self.config.modulation_scale * delta_z
+            self.last_z_delta = (z_mod - z_map).detach()
             z_tokens = z_mod.flatten(2).transpose(1, 2).contiguous()
             lora_out = self.lora_up(z_tokens) * self.scaling
             result = {"aux": {"z_event": delta_z, "delta_z": z_mod - z_map}}
@@ -545,6 +548,7 @@ class SpatialRGBEventLoRALinear(nn.Module):
             )
             delta_bax = self.shared_residual_heads(bax_map, self.event_feats)
             bax_mod = bax_map + self.config.modulation_scale * delta_bax
+            self.last_z_delta = (bax_mod - bax_map).detach()
             lora_out = bax_mod.flatten(2).transpose(1, 2).contiguous() * self.scaling
             result = {"aux": {"bax_event": delta_bax, "bax_delta": bax_mod - bax_map}}
         elif self.variant == "cbam_output_gate":
@@ -553,9 +557,11 @@ class SpatialRGBEventLoRALinear(nn.Module):
                 bsz, self.base_linear.out_features, spatial, spatial
             )
             result = self.modulator(z_map, event_feat, event_key, u_map=u_map)
+            self.last_z_delta = (result["u_mod"] - u_map).detach()
             lora_out = result["u_mod"].flatten(2).transpose(1, 2).contiguous()
         else:
             result = self.modulator(z_map, event_feat, event_key)
+            self.last_z_delta = (result["z_mod"] - z_map).detach()
             z_tokens = result["z_mod"].flatten(2).transpose(1, 2).contiguous()
             lora_out = self.lora_up(z_tokens) * self.scaling
 

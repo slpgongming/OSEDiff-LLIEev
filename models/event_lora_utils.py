@@ -192,20 +192,28 @@ def _total_variation(x):
 
 
 def collect_event_lora_regularization(unet, device):
-    """
-    对当前 forward 的真实调制输出计算幅值与 TV，而不是用 head 权重冒充输出正则。
-
-    函数必须在 Event-LoRA forward 之后、backward 之前调用，`last_aux` 才保留
-    当前计算图。每个模块只缓存本 batch 的最后一次输出。
-    """
+    """旧版正则：detach 后的调制增量统计，加可反传的事件头 L2。"""
     smooth = torch.zeros((), device=device)
     mod = torch.zeros((), device=device)
     count = 0
+    seen = set()
     for _, module in iter_event_lora_modules(unet):
-        for tensor in module.last_aux.values():
-            mod = mod + tensor.float().pow(2).mean()
-            smooth = smooth + _total_variation(tensor.float())
+        z_delta = module.last_z_delta
+        if z_delta is not None:
+            z_delta = z_delta.to(device=device, dtype=torch.float32)
+            mod = mod + z_delta.pow(2).mean()
+            smooth = smooth + _total_variation(z_delta)
             count += 1
+        # residual variant 的共享头只计一次；其他 variant 使用独立 modulator。
+        head = (module.shared_residual_heads if hasattr(module, "shared_residual_heads")
+                else module.modulator)
+        if head is not None:
+            for param in head.parameters():
+                if id(param) in seen:
+                    continue
+                seen.add(id(param))
+                mod = mod + param.float().pow(2).mean()
+                count += 1
     if count:
         smooth = smooth / count
         mod = mod / count

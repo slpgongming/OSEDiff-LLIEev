@@ -14,7 +14,7 @@ from PIL import Image
 from torchvision import transforms
 
 from dataloaders.sde_event_film_dataset import SDEEventFilmDataset
-from osediff_event_film import OSEDiffEventFiLMTest
+from osediff_event_film import OSEDiffEventFiLMTest, parse_unet_lora_parts
 
 
 METRIC_NAMES = ("psnr", "ssim", "lpips")
@@ -341,6 +341,10 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", type=int, choices=[2, 3], default=2,
         help="Stage label for logging/output semantics; checkpoint content is selected by --osediff_path.")
+    parser.add_argument(
+        "--unet_lora_parts", type=parse_unet_lora_parts, default=(),
+        help="推理时激活的普通 UNet LoRA 分组：none 或 down,mid,up 的逗号分隔子集；默认 none。Event-LoRA 始终启用。",
+    )
     parser.add_argument("--input_image", "-i", type=str, required=True,
         help="SDE test root with scene/low and scene/normal folders.")
     parser.add_argument("--output_dir", "-o", type=str, default="output_event_film/test")

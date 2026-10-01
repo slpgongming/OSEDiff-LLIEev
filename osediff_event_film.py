@@ -39,6 +39,48 @@ from models.event_lora_utils import (
 )
 
 
+UNET_LORA_PARTS = ("down", "mid", "up")
+_UNET_LORA_ADAPTERS = {
+    "down": "default_encoder",  # down_blocks and conv_in
+    "mid": "default_others",   # mid_block and remaining non-down/up modules
+    "up": "default_decoder",   # up_blocks and conv_out
+}
+
+
+def parse_unet_lora_parts(value):
+    """Parse a comma-separated selection of ordinary UNet PEFT LoRA groups."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        value = value.strip().lower()
+        parts = [] if value in {"", "none"} else value.split(",")
+    else:
+        parts = list(value)
+    parts = [part.strip().lower() for part in parts]
+    invalid = set(parts) - set(UNET_LORA_PARTS)
+    if invalid or len(parts) != len(set(parts)):
+        raise ValueError(
+            f"Invalid UNet LoRA parts {value!r}; use none or a comma-separated "
+            "selection of down,mid,up without duplicates."
+        )
+    return tuple(part for part in UNET_LORA_PARTS if part in parts)
+
+
+def validate_unet_lora_training_parts(active, trainable):
+    active = parse_unet_lora_parts(active)
+    trainable = parse_unet_lora_parts(trainable)
+    if not set(trainable).issubset(active):
+        raise ValueError(
+            "Trainable ordinary UNet LoRA parts must also be active; "
+            f"active={active}, trainable={trainable}."
+        )
+    return active, trainable
+
+
+def _is_unet_lora_parameter_name(name):
+    return any(marker in name for marker in ("lora_A.", "lora_B.", "lora_down", "lora_up"))
+
+
 def _event_lora_config_from_args(args):
     return EventLoRAConfig(
         variant=getattr(args, "event_lora_variant", "film_affine"),
@@ -333,14 +375,17 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             raise RuntimeError(f"Unexpected trainable parameters: {stray}")
         return trainable
 
-    def activate_lora_adapters(self):
-        """显式激活 Stage1/Stage3 使用的全部 UNet/VAE LoRA adapter。"""
-        # add_adapter 只负责注册 adapter；未激活的 adapter 不会进入 forward，
-        # 即使成功加载权重也不会产生输出或梯度。
-        self.unet.set_adapter(
-            ["default_encoder", "default_decoder", "default_others"]
-        )
+    def activate_lora_adapters(self, parts=UNET_LORA_PARTS):
+        """选择普通 UNet LoRA；自定义 Event-LoRA 不受 PEFT 开关影响。"""
+        parts = parse_unet_lora_parts(parts)
+        if parts:
+            self.unet.set_adapter([_UNET_LORA_ADAPTERS[part] for part in parts])
+            self.unet.enable_adapters()
+        else:
+            self.unet.disable_adapters()
         self.vae.set_adapter(["default_encoder"])
+        self.active_unet_lora_parts = parts
+        print(f"[UNet ordinary LoRA] active={','.join(parts) or 'none'}")
 
     def set_train_stage5(self):
         """Stage5 的联合微调解冻策略。
@@ -475,11 +520,13 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         return checkpoint
 
     def set_train_stage(self, stage):
-        # Stage2/3 都必须和后续 checkpoint 测试保持相同的 PEFT adapter 组合。
-        # 否则从 Stage1 全新启动 Stage2 时，会沿用 PEFT 的默认单 adapter 状态，
-        # 导致已注册的 encoder/decoder LoRA 不参与前向和梯度更新。
         if stage in {2, 3, "2", "3"}:
-            self.activate_lora_adapters()
+            active_parts, trainable_parts = validate_unet_lora_training_parts(
+                getattr(self.args, "unet_lora_active_parts", ()),
+                getattr(self.args, "unet_lora_trainable_parts", ()),
+            )
+            self.activate_lora_adapters(active_parts)
+            self.trainable_unet_lora_parts = trainable_parts
         self.unet.train()
         self.vae.train()
         self.event_encoder.train()
@@ -487,6 +534,23 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         self.vae.requires_grad_(False)
         self.text_encoder.requires_grad_(False)
         self.event_encoder.requires_grad_(stage in {2, 3, "2", "3"})
+        if stage in {2, 3, "2", "3"}:
+            selected_adapters = {
+                _UNET_LORA_ADAPTERS[part] for part in self.trainable_unet_lora_parts
+            }
+            matched_adapters = set()
+            for name, param in self.unet.named_parameters():
+                if "lora_A." in name or "lora_B." in name:
+                    marker = "lora_A." if "lora_A." in name else "lora_B."
+                    adapter = name.split(marker, 1)[1].split(".", 1)[0]
+                    param.requires_grad_(adapter in selected_adapters)
+                    matched_adapters.add(adapter)
+            if selected_adapters - matched_adapters:
+                raise RuntimeError(
+                    "Selected ordinary UNet LoRA adapters have no parameters: "
+                    f"{sorted(selected_adapters - matched_adapters)}"
+                )
+            print(f"[UNet ordinary LoRA] trainable={','.join(trainable_parts) or 'none'}")
         if stage in {2, "2"}:
             set_event_lora_trainable(self.unet, train_lora=False, train_modulation=True)
             set_modulation_enabled_for_all_event_lora(self.unet, True)
@@ -501,7 +565,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
     def get_lora_params(self):
         params = []
         for name, param in self.unet.named_parameters():
-            if param.requires_grad and ("lora_down" in name or "lora_up" in name):
+            if param.requires_grad and _is_unet_lora_parameter_name(name):
                 params.append(param)
         return params
 
@@ -511,7 +575,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         params = [p for p in self.event_encoder.parameters() if p.requires_grad]
         seen = {id(param) for param in params}
         for name, param in self.unet.named_parameters():
-            if not param.requires_grad or "lora_down" in name or "lora_up" in name:
+            if not param.requires_grad or _is_unet_lora_parameter_name(name):
                 continue
             if id(param) not in seen:
                 params.append(param)
@@ -852,11 +916,15 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             "event_lora_config": self.event_lora_config.to_dict(),
             "event_lora_variant": self.event_lora_config.variant,
             "event_film_replaced_names": self.event_film_replaced_names,
+            "train_unet_lora_active_parts": tuple(getattr(self, "active_unet_lora_parts", ())),
+            "train_unet_lora_trainable_parts": tuple(getattr(self, "trainable_unet_lora_parts", ())),
             "stage": stage,
             "timestep_config": timestep_config or {},
             "global_step": global_step,
             "epoch": epoch,
         }
+        if stage in {2, 3, "2", "3"}:
+            sd["event_regularization_mode"] = "legacy_detached_delta_and_head_l2"
         if optimizer is not None:
             sd["optimizer_state_dict"] = optimizer.state_dict()
         if lr_scheduler is not None:
@@ -1070,10 +1138,10 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
         self.regularizer_lora_mode = getattr(
             args, "regularizer_lora_mode", "same_as_generator"
         )
-        if self.regularizer_lora_mode == "event_film":
+        if self.regularizer_lora_mode in {"event_lora", "event_film"}:
             print(
-                "[DEPRECATED] regularizer_lora_mode=event_film is mapped to "
-                "same_as_generator."
+                f"[DEPRECATED] regularizer_lora_mode={self.regularizer_lora_mode} "
+                "is mapped to same_as_generator."
             )
             self.regularizer_lora_mode = "same_as_generator"
         self._shared_event_encoder_ref = [None]
@@ -1143,7 +1211,7 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
     def load_ckpt(self, checkpoint, strict_config=True):
         state = checkpoint.get("state_dict_reg", checkpoint.get("state_dict_unet", {}))
         checkpoint_mode = checkpoint.get("regularizer_lora_mode")
-        if checkpoint_mode == "event_film":
+        if checkpoint_mode in {"event_lora", "event_film"}:
             checkpoint_mode = "same_as_generator"
         if (
             strict_config
@@ -1304,6 +1372,11 @@ class OSEDiffEventFiLMTest(torch.nn.Module):
             ignore_config_mismatch=bool(
                 getattr(args, "resume_ignore_mismatch", False)
             ),
+        )
+        # Stage2/3 测试入口显式提供默认空选择；其他使用此 wrapper 的
+        # Stage4/5 入口继续沿用完整普通 LoRA adapter 组合。
+        self.gen.activate_lora_adapters(
+            getattr(args, "unet_lora_parts", UNET_LORA_PARTS)
         )
         self.gen.eval()
         self.weight_dtype = torch.float16 if getattr(args, "mixed_precision", "fp16") == "fp16" else torch.float32

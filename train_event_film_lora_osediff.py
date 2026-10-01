@@ -17,7 +17,12 @@ from tqdm.auto import tqdm
 
 from dataloaders.sde_event_film_dataset import SDEEventFilmDataset
 from models.event_lora_utils import collect_event_lora_regularization
-from osediff_event_film import OSEDiffEventFiLMGen, OSEDiffEventFiLMReg
+from osediff_event_film import (
+    OSEDiffEventFiLMGen,
+    OSEDiffEventFiLMReg,
+    parse_unet_lora_parts,
+    validate_unet_lora_training_parts,
+)
 
 
 def setup_wandb_ssl_bypass():
@@ -99,6 +104,14 @@ def event_edge_loss(pred, gt, events):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", type=int, choices=[2, 3], default=2)
+    parser.add_argument(
+        "--unet_lora_active_parts", type=parse_unet_lora_parts, default=(),
+        help="训练前向中激活的普通 UNet LoRA 分组：none 或 down,mid,up 的逗号分隔子集；默认 none。",
+    )
+    parser.add_argument(
+        "--unet_lora_trainable_parts", type=parse_unet_lora_parts, default=(),
+        help="训练时解冻的普通 UNet LoRA 分组，须为激活分组的子集；默认 none。Event-LoRA 不受此参数控制。",
+    )
     parser.add_argument("--pretrained_model_name_or_path", type=str, required=True)
     parser.add_argument("--train_data_root", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="experience/event_film_lora_osediff")
@@ -168,7 +181,7 @@ def parse_args():
         "--regularizer_lora_mode",
         type=str,
         default="same_as_generator",
-        choices=["original", "same_as_generator", "event_film"],
+        choices=["original", "same_as_generator", "event_lora", "event_film"],
         help="unet_update 使用普通 PEFT LoRA，或使用与 Generator 同结构但权重独立的 Event-LoRA。",
     )
 
@@ -226,13 +239,19 @@ def parse_args():
 
 
 def main(args):
+    active_parts, trainable_parts = validate_unet_lora_training_parts(
+        args.unet_lora_active_parts, args.unet_lora_trainable_parts
+    )
+    args.unet_lora_active_parts = active_parts
+    args.unet_lora_trainable_parts = trainable_parts
     if not same_timestep_spec(args.generator_train_timestep, args.regularizer_train_timestep):
         raise ValueError(
             "Generator 和 fine-tuned regularizer 的 timestep 参数必须一致，"
             f"got {args.generator_train_timestep} vs {args.regularizer_train_timestep}"
         )
 
-    setup_wandb_ssl_bypass()
+    if "wandb" in args.report_to or args.report_to == "all":
+        setup_wandb_ssl_bypass()
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
     # 每个 Event-LoRA 层都保存多个 event 尺度对应的 1x1 projection，但一次
@@ -241,9 +260,7 @@ def main(args):
     # 后仍有 bucket 未完成归约，第二步 forward 会报
     # "Expected to have finished reduction in the prior iteration"。
     #
-    # 当前 smooth/mod 正则读取的是同一次 forward 产生的 last_aux 张量，这些张量
-    # 与图像重建输出属于同一计算图，不再是独立读取模块参数的额外梯度路径，
-    # 因而可以安全地配合 find_unused_parameters=True。
+    # 旧版 smooth/mod 的调制增量已 detach；mod 中事件头 L2 仍是独立参数梯度路径。
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
