@@ -1,0 +1,53 @@
+# 按 checkpoint 范围评测四项指标
+
+使用新入口 `test_event_film_lora_checkpoint_range.py`。原有
+`test_event_film_lora_osediff.py` 的代码和行为保持不变。
+
+起点、终点、间隔的单位为 k，均须为 10 的整数倍，间隔必须大于 0。
+例如 `--start_k 10 --end_k 100 --interval_k 20` 依次评测
+`model_10000.pkl`、`model_30000.pkl`、`model_50000.pkl`、
+`model_70000.pkl`、`model_90000.pkl`。终点仅在等差序列上时纳入。
+不会额外测试 `model_final.pkl`。
+
+默认测试 `correct,zero`，每个 checkpoint、每个事件模式输出一行总体
+PSNR、SSIM、LPIPS、FID，汇总到输出目录的 `checkpoint_metrics.csv`。
+CSV 另含 step、checkpoint 路径、mode 和样本数以标识结果。
+不保存增强图、输入图、GT 图、调制诊断、逐图或逐场景指标。
+FID 沿用原测试入口的整组图像算法及量化方式，临时图像会在计算后清理。
+
+## zwy 室内 Stage 3 示例
+
+在仓库目录和已经激活的训练环境中运行：
+
+```bash
+python test_event_film_lora_checkpoint_range.py \
+  --training_result_dir /public/home/zhouweiyu/Chen_Project/OSEDiff_project/TrainingWeights/OSEDiff_stage3_10-1-1700 \
+  --start_k 10 --end_k 100 --interval_k 10 \
+  --output_dir /public/home/zhouweiyu/Chen_Project/OSEDiff_project/test_results/indoor_stage3_checkpoint_metrics \
+  --stage 3 \
+  --input_image /public/home/zhouweiyu/Chen_Project/dataset/SDE/indoor/sde_in_release/test \
+  --pretrained_model_name_or_path /public/home/zhouweiyu/Chen_Project/PretrainedModel/stable-diffusion-2-1-base \
+  --unet_lora_parts none \
+  --generator_timestep 500 \
+  --event_bins 5 --event_channels 5 --clora_event_active_bins 5 \
+  --event_lora_variant residual_cross_attn --lora_rank 4 \
+  --mod_channels 64 --modulation_scale 0.1 \
+  --image_size 256 --mixed_precision fp16 \
+  --multi_gpu
+```
+
+双 GPU 模式运行前设置 `CUDA_VISIBLE_DEVICES=0,1`；去掉 `--multi_gpu`
+可在单 GPU 上按模式顺序评测。普通 UNet LoRA 默认为 none，Event-LoRA 始终激活。
+模型配置参数应与待测 checkpoint 一致。
+
+开始推理前检查整个范围的文件，默认缺失任一文件就报告并停止。
+加入 `--skip_missing` 可跳过缺失文件。`--training_result_dir` 也可直接指向
+`checkpoints/` 目录。
+
+每完成一个 checkpoint 即原子更新汇总 CSV；之后的评测失败时保留已经完成的行。
+重新运行会重新评测所选范围并重写汇总，不会自动跳过已有指标。
+仅测 correct 或 zero 时使用 `--ablation_modes correct` 或 `--ablation_modes zero`，
+并去掉 `--multi_gpu`。
+
+范围入口将其他参数传给新建的 `test_event_film_lora_metrics.py`，该文件复用
+原测试入口的模型参数解析及指标定义，强制只计算四项总体指标。
