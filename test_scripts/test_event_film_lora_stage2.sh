@@ -38,6 +38,7 @@ archive_run_context "$OUTPUT_DIR" "${BASH_SOURCE[0]}" stage2 test \
   "PRETRAINED_MODEL=$PRETRAINED_MODEL" "TEST_DATA_ROOT=$TEST_DATA_ROOT" \
   "CHECKPOINT_PATH=$CHECKPOINT_PATH" "OUTPUT_DIR=$OUTPUT_DIR" \
   "EVENT_LORA_VARIANT=${EVENT_LORA_VARIANT:-cbam_lowrank_residual}" \
+  "EVENT_LORA_TARGETS=${EVENT_LORA_TARGETS:-auto}" \
   "IMAGE_SIZE=256" "GENERATOR_TIMESTEP=${GENERATOR_TIMESTEP:-999}" \
   "ABLATION_MODES=${ABLATION_MODES:-correct,zero}"
 
@@ -49,6 +50,7 @@ python test_event_film_lora_osediff.py \
   --osediff_path "$CHECKPOINT_PATH" \
   --generator_timestep "${GENERATOR_TIMESTEP:-999}" \
   --event_lora_variant "${EVENT_LORA_VARIANT:-cbam_lowrank_residual}" \
+  --event_lora_targets "${EVENT_LORA_TARGETS:-auto}" \
   --lora_rank "${LORA_RANK:-4}" \
   --mod_channels "${EVENT_LORA_MOD_CHANNELS:-32}" \
   --modulation_scale "${EVENT_LORA_MODULATION_SCALE:-0.1}" \

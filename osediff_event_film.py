@@ -14,7 +14,7 @@ from safetensors.torch import load_file
 import json
 
 from models.event_encoder import EventEncoder
-from models.event_film_lora import EventLoRAConfig, normalize_event_lora_variant
+from models.event_film_lora import EventLoRAConfig, SpatialRGBEventLoRALinear, normalize_event_lora_variant, parse_event_lora_targets
 from models.event_self_swap_guidance import (
     EventSelfSwapConfig,
     swap_event_feature_tokens,
@@ -31,8 +31,9 @@ from models.event_lora_utils import (
     copy_compatible_state_dict,
     event_lora_state_keys,
     iter_event_lora_modules,
+    migrate_event_lora_state,
     remap_legacy_event_film_state_dict,
-    replace_self_attn_to_v_with_event_lora,
+    replace_self_attn_projections_with_event_lora,
     set_event_feats_for_all_event_lora,
     set_event_lora_trainable,
     set_modulation_enabled_for_all_event_lora,
@@ -82,8 +83,23 @@ def _is_unet_lora_parameter_name(name):
 
 
 def _event_lora_config_from_args(args):
+    targets = parse_event_lora_targets(getattr(args, "event_lora_targets", "auto"), allow_auto=True)
+    if targets == "auto":
+        source = next((getattr(args, key, None) for key in (
+            "osediff_path", "event_lora_checkpoint", "resume_from_checkpoint",
+            "init_from_event_checkpoint",
+        ) if getattr(args, key, None) not in (None, "latest")), None)
+        if source:
+            try:
+                checkpoint = torch.load(source, map_location="cpu", weights_only=False)
+            except TypeError:
+                checkpoint = torch.load(source, map_location="cpu")
+            targets = _checkpoint_event_lora_config(checkpoint).targets
+        else:
+            targets = ("v",)
     return EventLoRAConfig(
         variant=getattr(args, "event_lora_variant", "film_affine"),
+        targets=targets,
         rank=args.lora_rank,
         alpha=float(args.lora_rank),
         mod_channels=getattr(args, "mod_channels", 32),
@@ -102,6 +118,10 @@ def _checkpoint_event_lora_config(checkpoint):
         # 旧 idea2 checkpoint 只有 Event-FiLM，因此缺少配置时按 film_affine 解释。
         return EventLoRAConfig(variant="film_affine")
     config = dict(config)
+    metadata = checkpoint.get("event_lora_metadata") or {}
+    if "targets" in metadata and "targets" in config and tuple(metadata["targets"]) != tuple(config["targets"]):
+        raise ValueError("Checkpoint Event-LoRA target metadata contradicts its config.")
+    config.setdefault("targets", metadata.get("targets", ("v",)))
     legacy_variant = checkpoint.get("event_lora_variant")
     config.setdefault("variant", normalize_event_lora_variant(legacy_variant or "film_affine"))
     rank = int(checkpoint.get("rank_unet", config.get("rank", 4)))
@@ -112,6 +132,75 @@ def _checkpoint_event_lora_config(checkpoint):
         "residual_cross_attn", "residual_cross_attn_bax"
     } else 32)
     return EventLoRAConfig(**config)
+
+
+def _event_checkpoint_state(checkpoint):
+    return remap_legacy_event_film_state_dict(checkpoint.get(
+        "state_dict_unet", checkpoint.get("state_dict_unet_event_lora", {})
+    ))
+
+
+def _validate_checkpoint_target_evidence(checkpoint, config, state):
+    suffixes = {"q": "attn1.to_q", "k": "attn1.to_k",
+                "v": "attn1.to_v", "out": "attn1.to_out.0"}
+    actual = set()
+    for key in state:
+        if not key.endswith(".lora_down.weight"):
+            continue
+        path = key[:-len(".lora_down.weight")]
+        actual.update(target for target, suffix in suffixes.items() if path.endswith(suffix))
+    declared = set(config.targets)
+    if actual != declared:
+        raise ValueError(f"Checkpoint Event-LoRA targets contradict weights: declared={sorted(declared)}, present={sorted(actual)}")
+    replaced = checkpoint.get("event_film_replaced_names") or []
+    for path in replaced:
+        target = next((target for target, suffix in suffixes.items() if path.endswith(suffix)), None)
+        if target not in declared:
+            raise ValueError(f"Checkpoint replaced_names contradict targets: {path}")
+    metadata = checkpoint.get("event_lora_metadata") or {}
+    expected_layout = ("per_projection_per_scale" if config.variant in {
+        "residual_cross_attn", "residual_cross_attn_bax"
+    } else "per_module")
+    if metadata and metadata.get("shared_heads") != expected_layout:
+        raise ValueError(f"Unsupported Event-LoRA shared-head layout: {metadata.get('shared_heads')}")
+
+
+def _validate_layer_scaling(unet, checkpoint):
+    layers = (checkpoint.get("event_lora_metadata") or {}).get("layers") or {}
+    modules = dict(iter_event_lora_modules(unet))
+    for name, source in layers.items():
+        module = modules.get(name)
+        if module is None:
+            continue
+        if int(source["rank"]) != module.rank or abs(float(source["scaling"]) - module.scaling) > 1e-6:
+            raise ValueError(f"Event-LoRA rank/scaling mismatch at {name}: checkpoint={source}, runtime={(module.rank, module.scaling)}")
+
+
+def _assert_event_checkpoint_keys(unet, state, replaced_names, new_targets=()):
+    """Event A/B and existing modulation heads must never be silently skipped."""
+    expected = unet.state_dict()
+    prefixes = tuple(name + "." for name in replaced_names)
+    new_names = {name for name, module in iter_event_lora_modules(unet) if module.projection in new_targets}
+    critical = [key for key in expected if key.startswith(prefixes) and (
+        ".lora_down." in key or ".lora_up." in key or
+        (".modulator." in key and not any(key.startswith(name + ".") for name in new_names))
+    )]
+    critical += [key for key in expected if "_event_lora_shared_heads_" in key and not any(
+        key.startswith(f"_event_lora_shared_heads_{variant}_{target}.") or
+        (target == "v" and key.startswith(f"_event_lora_shared_heads_{variant}."))
+        for target in new_targets for variant in ("residual_cross_attn", "residual_cross_attn_bax")
+    )]
+    missing = [key for key in critical if key not in state]
+    mismatched = [key for key in critical if key in state and expected[key].shape != state[key].shape]
+    unexpected = [key for key in state if (
+        ".lora_down." in key or ".lora_up." in key or
+        ".modulator." in key or "_event_lora_shared_heads_" in key
+    ) and key not in expected]
+    if missing or mismatched or unexpected:
+        raise RuntimeError(
+            "Event-LoRA checkpoint is structurally incomplete: "
+            f"missing={missing[:12]}, shape_mismatch={mismatched[:12]}, unexpected={unexpected[:12]}"
+        )
 
 
 def resolve_decoder_refinement_variant(value, checkpoint_path=None):
@@ -165,6 +254,7 @@ def resolve_decoder_refinement_args(args, checkpoint_path):
 def _validate_event_lora_config(runtime_config, checkpoint_config, context):
     structural_keys = (
         "variant",
+        "targets",
         "rank",
         "alpha",
         "mod_channels",
@@ -236,6 +326,12 @@ def _unet_cross_attention_dtype(unet, default=torch.float32):
     return default
 
 
+def _keep_event_features_for_checkpoint_backward(unet):
+    return torch.is_grad_enabled() and any(
+        getattr(module, "gradient_checkpointing", False) for module in unet.modules()
+    )
+
+
 @dataclass
 class DenoisingContext:
     """同一图像的 RGB latent、文本条件与原始 event features，供公平 sweep 复用。"""
@@ -259,7 +355,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
     作用：
     - 复用原 OSEDiff 的 VAE、Text Encoder、UNet 与 scheduler；
     - 保留完整 Stage1 可兼容权重；
-    - 将 self-attention 的 attn1.to_v 替换成事件调制 LoRA。
+    - 将选中的 self-attention Q/K/V/out 投影替换成事件调制 LoRA。
     """
 
     def __init__(self, args):
@@ -399,7 +495,17 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
 
         # initialize_unet 注册了三组 PEFT adapter，但 add_adapter 不保证它们同时
         # 处于 active 状态。未激活的 adapter 不会进入 forward，也不会得到梯度。
-        self.activate_lora_adapters()
+        requested_active = getattr(self.args, "unet_lora_active_parts", None)
+        requested_trainable = getattr(self.args, "unet_lora_trainable_parts", None)
+        if requested_active is None and requested_trainable is None:
+            active_parts = trainable_parts = UNET_LORA_PARTS
+        else:
+            active_parts, trainable_parts = validate_unet_lora_training_parts(
+                UNET_LORA_PARTS if requested_active is None else requested_active,
+                () if requested_trainable is None else requested_trainable,
+            )
+        self.activate_lora_adapters(active_parts)
+        self.trainable_unet_lora_parts = trainable_parts
 
         # 先统一冻结，避免 Stage1/Stage3 的 requires_grad 状态泄漏到 Stage5。
         self.requires_grad_(False)
@@ -409,10 +515,13 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         self.text_encoder.eval()
         self.rgb_event_encoder.eval()
 
-        # 解冻 UNet 中所有 PEFT/Event-LoRA 参数，但不解冻 base UNet 权重。
+        # PEFT A/B follow the independent ordinary-LoRA selection.
+        selected_adapters = {_UNET_LORA_ADAPTERS[part] for part in trainable_parts}
         for name, parameter in self.unet.named_parameters():
-            if "lora_" in name:
-                parameter.requires_grad_(True)
+            if "lora_A." in name or "lora_B." in name:
+                marker = "lora_A." if "lora_A." in name else "lora_B."
+                adapter = name.split(marker, 1)[1].split(".", 1)[0]
+                parameter.requires_grad_(adapter in selected_adapters)
         set_event_lora_trainable(
             self.unet,
             train_lora=True,
@@ -421,7 +530,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         set_modulation_enabled_for_all_event_lora(self.unet, True)
 
         # EventEncoder 是 Stage2/3 已训练的事件条件分支，Stage5 继续联合适配。
-        self.event_encoder.requires_grad_(True)
+        self.event_encoder.requires_grad_(bool(self.event_lora_config.targets))
 
         # VAE 只开放 encoder LoRA；原始 decoder backbone 保持冻结。
         for name, parameter in self.vae.named_parameters():
@@ -472,21 +581,32 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             stray.append(name)
         if stray:
             raise RuntimeError(f"Unexpected Stage5 trainable parameters: {stray}")
+        print(f"[Stage5 LoRA] active={active_parts}, trainable={trainable_parts}, "
+              f"parameters={self.trainable_parameter_summary()}")
         return trainable
 
     def install_event_lora(self):
         if self.event_film_installed:
             return 0, self.event_film_replaced_names
-        num_replaced, names = replace_self_attn_to_v_with_event_lora(
+        num_replaced, names = replace_self_attn_projections_with_event_lora(
             self.unet,
             config=self.event_lora_config,
             event_channels_by_size=self.event_encoder.out_channels_by_size,
         )
         self.event_film_installed = True
         self.event_film_replaced_names = names
+        self.event_film_replaced_by_target = {
+            target: [name for name in names if name.endswith({
+                "q": "attn1.to_q", "k": "attn1.to_k", "v": "attn1.to_v",
+                "out": "attn1.to_out.0",
+            }[target])]
+            for target in ("q", "k", "v", "out")
+        }
+        counts = {target: len(paths) for target, paths in self.event_film_replaced_by_target.items()}
         print(
             f"[Event-LoRA:{self.event_lora_config.variant}] "
-            f"Replaced {num_replaced} self-attn to_v layer(s)."
+            f"targets={','.join(self.event_lora_config.targets) or 'none'}; "
+            f"replaced={counts}; shared_heads={('per_projection_per_scale' if self.event_lora_config.variant in {'residual_cross_attn', 'residual_cross_attn_bax'} else 'per_module')}."
         )
         for name in names[:20]:
             print(f"[Event-LoRA]   {name}")
@@ -497,11 +617,11 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
 
     def load_stage1_full(self, checkpoint_path):
         """
-        完整加载 Stage1 中可兼容权重，然后迁移 attn1.to_v LoRA 到 Event-FiLM 模块。
+        完整加载 Stage1 中可兼容权重，然后迁移选中投影的普通 LoRA 到 Event-LoRA。
 
         加载顺序很关键：
         1. 先把 Stage1 的 PEFT LoRA/conv_in/VAE LoRA 加到原始结构；
-        2. 再替换 attn1.to_v，此时替换工具会复制已经加载好的 LoRA A/B。
+        2. 再替换选中投影，此时替换工具会复制已经加载好的 LoRA A/B。
         """
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         unet_loaded, unet_skipped = _load_compatible_named_parameters(
@@ -533,7 +653,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         self.unet.requires_grad_(False)
         self.vae.requires_grad_(False)
         self.text_encoder.requires_grad_(False)
-        self.event_encoder.requires_grad_(stage in {2, 3, "2", "3"})
+        self.event_encoder.requires_grad_(bool(self.event_lora_config.targets) and stage in {2, 3, "2", "3"})
         if stage in {2, 3, "2", "3"}:
             selected_adapters = {
                 _UNET_LORA_ADAPTERS[part] for part in self.trainable_unet_lora_parts
@@ -561,6 +681,30 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             self.event_encoder.requires_grad_(False)
             set_event_lora_trainable(self.unet, train_lora=True, train_modulation=False)
             set_modulation_enabled_for_all_event_lora(self.unet, False)
+        if stage in {2, 3, "2", "3"} and not any(p.requires_grad for p in self.unet.parameters()) and not any(p.requires_grad for p in self.event_encoder.parameters()):
+            raise RuntimeError("No generator parameters participate in training: Event-LoRA targets and ordinary LoRA trainable parts are both none.")
+        if stage in {2, 3, "2", "3"}:
+            print(f"[Event-LoRA] A/B trainable={stage in {3, '3'}}; "
+                  f"parameter_groups={self.trainable_parameter_summary()}")
+
+    def trainable_parameter_summary(self):
+        event_ab = {id(param) for _, module in iter_event_lora_modules(self.unet)
+                    for param in (*module.lora_down.parameters(), *module.lora_up.parameters())}
+        summary = {"ordinary_ab": 0, "event_ab": 0, "event_heads": 0,
+                   "event_encoder": 0}
+        for name, param in self.unet.named_parameters():
+            if not param.requires_grad:
+                continue
+            if id(param) in event_ab:
+                key = "event_ab"
+            elif "lora_A." in name or "lora_B." in name:
+                key = "ordinary_ab"
+            else:
+                key = "event_heads"
+            summary[key] += param.numel()
+        summary["event_encoder"] = sum(param.numel() for param in self.event_encoder.parameters()
+                                       if param.requires_grad)
+        return summary
 
     def get_lora_params(self):
         params = []
@@ -603,7 +747,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         encoded_control = self.vae.encode(c_t).latent_dist.sample() * self.vae.config.scaling_factor
         prompt_embeds = self.encode_prompt(batch["prompt"])
         neg_prompt_embeds = self.encode_prompt(batch["neg_prompt"])
-        event_feats = self.event_encoder(events)
+        event_feats = self.event_encoder(events) if self.event_lora_config.targets else {}
         return DenoisingContext(
             encoded_control=encoded_control,
             prompt_embeds=prompt_embeds,
@@ -620,13 +764,17 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         )
         set_event_feats_for_all_event_lora(self.unet, event_feats)
         try:
-            return self.unet(
+            result = self.unet(
                 encoded_control,
                 timesteps,
                 encoder_hidden_states=prompt_embeds.to(dtype=cross_attn_dtype),
             ).sample
-        finally:
+        except BaseException:
             clear_event_feats_for_all_event_lora(self.unet)
+            raise
+        if not _keep_event_features_for_checkpoint_backward(self.unet):
+            clear_event_feats_for_all_event_lora(self.unet)
+        return result
 
     @staticmethod
     def _paired_timesteps(timesteps, batch_size):
@@ -914,6 +1062,19 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             "state_dict_vae": {k: v for k, v in self.vae.state_dict().items() if "lora" in k},
             "state_dict_event_encoder": self.event_encoder.state_dict(),
             "event_lora_config": self.event_lora_config.to_dict(),
+            "event_lora_metadata": {
+                "version": 2,
+                "targets": tuple(self.event_lora_config.targets),
+                "shared_heads": ("per_projection_per_scale" if self.event_lora_config.variant in {
+                    "residual_cross_attn", "residual_cross_attn_bax"
+                } else "per_module"),
+                "replaced_by_target": getattr(self, "event_film_replaced_by_target", {}),
+                "layers": {
+                    name: {"projection": module.projection, "rank": module.rank,
+                           "alpha": module.lora_alpha, "scaling": module.scaling}
+                    for name, module in iter_event_lora_modules(self.unet)
+                },
+            },
             "event_lora_variant": self.event_lora_config.variant,
             "event_film_replaced_names": self.event_film_replaced_names,
             "train_unet_lora_active_parts": tuple(getattr(self, "active_unet_lora_parts", ())),
@@ -1035,21 +1196,42 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         print(f"[Idea3 Load] decoder_refinement loaded={loaded}, skipped={skipped}")
         return loaded, skipped
 
-    def load_event_checkpoint(self, checkpoint, ignore_config_mismatch=False):
+    def load_event_checkpoint(self, checkpoint, ignore_config_mismatch=False, migrate_targets=False):
         checkpoint_config = _checkpoint_event_lora_config(checkpoint)
+        if checkpoint_config.targets != self.event_lora_config.targets and not migrate_targets:
+            raise ValueError(
+                f"Event-LoRA targets mismatch: runtime={self.event_lora_config.targets}, "
+                f"checkpoint={checkpoint_config.targets}. Use weights-only initialization for migration."
+            )
         if ignore_config_mismatch:
             print("[Event-LoRA Load] config mismatch checks are explicitly disabled.")
         else:
-            _validate_event_lora_config(
-                self.event_lora_config, checkpoint_config, context="Generator"
-            )
+            if not migrate_targets:
+                _validate_event_lora_config(
+                    self.event_lora_config, checkpoint_config, context="Generator"
+                )
+            else:
+                _validate_event_lora_config(
+                    EventLoRAConfig(**{**self.event_lora_config.to_dict(), "targets": checkpoint_config.targets}),
+                    checkpoint_config, context="Generator migration",
+                )
         self.install_event_lora()
-        unet_state = remap_legacy_event_film_state_dict(
-            checkpoint.get(
-                "state_dict_unet",
-                checkpoint.get("state_dict_unet_event_lora", {}),
+        unet_state = _event_checkpoint_state(checkpoint)
+        _validate_checkpoint_target_evidence(checkpoint, checkpoint_config, unet_state)
+        _validate_layer_scaling(self.unet, checkpoint)
+        if migrate_targets and checkpoint_config.targets != self.event_lora_config.targets:
+            unet_state, report = migrate_event_lora_state(
+                self.unet, unet_state, checkpoint_config.targets,
+                self.event_lora_config.targets,
+                (checkpoint.get("event_lora_metadata") or {}).get("layers"),
             )
-        )
+            print(f"[Event-LoRA migration] {report}")
+            _assert_event_checkpoint_keys(
+                self.unet, unet_state, self.event_film_replaced_names,
+                new_targets=set(self.event_lora_config.targets) - set(checkpoint_config.targets),
+            )
+        else:
+            _assert_event_checkpoint_keys(self.unet, unet_state, self.event_film_replaced_names)
         unet_loaded, unet_skipped = copy_compatible_state_dict(
             self.unet, unet_state
         )
@@ -1074,8 +1256,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
                 checkpoint,
                 ignore_mismatch=ignore_config_mismatch,
             )
-        # 测试模型也必须激活完整 adapter 组合，否则 Stage5 LoRA 权重会被遗漏。
-        self.activate_lora_adapters()
+        # The caller applies its own training/inference ordinary-LoRA policy.
 
 
 class OSEDiffEventFiLMReg(torch.nn.Module):
@@ -1180,7 +1361,7 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
         if self.event_lora_config is None:
             raise RuntimeError("Generator EventLoRAConfig has not been shared.")
         event_encoder = self.get_shared_event_encoder()
-        num_replaced, names = replace_self_attn_to_v_with_event_lora(
+        num_replaced, names = replace_self_attn_projections_with_event_lora(
             self.unet_update,
             config=self.event_lora_config,
             event_channels_by_size=event_encoder.out_channels_by_size,
@@ -1189,7 +1370,7 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
         self.event_film_replaced_names = names
         print(
             f"[Reg Event-LoRA:{self.event_lora_config.variant}] "
-            f"Replaced {num_replaced} self-attn to_v layer(s)."
+            f"targets={','.join(self.event_lora_config.targets) or 'none'}; replaced={num_replaced}."
         )
         for name in names[:20]:
             print(f"[Reg Event-LoRA]   {name}")
@@ -1208,7 +1389,7 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
             set_event_lora_trainable(self.unet_update, train_lora=True, train_modulation=True)
             set_modulation_enabled_for_all_event_lora(self.unet_update, True)
 
-    def load_ckpt(self, checkpoint, strict_config=True):
+    def load_ckpt(self, checkpoint, strict_config=True, migrate_targets=False):
         state = checkpoint.get("state_dict_reg", checkpoint.get("state_dict_unet", {}))
         checkpoint_mode = checkpoint.get("regularizer_lora_mode")
         if checkpoint_mode in {"event_lora", "event_film"}:
@@ -1233,6 +1414,21 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
                 "only compatible LoRA weights will be initialized."
             )
         checkpoint_config_dict = checkpoint.get("regularizer_event_lora_config")
+        if (migrate_targets and checkpoint_config_dict and self.event_lora_config is not None
+                and EventLoRAConfig(**checkpoint_config_dict).variant != self.event_lora_config.variant):
+            raise ValueError("Regularizer Event-LoRA variant cannot change during target migration.")
+        source_targets = EventLoRAConfig(**checkpoint_config_dict).targets if checkpoint_config_dict else ("v",)
+        regularizer_metadata = checkpoint.get("regularizer_event_lora_metadata") or {}
+        if regularizer_metadata and tuple(regularizer_metadata.get("targets", ())) != tuple(source_targets):
+            raise ValueError("Regularizer checkpoint targets contradict its config.")
+        if regularizer_metadata and self.event_lora_config is not None:
+            layout = ("per_projection_per_scale" if self.event_lora_config.variant in {
+                "residual_cross_attn", "residual_cross_attn_bax"
+            } else "per_module")
+            if regularizer_metadata.get("shared_heads") != layout:
+                raise ValueError("Regularizer Event-LoRA shared-head layout mismatch.")
+        if (strict_config or not migrate_targets) and self.regularizer_lora_mode == "same_as_generator" and self.event_lora_config is not None and any(".lora_down." in key for key in state) and source_targets != self.event_lora_config.targets:
+            raise ValueError(f"Regularizer Event-LoRA targets mismatch: {source_targets} -> {self.event_lora_config.targets}")
         if (
             strict_config
             and checkpoint_config_dict is not None
@@ -1250,6 +1446,18 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
         )
         if self.regularizer_lora_mode == "same_as_generator" and has_event_film_state:
             self.install_event_lora()
+            if migrate_targets and source_targets != self.event_lora_config.targets:
+                state, report = migrate_event_lora_state(
+                    self.unet_update, state, source_targets, self.event_lora_config.targets,
+                    regularizer_metadata.get("layers"),
+                )
+                print(f"[Reg Event-LoRA migration] {report}")
+                _assert_event_checkpoint_keys(
+                    self.unet_update, state, self.event_film_replaced_names,
+                    new_targets=set(self.event_lora_config.targets) - set(source_targets),
+                )
+            else:
+                _assert_event_checkpoint_keys(self.unet_update, state, self.event_film_replaced_names)
             loaded, skipped = copy_compatible_state_dict(self.unet_update, state)
         elif self.regularizer_lora_mode == "same_as_generator":
             # 普通 LoRA checkpoint：先加载 unet_update，再按 Generator variant 替换。
@@ -1273,6 +1481,18 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
         }
 
     def checkpoint_state(self):
+        active = getattr(self.unet_update, "active_adapters", ())
+        if callable(active):
+            active = active()
+        if isinstance(active, str):
+            active = (active,)
+        active = active or ()
+        trainable = sorted({
+            name.split(marker, 1)[1].split(".", 1)[0]
+            for name, param in self.unet_update.named_parameters()
+            for marker in ("lora_A.", "lora_B.")
+            if param.requires_grad and marker in name
+        })
         state = {
             "state_dict_reg": self.state_dict_reg(),
             "regularizer_lora_mode": self.regularizer_lora_mode,
@@ -1281,12 +1501,29 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
                 if self.regularizer_lora_mode == "same_as_generator"
                 else None
             ),
+            "regularizer_event_lora_metadata": (
+                {
+                    "version": 2,
+                    "targets": tuple(self.event_lora_config.targets),
+                    "shared_heads": ("per_projection_per_scale" if self.event_lora_config.variant in {
+                        "residual_cross_attn", "residual_cross_attn_bax"
+                    } else "per_module"),
+                    "replaced_names": tuple(self.event_film_replaced_names),
+                    "layers": {
+                        name: {"rank": module.rank, "scaling": module.scaling}
+                        for name, module in iter_event_lora_modules(self.unet_update)
+                    },
+                }
+                if self.regularizer_lora_mode == "same_as_generator" else None
+            ),
             "reg_event_film_replaced_names": self.event_film_replaced_names,
+            "regularizer_ordinary_lora_active_adapters": tuple(active),
+            "regularizer_ordinary_lora_trainable_adapters": tuple(trainable),
         }
         return state
 
     def _predict_with_update_unet(self, noisy_latents, timesteps, prompt_embeds, events):
-        if self.regularizer_lora_mode != "same_as_generator":
+        if self.regularizer_lora_mode != "same_as_generator" or not self.event_lora_config.targets:
             return self.unet_update(
                 noisy_latents,
                 timestep=timesteps,
@@ -1298,13 +1535,17 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
         event_feats = {key: value.detach() for key, value in event_feats.items()}
         set_event_feats_for_all_event_lora(self.unet_update, event_feats)
         try:
-            return self.unet_update(
+            result = self.unet_update(
                 noisy_latents,
                 timestep=timesteps,
                 encoder_hidden_states=prompt_embeds,
             ).sample
-        finally:
+        except BaseException:
             clear_event_feats_for_all_event_lora(self.unet_update)
+            raise
+        if not _keep_event_features_for_checkpoint_backward(self.unet_update):
+            clear_event_feats_for_all_event_lora(self.unet_update)
+        return result
 
     def diff_loss(self, latents, prompt_embeds, timesteps, events):
         latents, prompt_embeds = latents.detach(), prompt_embeds.detach()

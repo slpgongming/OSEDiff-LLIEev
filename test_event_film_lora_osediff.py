@@ -15,6 +15,7 @@ from torchvision import transforms
 
 from dataloaders.sde_event_film_dataset import SDEEventFilmDataset
 from osediff_event_film import OSEDiffEventFiLMTest, parse_unet_lora_parts
+from models.event_film_lora import parse_event_lora_targets
 
 
 METRIC_NAMES = ("psnr", "ssim", "lpips")
@@ -339,6 +340,8 @@ def build_summary_rows(stats_by_mode, modes, include_scene):
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--event_lora_targets", type=lambda value: parse_event_lora_targets(value, allow_auto=True), default="auto",
+                        help="auto reads the Event checkpoint; otherwise select none, all, or a q,k,v,out subset.")
     parser.add_argument("--stage", type=int, choices=[2, 3], default=2,
         help="Stage label for logging/output semantics; checkpoint content is selected by --osediff_path.")
     parser.add_argument(

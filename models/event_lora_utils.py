@@ -9,12 +9,22 @@ from models.event_film_lora import (
     SpatialRGBEventLoRALinear,
 )
 
+SELF_ATTN_PROJECTIONS = {
+    "q": "attn1.to_q", "k": "attn1.to_k",
+    "v": "attn1.to_v", "out": "attn1.to_out.0",
+}
+ADAPTER_BY_BLOCK = {
+    "down_blocks": "default_encoder",
+    "mid_block": "default_others",
+    "up_blocks": "default_decoder",
+}
+
 
 def get_parent_module(root, module_name):
     parts = module_name.split(".")
     parent = root
     for part in parts[:-1]:
-        parent = getattr(parent, part)
+        parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
     return parent, parts[-1]
 
 
@@ -28,27 +38,32 @@ def iter_event_lora_modules(model):
 iter_event_film_lora_modules = iter_event_lora_modules
 
 
-def _first_lora_adapter(module):
-    if not hasattr(module, "lora_A"):
-        return None
-    keys = list(module.lora_A.keys())
-    return keys[0] if keys else None
-
-
-def _extract_peft_linear(module):
+def _extract_peft_linear(module, adapter):
     """提取冻结 base Linear 和已加载的 PEFT LoRA A/B，供 Event-LoRA 无损迁移。"""
     if hasattr(module, "base_layer"):
         base_linear = copy.deepcopy(module.base_layer)
-        adapter = _first_lora_adapter(module)
-        if adapter is None:
-            return base_linear, None, None, None
+        if not isinstance(base_linear, nn.Linear):
+            raise TypeError(f"Event-LoRA needs a Linear base layer, got {type(base_linear)}")
+        if not hasattr(module, "lora_A") or set(module.lora_A) != {adapter} or set(module.lora_B) != {adapter}:
+            raise ValueError(f"Expected exactly one complete PEFT adapter {adapter}; got {list(getattr(module, 'lora_A', {}))}")
+        if getattr(module, "merged", False) or getattr(module, "use_dora", {}).get(adapter, False):
+            raise ValueError("Merged or DoRA PEFT layers cannot be converted losslessly.")
+        dropouts = getattr(module, "lora_dropout", {})
+        dropout = dropouts[adapter] if adapter in dropouts else None
+        if dropout is not None and not isinstance(dropout, nn.Identity) and getattr(dropout, "p", 0) != 0:
+            raise ValueError("Event-LoRA conversion requires lora_dropout=0.")
         lora_a = module.lora_A[adapter].weight.detach().clone()
         lora_b = module.lora_B[adapter].weight.detach().clone()
+        if lora_a.shape != (lora_a.shape[0], base_linear.in_features) or lora_b.shape != (base_linear.out_features, lora_a.shape[0]):
+            raise ValueError(f"Invalid PEFT A/B shapes: {tuple(lora_a.shape)}, {tuple(lora_b.shape)}")
         alpha = module.lora_alpha[adapter] if hasattr(module, "lora_alpha") else lora_a.shape[0]
+        scaling = float(module.scaling[adapter])
+        if abs(float(alpha) / lora_a.shape[0] - scaling) > 1e-6:
+            raise ValueError(f"Unsupported PEFT scaling {scaling}; expected alpha/r.")
         return base_linear, lora_a, lora_b, alpha
     if isinstance(module, nn.Linear):
         return copy.deepcopy(module), None, None, None
-    raise TypeError(f"Unsupported to_v module type: {type(module)}")
+    raise TypeError(f"Unsupported self-attention projection type: {type(module)}")
 
 
 def _infer_bax_query_channels_by_size(unet, event_channels_by_size):
@@ -69,51 +84,88 @@ def _infer_bax_query_channels_by_size(unet, event_channels_by_size):
     return {str(size): channels for size, channels in zip(sizes, block_channels)}
 
 
-def replace_self_attn_to_v_with_event_lora(unet, config, event_channels_by_size):
-    """只替换图像 self-attention 的 `attn1.to_v`，不触碰文本 cross-attention。"""
-    replaced_names = []
-    shared_residual_heads = None
-    if config.variant in {"residual_cross_attn", "residual_cross_attn_bax"}:
-        shared_attr = f"_event_lora_shared_heads_{config.variant}"
-        shared_residual_heads = getattr(unet, shared_attr, None)
-        if shared_residual_heads is None:
-            query_channels_by_size = None
-            if config.variant == "residual_cross_attn_bax":
-                query_channels_by_size = _infer_bax_query_channels_by_size(
-                    unet, event_channels_by_size
-                )
-            shared_residual_heads = SharedResidualEventHeads(
-                config=config,
-                event_channels_by_size=event_channels_by_size,
-                query_channels_by_size=query_channels_by_size,
-            )
-            setattr(unet, shared_attr, shared_residual_heads)
+def replace_self_attn_projections_with_event_lora(unet, config, event_channels_by_size):
+    """Validate all selected self-attention PEFT layers before changing the UNet."""
+    targets = tuple(config.targets)
+    existing = {module.projection for _, module in iter_event_lora_modules(unet)}
+    if existing:
+        if existing != set(targets):
+            raise ValueError(f"Event-LoRA already installed for {sorted(existing)}; cannot switch to {targets}.")
+        return 0, []
+    candidates = []
     for name, module in list(unet.named_modules()):
-        if not name.endswith("attn1.to_v"):
-            continue
-        base_linear, lora_a, lora_b, alpha = _extract_peft_linear(module)
+        for target in targets:
+            suffix = SELF_ATTN_PROJECTIONS[target]
+            if name.endswith(suffix) and (name == suffix or name[-len(suffix)-1] == "."):
+                block = name.split(".", 1)[0]
+                if block not in ADAPTER_BY_BLOCK and not isinstance(module, nn.Linear):
+                    raise ValueError(f"Cannot identify PEFT adapter for {name}.")
+                base, lora_a, lora_b, alpha = _extract_peft_linear(module, ADAPTER_BY_BLOCK.get(block))
+                candidates.append((name, module, target, base, lora_a, lora_b, alpha))
+                break
+    if targets and not candidates:
+        raise ValueError(f"No self-attention projections found for {targets}.")
+    found = {item[2] for item in candidates}
+    if set(targets) != found:
+        raise ValueError(f"Missing selected Event-LoRA projections: {set(targets) - found}.")
+
+    shared = {}
+    pending_heads = {}
+    if config.variant in {"residual_cross_attn", "residual_cross_attn_bax"}:
+        for target in targets:
+            rows = [item for item in candidates if item[2] == target]
+            ranks = {item[4].shape[0] if item[4] is not None else config.rank for item in rows}
+            out_channels = {item[3].out_features for item in rows}
+            if len(ranks) != 1:
+                raise ValueError(f"Shared head dimensions differ for {target}: ranks={ranks}, outputs={out_channels}.")
+            if target == "v":
+                attr = f"_event_lora_shared_heads_{config.variant}"
+            else:
+                attr = f"_event_lora_shared_heads_{config.variant}_{target}"
+            head_config = EventLoRAConfig(**{**config.to_dict(), "rank": ranks.pop()})
+            query_channels = None
+            if config.variant == "residual_cross_attn_bax":
+                query_channels = _infer_bax_query_channels_by_size(unet, event_channels_by_size)
+                if not set(out_channels).issubset(set(query_channels.values())):
+                    raise ValueError(f"BAx shared head cannot represent {target} outputs {out_channels}.")
+            head = SharedResidualEventHeads(head_config, event_channels_by_size, query_channels)
+            head.to(device=rows[0][3].weight.device, dtype=rows[0][3].weight.dtype)
+            pending_heads[attr] = head
+            shared[target] = head
+
+    prepared = []
+    for name, original, target, base, lora_a, lora_b, alpha in candidates:
         effective_rank = lora_a.shape[0] if lora_a is not None else config.rank
-        layer_config = EventLoRAConfig(
-            **{
-                **config.to_dict(),
-                "rank": effective_rank,
-                "alpha": float(alpha if alpha is not None else effective_rank),
-            }
-        )
+        layer_config = EventLoRAConfig(**{
+            **config.to_dict(), "rank": effective_rank,
+            "alpha": float(alpha if alpha is not None else effective_rank),
+        })
         event_lora = SpatialRGBEventLoRALinear(
-            base_linear=base_linear,
-            config=layer_config,
-            event_channels_by_size=event_channels_by_size,
-            shared_residual_heads=shared_residual_heads,
+            base, layer_config, event_channels_by_size,
+            shared_residual_heads=shared.get(target), projection=target,
         )
+        event_lora.to(device=base.weight.device, dtype=base.weight.dtype)
         if lora_a is not None:
             event_lora.lora_down.weight.data.copy_(lora_a)
-        if lora_b is not None:
             event_lora.lora_up.weight.data.copy_(lora_b)
-        parent, child_name = get_parent_module(unet, name)
-        setattr(parent, child_name, event_lora)
+        prepared.append((name, event_lora))
+    for attr, head in pending_heads.items():
+        setattr(unet, attr, head)
+    replaced_names = []
+    for name, event_lora in prepared:
+        parent, child = get_parent_module(unet, name)
+        if child.isdigit():
+            parent[int(child)] = event_lora
+        else:
+            setattr(parent, child, event_lora)
         replaced_names.append(name)
     return len(replaced_names), replaced_names
+
+
+def replace_self_attn_to_v_with_event_lora(unet, config, event_channels_by_size):
+    """Legacy V-only API, independent of the caller's new target selection."""
+    v_config = EventLoRAConfig(**{**config.to_dict(), "targets": ("v",)})
+    return replace_self_attn_projections_with_event_lora(unet, v_config, event_channels_by_size)
 
 
 def replace_self_attn_to_v_with_event_film_lora(
@@ -134,6 +186,55 @@ def replace_self_attn_to_v_with_event_film_lora(
     return replace_self_attn_to_v_with_event_lora(
         unet, config, event_channels_by_size or {}
     )
+
+
+def migrate_event_lora_state(unet, source_state, source_targets, destination_targets,
+                             source_layer_metadata=None):
+    """Map A/B between PEFT and Event projections at the same logical path."""
+    migrated = dict(source_state)
+    source_layer_metadata = source_layer_metadata or {}
+    report = {"ordinary_to_event": [], "event_to_ordinary": [], "event_to_event": []}
+    for name, module in unet.named_modules():
+        target = getattr(module, "projection", None)
+        if not isinstance(module, SpatialRGBEventLoRALinear):
+            target = next((key for key, suffix in SELF_ATTN_PROJECTIONS.items()
+                           if name.endswith(suffix)), None)
+            if target not in source_targets or target in destination_targets or not hasattr(module, "lora_A"):
+                continue
+            pairs = (("lora_down.weight", "lora_A"), ("lora_up.weight", "lora_B"))
+            direction = "event_to_ordinary"
+        elif target not in source_targets:
+            pairs = (("lora_A", "lora_down.weight"), ("lora_B", "lora_up.weight"))
+            direction = "ordinary_to_event"
+        else:
+            report["event_to_event"].append(name)
+            continue
+        block = name.split(".", 1)[0]
+        if block not in ADAPTER_BY_BLOCK:
+            raise ValueError(f"Unknown adapter block for migration: {name}")
+        adapter = ADAPTER_BY_BLOCK[block]
+        if direction == "event_to_ordinary" and name in source_layer_metadata:
+            source = source_layer_metadata[name]
+            rank = module.lora_A[adapter].weight.shape[0]
+            scaling = float(module.scaling[adapter])
+            if int(source["rank"]) != rank or abs(float(source["scaling"]) - scaling) > 1e-6:
+                raise ValueError(f"Event-to-ordinary rank/scaling mismatch at {name}: checkpoint={source}, runtime={(rank, scaling)}")
+        for source_part, dest_part in pairs:
+            source_suffix = f"{source_part}.{adapter}.weight" if source_part in ("lora_A", "lora_B") else source_part
+            dest_suffix = f"{dest_part}.{adapter}.weight" if dest_part in ("lora_A", "lora_B") else dest_part
+            source_key, dest_key = f"{name}.{source_suffix}", f"{name}.{dest_suffix}"
+            if source_key not in source_state:
+                raise RuntimeError(f"Cannot migrate LoRA: missing {source_key}")
+            migrated[dest_key] = source_state[source_key]
+        report[direction].append(name)
+    own = unet.state_dict()
+    for key in set(migrated) & set(own):
+        if own[key].shape != migrated[key].shape:
+            raise RuntimeError(f"LoRA migration shape mismatch at {key}: {tuple(migrated[key].shape)} -> {tuple(own[key].shape)}")
+    report["discarded_event_keys"] = [key for key in migrated if key not in own and (
+        ".modulator." in key or "_event_lora_shared_heads_" in key
+    )]
+    return {key: value for key, value in migrated.items() if key in own}, report
 
 
 def set_event_feats_for_all_event_lora(unet, event_feats):

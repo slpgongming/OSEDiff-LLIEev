@@ -20,6 +20,8 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from dataloaders.sde_event_film_dataset import SDEEventFilmDataset
+from models.event_film_lora import parse_event_lora_targets
+from osediff_event_film import parse_unet_lora_parts
 from osediff_event_film import OSEDiffEventFiLMGen, resolve_decoder_refinement_args
 from train_idea3_decoder_refinement import (
     build_scheduler,
@@ -37,6 +39,9 @@ def parse_args():
     parser.add_argument("--stage1_checkpoint", required=True)
     parser.add_argument("--event_lora_checkpoint", required=True,
                         help="Stage4 refinement decoder checkpoint.")
+    parser.add_argument("--event_lora_targets", type=lambda value: parse_event_lora_targets(value, allow_auto=True), default="auto")
+    parser.add_argument("--unet_lora_active_parts", type=parse_unet_lora_parts, default=None)
+    parser.add_argument("--unet_lora_trainable_parts", type=parse_unet_lora_parts, default=None)
     parser.add_argument("--output_dir", required=True)
 
     parser.add_argument("--rgb_event_pretrained_root", default=None)

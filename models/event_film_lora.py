@@ -15,6 +15,26 @@ EVENT_LORA_VARIANTS = (
 )
 
 EVENT_LORA_VARIANT_ALIASES = {"film": "film_affine"}
+EVENT_LORA_TARGETS = ("q", "k", "v", "out")
+
+
+def parse_event_lora_targets(value, allow_auto=False):
+    """Normalize the selected self-attention projections in a stable order."""
+    if not isinstance(value, str) and not value:
+        return ()
+    if isinstance(value, str):
+        parts = [part.strip().lower() for part in value.split(",")]
+    else:
+        parts = [str(part).strip().lower() for part in value]
+    if len(parts) == 1 and parts[0] == "auto" and allow_auto:
+        return "auto"
+    if len(parts) == 1 and parts[0] == "all":
+        return EVENT_LORA_TARGETS
+    if len(parts) == 1 and parts[0] == "none":
+        return ()
+    if not parts or any(part not in EVENT_LORA_TARGETS for part in parts) or len(parts) != len(set(parts)):
+        raise ValueError(f"Invalid Event-LoRA targets {value!r}; use none, all, auto, or a unique subset of q,k,v,out.")
+    return tuple(target for target in EVENT_LORA_TARGETS if target in parts)
 
 
 def normalize_event_lora_variant(variant):
@@ -27,6 +47,7 @@ class EventLoRAConfig:
     """Event-LoRA 的结构配置；训练、推理和 regularizer 必须使用同一份语义。"""
 
     variant: str = "film_affine"
+    targets: tuple = ("v",)
     rank: int = 4
     alpha: float = 4.0
     mod_channels: int = 32
@@ -40,6 +61,7 @@ class EventLoRAConfig:
     zero_init_last: bool = True
 
     def __post_init__(self):
+        object.__setattr__(self, "targets", parse_event_lora_targets(self.targets))
         normalized_variant = normalize_event_lora_variant(self.variant)
         object.__setattr__(self, "variant", normalized_variant)
         if normalized_variant not in EVENT_LORA_VARIANTS:
@@ -447,7 +469,7 @@ class SharedResidualEventHeads(nn.Module):
 
 class SpatialRGBEventLoRALinear(nn.Module):
     """
-    用 Event-LoRA 替换 UNet self-attention `attn1.to_v`。
+    用 Event-LoRA 替换选中的 UNet self-attention Q/K/V/out 投影。
 
     输入为 `[B,N,C]` 图像 token。FiLM/low-rank residual 在 `lora_up` 前
     修改 rank 通道特征；output gate 在 `lora_up` 后修改 LoRA residual。
@@ -460,11 +482,13 @@ class SpatialRGBEventLoRALinear(nn.Module):
         config,
         event_channels_by_size,
         shared_residual_heads=None,
+        projection="v",
     ):
         super().__init__()
         self.base_linear = base_linear
         self.base_linear.requires_grad_(False)
         self.config = config
+        self.projection = projection
         self.rank = config.rank
         self.lora_alpha = config.alpha
         self.scaling = self.lora_alpha / max(self.rank, 1)

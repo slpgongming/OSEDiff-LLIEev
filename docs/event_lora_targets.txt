@@ -1,0 +1,31 @@
+idea4：选择 Event-LoRA 的 self-attention 投影
+
+--event_lora_targets 支持 q,k,v,out 的逗号分隔子集，以及 all、none、auto。
+q=attn1.to_q，k=attn1.to_k，v=attn1.to_v，out=attn1.to_out.0。
+大小写和首尾空格不影响解析；重复值或与 all/none/auto 混用会报错。
+
+auto 是各入口的默认值。从 Stage 1 开始新训练时选 v；加载 Event checkpoint
+时按 checkpoint 记录的目标集重建。缺少目标元信息的旧权重按 V-only 解释，
+并与实际 Event-LoRA 权重键核对。推理显式指定不同目标集会拒绝加载。
+
+例如从旧 V-only 权重启动新的 Q+V 实验：
+
+  --init_from_event_checkpoint /path/to/model_final.pkl \
+  --event_lora_targets q,v
+
+这会按同一投影路径迁移普通与 Event-LoRA 的 A/B 权重；新加 Q 事件头保持
+零初始化。它不会恢复旧实验的 step、optimizer 或 scheduler。断点续训
+--resume_from_checkpoint 要求目标集与原权重一致。
+
+--unet_lora_active_parts 和 --unet_lora_trainable_parts 分别控制未替换的普通
+PEFT LoRA 的 down/mid/up 分组；解冻组必须属于激活组。Stage 2/3 默认为
+none/none。Stage 2 冻结 Event-LoRA A/B，只训练事件编码器与调制头；
+Stage 3 解冻选中目标的 Event-LoRA A/B。推理仍使用 --unet_lora_parts
+控制普通 LoRA，Stage 2/3 测试入口默认 none。
+
+none 不安装 Event-LoRA，保留普通 PEFT 结构。若同时没有任何可训练的普通
+LoRA，Stage 2/3 会在启动阶段报错。same_as_generator regularizer 沿用
+生成器目标集；original regularizer 继续使用普通 PEFT LoRA。
+
+当前目标集迁移的输出未必与旧模型完全相同：原先关闭的普通 LoRA 投影
+改成 Event-LoRA 后，其 A/B 会参与前向，即使新增事件头为零。

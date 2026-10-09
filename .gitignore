@@ -4,6 +4,8 @@ preset/
 __pycache__/
 *.pyc
 *.md
+!AGENTS.md
+!AGENTS.zh-CN.md
 checkpoints/
 output_lle/
 references/

@@ -15,7 +15,8 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from dataloaders.sde_event_film_dataset import SDEEventFilmDataset
-from osediff_event_film import OSEDiffEventFiLMGen
+from models.event_film_lora import parse_event_lora_targets
+from osediff_event_film import OSEDiffEventFiLMGen, parse_unet_lora_parts
 
 
 def event_edge_loss(prediction, target, events):
@@ -60,6 +61,11 @@ def parse_args():
     parser.add_argument("--train_data_root", required=True)
     parser.add_argument("--stage1_checkpoint", required=True)
     parser.add_argument("--event_lora_checkpoint", required=True)
+    parser.add_argument("--event_lora_targets", type=lambda value: parse_event_lora_targets(value, allow_auto=True), default="auto")
+    parser.add_argument("--unet_lora_active_parts", type=parse_unet_lora_parts,
+                        default=("down", "mid", "up"))
+    parser.add_argument("--unet_lora_trainable_parts", type=parse_unet_lora_parts, default=None,
+                        help="Stage4 freezes UNet; only none is accepted.")
     parser.add_argument("--output_dir", required=True)
 
     parser.add_argument("--rgb_event_pretrained_root", default=None)
@@ -279,6 +285,8 @@ def save_checkpoint(
 
 
 def main(args):
+    if getattr(args, "unet_lora_trainable_parts", None) not in (None, ()):
+        raise ValueError("Stage4 freezes UNet; ordinary UNet LoRA cannot be trainable.")
     validate_paths(args)
     os.makedirs(args.output_dir, exist_ok=True)
     accelerator = Accelerator(
@@ -319,6 +327,8 @@ def main(args):
             resume_checkpoint,
             ignore_config_mismatch=args.resume_ignore_mismatch,
         )
+
+    model.activate_lora_adapters(args.unet_lora_active_parts)
 
     trainable_parameters = model.set_train_decoder_refinement()
     trainable_names = [

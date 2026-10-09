@@ -11,9 +11,11 @@ import torch
 from dataloaders.sde_event_film_dataset import SDEEventFilmDataset
 from osediff_event_film import (
     OSEDiffEventFiLMTest,
+    parse_unet_lora_parts,
     resolve_decoder_refinement_args,
 )
 from test_event_film_lora_osediff import FIDEvaluator, tensor_to_pil
+from models.event_film_lora import parse_event_lora_targets
 
 
 EXPERIMENTS = {
@@ -40,6 +42,13 @@ def build_parser(include_experiments=True):
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--pretrained_model_name_or_path", required=True)
     parser.add_argument("--event_lora_checkpoint", required=True)
+    parser.add_argument("--event_lora_targets", type=lambda value: parse_event_lora_targets(value, allow_auto=True), default="auto")
+    parser.add_argument(
+        "--unet_lora_parts",
+        type=parse_unet_lora_parts,
+        default=("down", "mid", "up"),
+        help="普通 UNet LoRA 分组；none 关闭全部普通 UNet LoRA，Event-LoRA 仍生效。",
+    )
     parser.add_argument("--rgb_event_pretrained_root", default=None)
     parser.add_argument("--rgb_event_encoder_i_path", default=None)
     parser.add_argument("--rgb_event_encoder_e_path", default=None)

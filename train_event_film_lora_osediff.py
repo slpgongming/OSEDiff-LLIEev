@@ -16,7 +16,8 @@ from diffusers.utils.import_utils import is_xformers_available
 from tqdm.auto import tqdm
 
 from dataloaders.sde_event_film_dataset import SDEEventFilmDataset
-from models.event_lora_utils import collect_event_lora_regularization
+from models.event_lora_utils import collect_event_lora_regularization, clear_event_feats_for_all_event_lora
+from models.event_film_lora import parse_event_lora_targets
 from osediff_event_film import (
     OSEDiffEventFiLMGen,
     OSEDiffEventFiLMReg,
@@ -104,6 +105,8 @@ def event_edge_loss(pred, gt, events):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", type=int, choices=[2, 3], default=2)
+    parser.add_argument("--event_lora_targets", type=lambda value: parse_event_lora_targets(value, allow_auto=True), default="auto",
+                        help="self-attention Event-LoRA projections: auto, none, all, or q,k,v,out subset; auto inherits Event checkpoint or uses v.")
     parser.add_argument(
         "--unet_lora_active_parts", type=parse_unet_lora_parts, default=(),
         help="训练前向中激活的普通 UNet LoRA 分组：none 或 down,mid,up 的逗号分隔子集；默认 none。",
@@ -305,6 +308,19 @@ def main(args):
         if resume_path is None:
             logging.warning("No resume checkpoint found; starting from Stage1 checkpoint.")
 
+    source_path = resume_path or args.init_from_event_checkpoint
+    if args.event_lora_targets == "auto":
+        if source_path:
+            try:
+                source_checkpoint = torch.load(source_path, map_location="cpu", weights_only=False)
+            except TypeError:
+                source_checkpoint = torch.load(source_path, map_location="cpu")
+            from osediff_event_film import _checkpoint_event_lora_config
+            args.event_lora_targets = _checkpoint_event_lora_config(source_checkpoint).targets
+        else:
+            args.event_lora_targets = ("v",)
+    logging.info("Event-LoRA targets: %s", ",".join(args.event_lora_targets) or "none")
+
     model_gen = OSEDiffEventFiLMGen(args)
     model_reg = OSEDiffEventFiLMReg(args=args, accelerator=accelerator)
     model_reg.set_shared_event_encoder(
@@ -317,6 +333,12 @@ def main(args):
     if resume_path is not None:
         logging.info(f"[Resume] Loading checkpoint: {resume_path}")
         resume_checkpoint = torch.load(resume_path, map_location="cpu")
+        for key, runtime in (
+            ("train_unet_lora_active_parts", args.unet_lora_active_parts),
+            ("train_unet_lora_trainable_parts", args.unet_lora_trainable_parts),
+        ):
+            if key in resume_checkpoint and tuple(resume_checkpoint[key]) != tuple(runtime):
+                raise ValueError(f"Resume ordinary LoRA policy mismatch at {key}: checkpoint={resume_checkpoint[key]}, runtime={runtime}")
         model_gen.load_event_checkpoint(resume_checkpoint)
         reg_state = resume_checkpoint.get("additional_info", {}).get("reg_checkpoint", {})
         if reg_state:
@@ -326,10 +348,10 @@ def main(args):
     elif args.init_from_event_checkpoint is not None:
         logging.info(f"[Init] Loading Event-FiLM checkpoint without optimizer/step resume: {args.init_from_event_checkpoint}")
         init_checkpoint = torch.load(args.init_from_event_checkpoint, map_location="cpu")
-        model_gen.load_event_checkpoint(init_checkpoint)
+        model_gen.load_event_checkpoint(init_checkpoint, migrate_targets=True)
         reg_state = init_checkpoint.get("additional_info", {}).get("reg_checkpoint", {})
         if reg_state:
-            model_reg.load_ckpt(reg_state, strict_config=False)
+            model_reg.load_ckpt(reg_state, strict_config=False, migrate_targets=True)
     else:
         logging.info(f"[Stage1] Loading full Stage1 checkpoint: {args.stage1_checkpoint}")
         stage1_checkpoint = model_gen.load_stage1_full(args.stage1_checkpoint)
@@ -419,7 +441,7 @@ def main(args):
                     obj.load_state_dict(resume_checkpoint[key])
                     logging.info(f"[Resume] Loaded {label} state.")
                 except Exception as exc:
-                    logging.warning(f"[Resume] Failed to load {label}: {exc}")
+                    raise RuntimeError(f"[Resume] Cannot restore {label} state; optimizer groups must match: {exc}") from exc
 
     if accelerator.is_main_process:
         tracker_config = {k: str(v) if isinstance(v, tuple) else v for k, v in vars(args).items()}
@@ -499,6 +521,7 @@ def main(args):
                     loss_d = torch.zeros((), device=x_src.device)
 
                 accelerator.backward(loss)
+                clear_event_feats_for_all_event_lora(accelerator.unwrap_model(model_gen).unet)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_([p for g in optimizer.param_groups for p in g["params"]], args.max_grad_norm)
                 optimizer.step()
@@ -507,6 +530,7 @@ def main(args):
 
                 if args.lambda_vsd_lora > 0:
                     accelerator.backward(loss_d)
+                    clear_event_feats_for_all_event_lora(accelerator.unwrap_model(model_reg).unet_update)
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_([p for p in reg_runner.parameters() if p.requires_grad], args.max_grad_norm)
                     optimizer_reg.step()
