@@ -203,8 +203,10 @@ class SDEEventFilmDataset(Dataset):
             )[0]
         event = event.clone()
         if event.numel() > 0:
-            event[:, 1] *= target_width / max(float(source_width), 1.0)
-            event[:, 2] *= target_height / max(float(source_height), 1.0)
+            # 原始事件含 int64 绝对时间戳，不能整体转浮点；仅缩放坐标后赋回原 dtype。
+            # 避免 Long 张量 *= 浮点比例报错；整数坐标按后续体素索引语义截断。
+            event[:, 1] = event[:, 1].to(torch.float64) * (target_width / max(float(source_width), 1.0))
+            event[:, 2] = event[:, 2].to(torch.float64) * (target_height / max(float(source_height), 1.0))
         return event
 
     def _scan_samples(self, root_dir):

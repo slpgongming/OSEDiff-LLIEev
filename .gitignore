@@ -4,6 +4,7 @@ preset/
 __pycache__/
 *.pyc
 *.md
+!docs/idea6_mask_fusion.md
 checkpoints/
 output_lle/
 references/
