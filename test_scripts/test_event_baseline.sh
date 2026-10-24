@@ -3,7 +3,7 @@ set -euo pipefail
 
 # 可直接修改下方默认值，也可由外层实验脚本通过同名环境变量覆盖。
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  sed -n '4,45p' "$0"
+  sed -n '4,46p' "$0"
   exit 0
 fi
 
@@ -12,23 +12,20 @@ PRETRAINED_MODEL_NAME_OR_PATH="${PRETRAINED_MODEL_NAME_OR_PATH:-/public/home/slp
 TEST_DATA_ROOT="${TEST_DATA_ROOT:-/public/home/slpchen/EvLight--main/SDE_dataset/SDE_indoor/sde_in_release/test}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-/public/home/slpchen/OSEDiff_project/TrainingWeights/OSEDiff_stage5_8-17-1100/checkpoints/model_final.pkl}"
 RGB_EVENT_PRETRAINED_ROOT="${RGB_EVENT_PRETRAINED_ROOT:-/public/home/slpchen/OSEDiff_project/TrainingWeights/REencoder/SDE/indoor/joint/weights/best}"
-OUTPUT_DIR="${OUTPUT_DIR:-/public/home/slpchen/OSEDiff_project/test_results/idea4_esg}"
+OUTPUT_DIR="${OUTPUT_DIR:-/public/home/slpchen/OSEDiff_project/test_results/event_baseline}"
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 CALCULATE_FID="${CALCULATE_FID:-1}"
 SAVE_IMAGES="${SAVE_IMAGES:-1}"
 RESUME_IGNORE_MISMATCH="${RESUME_IGNORE_MISMATCH:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
+# seed 控制图像 latent；不继承已删除方案的扰动 seed。
+SEED="${SEED:-42}"
+UNET_LORA_PARTS="${UNET_LORA_PARTS:-down,mid,up}"
+BASELINE_CSV_FORMAT="${BASELINE_CSV_FORMAT:-generic}"
 EVENT_LORA_VARIANT="${EVENT_LORA_VARIANT:-residual_cross_attn}"
 DECODER_REFINEMENT_VARIANT="${DECODER_REFINEMENT_VARIANT:-auto}"
 DECODER_REFINEMENT_ENABLED="${DECODER_REFINEMENT_ENABLED:-1}"
-ESG_GUIDANCE_SCALES="${ESG_GUIDANCE_SCALES:-0,0.1,0.25,0.5,0.75}"
-ESG_SWAP_RATIOS="${ESG_SWAP_RATIOS:-0.05,0.10}"
-ESG_SWAP_MODES="${ESG_SWAP_MODES:-spatial}"
-ESG_PAIR_POLICIES="${ESG_PAIR_POLICIES:-dissimilar}"
-ESG_FEATURE_SCALES="${ESG_FEATURE_SCALES:-32,16,8}"
-ESG_EXECUTION_MODE="${ESG_EXECUTION_MODE:-batched}"
-ESG_SEED="${ESG_SEED:-42}"
 GENERATOR_TIMESTEP="${GENERATOR_TIMESTEP:-500}"
 IMAGE_SIZE="${IMAGE_SIZE:-256}"
 MIXED_PRECISION="${MIXED_PRECISION:-fp16}"
@@ -125,7 +122,7 @@ if [[ "$MAX_SAMPLES" != "0" ]]; then
   OPTIONAL_ARGS+=(--max_samples "$MAX_SAMPLES")
 fi
 
-archive_run_context "$OUTPUT_DIR" "${BASH_SOURCE[0]}" idea4 esg_test \
+archive_run_context "$OUTPUT_DIR" "${BASH_SOURCE[0]}" idea7 baseline_test \
   "PRETRAINED_MODEL_NAME_OR_PATH=$PRETRAINED_MODEL_NAME_OR_PATH" \
   "TEST_DATA_ROOT=$TEST_DATA_ROOT" \
   "CHECKPOINT_PATH=$CHECKPOINT_PATH" \
@@ -136,22 +133,22 @@ archive_run_context "$OUTPUT_DIR" "${BASH_SOURCE[0]}" idea4 esg_test \
   "DECODER_REFINEMENT_VARIANT=$DECODER_REFINEMENT_VARIANT" \
   "CLORA_EVENT_ACTIVE_BINS=$CLORA_EVENT_ACTIVE_BINS" \
   "RGB_EVENT_ACTIVE_BINS=$RGB_EVENT_ACTIVE_BINS" \
-  "ESG_GUIDANCE_SCALES=$ESG_GUIDANCE_SCALES" \
-  "ESG_SWAP_RATIOS=$ESG_SWAP_RATIOS" \
-  "ESG_SWAP_MODES=$ESG_SWAP_MODES" \
-  "ESG_PAIR_POLICIES=$ESG_PAIR_POLICIES" \
-  "ESG_FEATURE_SCALES=$ESG_FEATURE_SCALES" \
-  "ESG_EXECUTION_MODE=$ESG_EXECUTION_MODE"
+  "SEED=$SEED" \
+  "MIXED_PRECISION=$MIXED_PRECISION" \
+  "GENERATOR_TIMESTEP=$GENERATOR_TIMESTEP" \
+  "LORA_RANK=$LORA_RANK" \
+  "EVENT_LORA_MOD_CHANNELS=$EVENT_LORA_MOD_CHANNELS" \
+  "EVENT_LORA_MODULATION_SCALE=$EVENT_LORA_MODULATION_SCALE" \
+  "UNET_LORA_PARTS=$UNET_LORA_PARTS" \
+  "BASELINE_CSV_FORMAT=$BASELINE_CSV_FORMAT"
 
-echo "[Idea4 ESG] checkpoint=$CHECKPOINT_PATH"
-echo "[Idea4 ESG] output=$OUTPUT_DIR"
-echo "[Idea4 ESG] calculate_fid=$CALCULATE_FID"
-echo "[Idea4 ESG] decoder_refinement_enabled=$DECODER_REFINEMENT_ENABLED"
-echo "[Idea4 ESG] active event bins: cLoRA=$CLORA_EVENT_ACTIVE_BINS, RGB-event=$RGB_EVENT_ACTIVE_BINS (total channels=5)"
-echo "[Idea4 ESG] guidance=$ESG_GUIDANCE_SCALES ratio=$ESG_SWAP_RATIOS"
-echo "[Idea4 ESG] mode=$ESG_SWAP_MODES policy=$ESG_PAIR_POLICIES scales=$ESG_FEATURE_SCALES"
+echo "[Event baseline] checkpoint=$CHECKPOINT_PATH"
+echo "[Event baseline] output=$OUTPUT_DIR"
+echo "[Event baseline] calculate_fid=$CALCULATE_FID"
+echo "[Event baseline] decoder_refinement_enabled=$DECODER_REFINEMENT_ENABLED"
+echo "[Event baseline] active event bins: cLoRA=$CLORA_EVENT_ACTIVE_BINS, RGB-event=$RGB_EVENT_ACTIVE_BINS (total channels=5)"
 
-python "$REPO_ROOT/test_idea4_esg.py" \
+python "$REPO_ROOT/test_event_baseline.py" \
   --input_image "$TEST_DATA_ROOT" \
   --output_dir "$OUTPUT_DIR" \
   --pretrained_model_name_or_path "$PRETRAINED_MODEL_NAME_OR_PATH" \
@@ -173,11 +170,7 @@ python "$REPO_ROOT/test_idea4_esg.py" \
   --generator_timestep "$GENERATOR_TIMESTEP" \
   --image_size "$IMAGE_SIZE" \
   --mixed_precision "$MIXED_PRECISION" \
-  --esg_guidance_scales "$ESG_GUIDANCE_SCALES" \
-  --esg_swap_ratios "$ESG_SWAP_RATIOS" \
-  --esg_swap_modes "$ESG_SWAP_MODES" \
-  --esg_pair_policies "$ESG_PAIR_POLICIES" \
-  --esg_feature_scales "$ESG_FEATURE_SCALES" \
-  --esg_execution_mode "$ESG_EXECUTION_MODE" \
-  --esg_seed "$ESG_SEED" \
+  --seed "$SEED" \
+  --unet_lora_parts "$UNET_LORA_PARTS" \
+  --csv_format "$BASELINE_CSV_FORMAT" \
   "${OPTIONAL_ARGS[@]}"

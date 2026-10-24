@@ -9,3 +9,7 @@ output_lle/
 references/
 experience/
 plan/
+.pytest_cache/
+!plan/
+plan/*
+!plan/idea7_feature_dps.md

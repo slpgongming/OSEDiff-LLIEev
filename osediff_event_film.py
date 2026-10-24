@@ -15,10 +15,6 @@ import json
 
 from models.event_encoder import EventEncoder
 from models.event_film_lora import EventLoRAConfig, normalize_event_lora_variant
-from models.event_self_swap_guidance import (
-    EventSelfSwapConfig,
-    swap_event_feature_tokens,
-)
 from models.rgb_event_encoder import RGBEventEncoder
 from models.decoder_refinement import (
     normalize_activity_mode,
@@ -599,7 +595,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         return torch.cat(prompt_embeds_list, dim=0)
 
     def prepare_denoising_context(self, c_t, events, batch):
-        """各执行一次 VAE/text/event encode，固定 ESG sweep 的全部公共输入。"""
+        """各执行一次 VAE/text/event encode；训练路径仍保留原有梯度。"""
         encoded_control = self.vae.encode(c_t).latent_dist.sample() * self.vae.config.scaling_factor
         prompt_embeds = self.encode_prompt(batch["prompt"])
         neg_prompt_embeds = self.encode_prompt(batch["neg_prompt"])
@@ -611,8 +607,32 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             event_feats=event_feats,
         )
 
+    @torch.no_grad()
+    def prepare_fixed_denoising_context(self, c_t, events, batch):
+        """推理专用：只采样一次 latent，返回普通 detached 张量以支持后续特征求导。"""
+        if torch.is_inference_mode_enabled():
+            raise RuntimeError("Feature DPS context must be prepared outside torch.inference_mode().")
+        context = self.prepare_denoising_context(c_t, events, batch)
+        return DenoisingContext(
+            encoded_control=context.encoded_control.detach(),
+            prompt_embeds=context.prompt_embeds.detach(),
+            neg_prompt_embeds=context.neg_prompt_embeds.detach(),
+            event_feats={key: value.detach() for key, value in context.event_feats.items()},
+        )
+
+    def clear_feature_dps_caches(self):
+        """仅由推理 runner 收尾调用；训练的辅助损失仍可读取 last_aux。"""
+        clear_event_feats_for_all_event_lora(self.unet)
+        for module in self.unet.modules():
+            if hasattr(module, "last_aux"):
+                module.last_aux = {}
+            if hasattr(module, "last_visuals"):
+                module.last_visuals = {}
+            if hasattr(module, "last_z_delta"):
+                module.last_z_delta = None
+
     def _run_unet_with_event_features(
-        self, encoded_control, timesteps, prompt_embeds, event_feats
+        self, encoded_control, timesteps, prompt_embeds, event_feats, feature_guidance=None
     ):
         """在一次 UNet forward 的严格作用域内设置并清理 Event-LoRA feature。"""
         cross_attn_dtype = _unet_cross_attention_dtype(
@@ -620,141 +640,49 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         )
         set_event_feats_for_all_event_lora(self.unet, event_feats)
         try:
+            # 普通路径不额外传递 kwarg，兼容既有测试 mock 和默认 UNet 接口。
+            optional = {} if feature_guidance is None else {"feature_guidance": feature_guidance}
             return self.unet(
                 encoded_control,
                 timesteps,
                 encoder_hidden_states=prompt_embeds.to(dtype=cross_attn_dtype),
+                **optional,
             ).sample
         finally:
             clear_event_feats_for_all_event_lora(self.unet)
 
-    @staticmethod
-    def _paired_timesteps(timesteps, batch_size):
-        """把单 timestep 或逐样本 timestep 扩展为正负分支的 `[2B]`。"""
-        flat = timesteps.reshape(-1)
-        if flat.numel() == 1:
-            positive = flat.expand(batch_size)
-        elif flat.numel() == batch_size:
-            positive = flat
-        else:
-            raise ValueError(
-                "ESG timesteps must contain one value or one value per sample; "
-                f"got {flat.numel()} values for batch {batch_size}."
-            )
-        return torch.cat([positive, positive], dim=0)
-
     def predict_denoised_latent_from_context(
-        self, context, timesteps, esg_config=None, measure_time=False
+        self, context, timesteps, feature_guidance=None, measure_time=False
     ):
-        """从固定 context 运行普通或 ESG 去噪，并返回 `z0` 与推理统计。"""
+        """从固定 context 做一次 UNet 预测；可选主干修正不改变 scheduler 的原始输入。"""
         if not isinstance(context, DenoisingContext):
             raise TypeError(f"Expected DenoisingContext, got {type(context)}.")
-        if esg_config is not None and not isinstance(esg_config, EventSelfSwapConfig):
-            raise TypeError(
-                f"Expected EventSelfSwapConfig or None, got {type(esg_config)}."
-            )
-
         encoded_control = context.encoded_control
         if measure_time:
             _synchronize_tensor_device(encoded_control)
             start_time = time.perf_counter()
-
-        if esg_config is None or esg_config.guidance_scale == 0:
-            model_pred = self._run_unet_with_event_features(
-                encoded_control,
-                timesteps,
-                context.prompt_embeds,
-                context.event_feats,
-            )
-            swap_stats = {}
-            if esg_config is None and not measure_time:
-                # 旧训练/推理接口不需要 ESG 统计，避免 `.item()` 引入额外 GPU 同步。
-                guidance_stats = {}
-            else:
-                prediction_norm = float(model_pred.detach().float().norm().item())
-                guidance_stats = {
-                    "mean_abs_delta": 0.0,
-                    "delta_to_positive_norm": 0.0,
-                    "positive_prediction_norm": prediction_norm,
-                    "guided_prediction_norm": prediction_norm,
-                }
-        else:
-            swapped_feats, swap_stats = swap_event_feature_tokens(
-                context.event_feats, esg_config
-            )
-            if esg_config.execution_mode == "batched":
-                batch_size = encoded_control.shape[0]
-                paired_latent = torch.cat(
-                    [encoded_control, encoded_control], dim=0
-                )
-                paired_prompt = torch.cat(
-                    [context.prompt_embeds, context.prompt_embeds], dim=0
-                )
-                paired_events = {
-                    key: torch.cat([value, swapped_feats[key]], dim=0)
-                    for key, value in context.event_feats.items()
-                }
-                paired_timesteps = self._paired_timesteps(timesteps, batch_size)
-                paired_prediction = self._run_unet_with_event_features(
-                    paired_latent,
-                    paired_timesteps,
-                    paired_prompt,
-                    paired_events,
-                )
-                positive_pred, perturbed_pred = paired_prediction.chunk(2, dim=0)
-            else:
-                positive_pred = self._run_unet_with_event_features(
-                    encoded_control,
-                    timesteps,
-                    context.prompt_embeds,
-                    context.event_feats,
-                )
-                perturbed_pred = self._run_unet_with_event_features(
-                    encoded_control,
-                    timesteps,
-                    context.prompt_embeds,
-                    swapped_feats,
-                )
-
-            delta = positive_pred - perturbed_pred
-            model_pred = positive_pred + esg_config.guidance_scale * delta
-            if not torch.isfinite(model_pred).all():
-                raise FloatingPointError(
-                    "ESG guided prediction contains NaN or Inf; reduce guidance_scale "
-                    "or swap_ratio and inspect the checkpoint."
-                )
-            positive_norm = positive_pred.detach().float().norm()
-            delta_norm = delta.detach().float().norm()
-            guidance_stats = {
-                "mean_abs_delta": float(delta.detach().float().abs().mean().item()),
-                "delta_to_positive_norm": float(
-                    (delta_norm / positive_norm.clamp_min(1e-12)).item()
-                ),
-                "positive_prediction_norm": float(positive_norm.item()),
-                "guided_prediction_norm": float(
-                    model_pred.detach().float().norm().item()
-                ),
-            }
-
+        optional = {} if feature_guidance is None else {"feature_guidance": feature_guidance}
+        model_pred = self._run_unet_with_event_features(
+            encoded_control, timesteps, context.prompt_embeds, context.event_feats, **optional
+        )
+        stats = {}
         if measure_time:
             _synchronize_tensor_device(encoded_control)
-            guidance_stats["unet_ms"] = float(
-                (time.perf_counter() - start_time) * 1000.0
-            )
+            stats["unet_ms"] = float((time.perf_counter() - start_time) * 1000.0)
+            # 两项是单次预测的同一个范数，供旧 baseline CSV 的兼容列使用。
+            prediction_norm = float(model_pred.detach().float().norm().item())
+            stats["positive_prediction_norm"] = prediction_norm
+            stats["guided_prediction_norm"] = prediction_norm
         x_denoised = self.noise_scheduler.step(
             model_pred, timesteps, encoded_control, return_dict=True
         ).prev_sample
-        stats = {
-            **swap_stats,
-            **guidance_stats,
-        }
         return x_denoised, stats
 
     def predict_denoised_latent(self, c_t, events, timesteps, batch):
         """兼容旧接口：运行一次 VAE encode + event-cLoRA UNet 并返回 z0。"""
         context = self.prepare_denoising_context(c_t, events, batch)
         x_denoised, _ = self.predict_denoised_latent_from_context(
-            context, timesteps, esg_config=None
+            context, timesteps
         )
         return x_denoised, context.prompt_embeds, context.neg_prompt_embeds
 

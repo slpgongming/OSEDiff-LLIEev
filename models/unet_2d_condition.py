@@ -846,6 +846,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         down_intrablock_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
+        feature_guidance=None,
     ) -> Union[UNet2DConditionOutput, Tuple]:
         r"""
         The [`UNet2DConditionModel`] forward method.
@@ -1161,6 +1162,10 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         if is_controlnet:
             sample = sample + mid_block_additional_residual
 
+        # 类 DPS 只改变当前样本的全通道特征，默认 None 不改变训练/普通推理路径。
+        if feature_guidance is not None:
+            feature_guidance.bind_num_up_blocks(len(self.up_blocks))
+
         # 5. up
         for i, upsample_block in enumerate(self.up_blocks):
             is_final_block = i == len(self.up_blocks) - 1
@@ -1192,6 +1197,10 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                     upsample_size=upsample_size,
                     scale=lora_scale,
                 )
+
+            # 在完整 up-block（包括其上采样）返回后注入，后面仍保留完整恢复模块。
+            if feature_guidance is not None:
+                sample = feature_guidance.apply(block_index=i, features=sample)
 
         # 6. post-process
         if self.conv_norm_out:
