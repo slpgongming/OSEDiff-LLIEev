@@ -36,6 +36,11 @@ def example_manifest():
 def build_manifest(spec_path, data_root, output_path, require_measurement=True):
     with Path(spec_path).open(encoding="utf-8") as handle:
         spec = json.load(handle)
+    return build_manifest_from_spec(spec, data_root, output_path, require_measurement)
+
+
+def build_manifest_from_spec(spec, data_root, output_path, require_measurement=True):
+    """同时供显式 JSON 与 SDE 自动扫描器使用，统一校验和文件指纹语义。"""
     if not Path(data_root).is_dir():
         raise FileNotFoundError(f"Data root does not exist: {data_root}")
     result = validate_manifest(spec, data_root, check_files=True,

@@ -84,9 +84,11 @@ def read_raw_events(path, polarity_encoding, keys=None):
                                    json.dumps(keys, sort_keys=True), stat.st_size, stat.st_mtime_ns)
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=3)
 def _read_raw_events_cached(path, polarity_encoding, keys_json, size_bytes, mtime_ns):
     """支持字段 NPZ、结构化 arr_0 或 [N,4]；不允许 pickle 或预体素替代测量。"""
+    # 顺序 SDE 帧对同时需要上一帧分片、当前帧分片、整场景流。
+    # 只有两个槽会在每帧把最大的整场景文件挤出，反复解压数百 MB。
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(path)

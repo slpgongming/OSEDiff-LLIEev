@@ -22,6 +22,7 @@
 | `dataloaders/sde_event_pair_dataset.py` | 无 GT 的帧对输入、条件事件与原始测量两条通路 |
 | `models/event_observation_proxy.py` | 固定 mask 的 processed RGB 净事件统计代理 |
 | `scripts/build_event_pair_manifest.py` | 显式数据规格预检、规范化清单及文件指纹 |
+| `scripts/prepare_sde_idea7.py` | 扫描 SDE、按场景划分标定数据、生成全部清单并调用标定 |
 | `calibrate_event_observation.py` | train 拟合、validation 验收、标定 JSON/报告 |
 | `test_idea7_dps.py` | 预检、配置解析、顺序推理、baseline 缓存、统计和独立评估 |
 | `test_scripts/test_idea7_dps.sh` | whb 启动脚本，保留环境变量覆盖与 dry-run |
@@ -29,9 +30,73 @@
 
 旧 `models/event_self_swap_guidance.py`、`test_idea4_esg.py`、对应 shell/测试已移除。7 个历史 wrapper 改调 baseline 入口，原账户路径、模型设置和图像 seed 不变。`legacy-baseline` 只保留旧 CSV 文件名/列，不保留 ESG 算法。新 `.gitattributes` 保证 shell 在 Windows checkout 后也使用 LF。
 
-## 1. 准备显式配对清单
+## 1. 自动准备 SDE 数据
 
-真实原始数据当前未在本机验证。工具不会从文件名大小猜时间单位，不会将“排序配对”当作已经证明事件覆盖。
+SDE 可直接运行下面的命令，无需逐帧手写 JSON；仅需要 CPU 和现有 Python 依赖，不加载模型权重。
+
+```bash
+python scripts/prepare_sde_idea7.py \
+  --data-root /public/home/whb/Chen_Project/dataset/SDE_dataset/SDE_indoor/sde_in_release \
+  --output-dir ./idea7_sde
+```
+
+`--data-root` 是包含 `train/`、`test/` 的 release 根目录，**不是 test/ 本身**。本地示例根目录是 `D:/霖丹项目/论文构思/Codex工作区/SDE_indoor`。输出目录由调用者指定，不写入源数据目录。
+
+自动步骤：
+
+1. 场景按旧 dataset 的名称顺序遍历；场景内 low PNG、normal PNG、逐帧 NPZ 分别按整数时间戳排序后按索引配对。GT 文件名允许与 low 不同，不做同名/最近时间戳匹配。数量不一致报错，不静默截断。
+2. Event-LoRA 条件优先使用原有逐帧 NPZ 的全部事件，保持原预处理；无分片时使用整流的邻帧窗口。分片仅缺一部分时报错。反馈测量始终来自 `low/lowlight_event.npz`，按低光时间戳的 `(t_prev, t_curr]` 查询；不合并互相重叠的条件分片。
+3. 自动生成 `pairs_test.json`、`evaluation_test.json`、`pairs_trainval.json`、`gt_trainval.json`。配对清单和 GT 清单分离；文件路径相对于同一个 release 根目录。清单记录旧 dataset 的全局帧索引，供推理复现 `seed+index`。
+4. 优先使用独立 `validation/` 或 `val/`；没有时从 train 中确定性留出 20% 的完整场景（向上取整，至少保留一个训练场景；`--split-seed 42`）。可用 `--validation-scenes i_12 i_72` 指定留出场景，或 `--validation-dir val` 指定独立目录。train、validation、test 场景名和真实目录必须互不重叠。
+5. 自动调用已有标定器，生成 `calibration.json` 和 `calibration_report.md`，然后检查标定是否适用于测试清单。`preparation_report.json` 记录配对规则、各场景帧数/时间差、GT 时钟偏移、跳过的区间、数据划分、参数假设与最终状态。
+
+默认 SDE 配置为 `timestamp_unit=us`、`timestamp_anchor=center`、`clock_offset=0`、`polarity_encoding=zero_one`、5 bins、256×256 中心裁剪/缩放。时间单位和时间锚点是声明的 SDE 默认约定，不从时间戳量级反推；可用同名 CLI 参数覆盖。`--clock-offset` 表示 **low RGB 与事件之间** 的时钟偏移，不是 normal 文件名与 low 文件名之差。`--clora-event-active-bins` 和 `--rgb-event-active-bins` 必须与要测试的 checkpoint 一致，例如旧模型使用 1 个 active bin 时显式传 1。
+
+原始整流的首末事件仅提供保守的已观察范围；超出该范围的帧对、超过场景中位帧间隔 1.5 倍的时间缺口会标记为 `time_gap`，只输出基线。不会把缺失的采集区间补成“零事件”。该阈值可用 `--gap-factor` 调整，报告保留具体原因。
+
+曝光和 ISP 无法仅从当前目录推断。默认如实标记为 unknown，并暂时把全部场景放在 `sde_default` 组。若已知采集条件不同，用 `--group-config groups.json` 指定，例如：
+
+```json
+{
+  "default": {
+    "observation_group": "camera_A",
+    "observation_conditions": {"camera": "填写真实相机", "exposure": "填写真实曝光", "isp": "填写真实处理流程"}
+  },
+  "scenes": {
+    "i_111": {
+      "observation_group": "camera_B",
+      "observation_conditions": {"camera": "填写真实相机", "exposure": "填写真实曝光", "isp": "填写真实处理流程"}
+    }
+  }
+}
+```
+
+每个需要使用的组都需要自身的 train/validation 支持。测试场景不会参与参数拟合，也不会根据测试数据放宽标定验收阈值或尺寸/帧间隔限制。
+
+其他模式：
+
+```bash
+# 本地只有 test/ 时，只生成测试配对清单及独立评估清单。
+python scripts/prepare_sde_idea7.py --data-root /实际release根目录 --output-dir ./idea7_test --test-only
+# 生成全部清单和场景划分，但暂不拟合参数。
+python scripts/prepare_sde_idea7.py --data-root /实际release根目录 --output-dir ./idea7_sde --skip-calibration
+```
+
+退出码：0 表示请求的阶段成功；2 表示准备出错或标定未通过（查看报告）；3 表示标定通过但测试集有未被验证覆盖的采集条件、尺寸或帧间隔。此时保留完整清单；若部分场景完全兼容，还输出 `pairs_test_supported.json` 和 `evaluation_test_supported.json`，并在报告中列明纳入/排除的完整场景。子集仅按采集范围筛选，不使用测试 GT 或质量指标；子集指标不能称为完整测试集指标。`--test-only/--skip-calibration` 的成功不代表已经完成标定。标定失败仍保留带 `status=failed` 的 JSON，不伪造可用于推理的参数。
+
+生成后推理使用相同的数据根目录：
+
+```bash
+export TEST_DATA_ROOT=/public/home/whb/Chen_Project/dataset/SDE_dataset/SDE_indoor/sde_in_release
+export PAIR_MANIFEST=./idea7_sde/pairs_test.json
+export EVALUATION_MANIFEST=./idea7_sde/evaluation_test.json
+export OBSERVATION_CALIBRATION=./idea7_sde/calibration.json
+# 再按下面“whb 推理”部分指定 CHECKPOINT_PATH 等配置。
+```
+
+## 1b. 准备其他数据的显式配对清单
+
+非 SDE 数据可用下述显式规格工具。它不会从文件名大小猜时间单位，不会将“排序配对”当作已经证明事件覆盖。
 
 ```bash
 python scripts/build_event_pair_manifest.py --write-example pair_spec.json
