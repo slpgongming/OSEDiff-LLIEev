@@ -234,6 +234,15 @@ Event-LoRA target selection and checkpoint rules:
 - V-only checkpoints without target metadata are interpreted as legacy `v`. Key evidence must agree with the declared target set. The historical V shared-head state keys remain unchanged.
 - After building Stage 2, run a zero-init consistency check: Stage 1 output and untrained Stage 2 output should be nearly identical.
 
+## idea8 Event-Structure Feature Guidance
+
+- See `docs/idea8_structure_dps.txt` for the current implementation and runnable workflow. ESG-only code has been removed; the seven historical baseline wrappers now use the idea8 entry with guidance disabled and preserve ordinary LoRA `down,mid,up`.
+- `test_idea8_structure_dps.py` defaults to PSNR(Y), SSIM(Y), LPIPS and whole-set FID. Disabling FID or all metrics must be explicit. The new generic shell defaults to `GUIDANCE_STEPS=0`, ordinary LoRA `none`, residual cross-attention, timestep 500, and inherits Event-LoRA targets from the checkpoint.
+- Positive guidance currently requires a Stage3 generator without decoder refinement, batch size 1, 256-square input, and a separately trained/calibrated structure checkpoint. Only a transient full-channel feature delta before the last UpBlock is optimized; generator weights are frozen and GT never enters guidance.
+- Train the independent structure head, then its confidence head on disjoint calibration scenes. Keep timestamp units/windows explicit. The extra positive/negative event view must not alter the original five-channel inputs. Checkpoints carry the preprocessing configuration; timestamp recording coverage is not inferred from the first/last event.
+- The user selected generic environment-variable paths for the new idea8 scripts. Preserve existing account defaults in historical wrappers. Full UNet replay is implemented; cached suffix execution is a later optimization, not current behavior.
+- `train_scripts/` and `test_scripts/` are local-only, ignored directories as requested on 2026-10-25. Keep their local files, but do not force-add them to Git. The Python training/testing entry points remain tracked.
+
 ## Code Development Requirements
 
 Priority order for future development:

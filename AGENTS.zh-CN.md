@@ -234,6 +234,15 @@ Event-LoRA 目标选择与 checkpoint 规则：
 - 缺少 targets 元信息的旧 checkpoint 按 V-only 解释，并核对实际权重键；旧 V 共享头键名保持不变。
 - Stage 2 刚构建完成后应做 zero-init consistency check：Stage 1 输出与 Stage 2 未训练输出应几乎一致。
 
+## idea8 事件结构驱动的特征修正
+
+- 当前实现与启动方式见 `docs/idea8_structure_dps.txt`。ESG 专用代码已移除；7 个历史 baseline wrapper 已迁入 idea8 入口，关闭纠错，并保留普通 LoRA `down,mid,up`。
+- `test_idea8_structure_dps.py` 默认计算 PSNR(Y)、SSIM(Y)、LPIPS 和整组 FID。关闭 FID 或全部指标必须显式指定。新通用脚本默认 `GUIDANCE_STEPS=0`、普通 LoRA `none`、residual cross-attention、timestep 500，Event-LoRA targets 从 checkpoint 继承。
+- 正步数指导当前只支持无 decoder refinement 的 Stage3、batch=1、256 方形输入，且需要独立训练并完成置信度阶段的结构 checkpoint。只优化最后一个 UpBlock 前的临时完整通道特征 delta；生成器权重与 GT 不参与指导优化。
+- 先训练独立结构头，再在互斥校准场景训练置信度头。时间单位/窗口必须明确。新增正负分离事件视图不得改变原有 5 通道输入。预处理配置随 checkpoint 保存；不得由首/末事件推断录制覆盖范围。
+- 用户已选择新 idea8 脚本采用环境变量通用路径。历史 wrapper 保留各自账号默认路径。当前实现完整 UNet 重放，后段缓存属于后续优化，尚未实现。
+- 根据用户 2026-10-25 的要求，`train_scripts/` 和 `test_scripts/` 为仅本地保留的忽略目录。保留本地文件，不要强制加入 Git；Python 训练/测试入口继续跟踪。
+
 ## 代码开发要求
 
 本项目后续开发优先级：

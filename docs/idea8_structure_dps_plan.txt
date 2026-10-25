@@ -1,0 +1,359 @@
+idea8：事件结构驱动的 UNet 主干特征在线纠错——代码修改计划
+
+日期：2026-10-25（Asia/Shanghai）
+仓库：https://github.com/slpgongming/OSEDiff-LLIEev
+本地：D:\霖丹项目\论文构思\Codex工作区\OSEDiff_转移至宇博电脑\OSEDiff
+基线：origin/idea4 = 101182b068d10f49a1e780da4467de02c1cf3c27
+工作分支：idea8，从上述提交新建；不是从 idea7 派生。
+状态更新：用户已授权实现。ESG 清理、独立结构头及完整重放的特征修正已落地。
+下文保留原始设计计划；当前使用方式和验证边界以 docs/idea8_structure_dps.txt 为准。
+
+一、确定的目标与边界
+
+保留现有 OSEDiff + Event LoRA（主要配置为 residual_cross_attn），冻结生成器、
+VAE、文本编码器及原事件分支。另行训练轻量事件结构预测器；推理时用事件支持
+的边缘结构检查增强图像，并仅优化当前样本的完整通道 UNet 中间特征。
+
+首选接入点为最后一个 UpBlock 的输入：
+
+  低光 RGB / 原事件输入
+    → 原模型前段（DownBlocks、MidBlock、前几个 UpBlocks）
+    → h0
+    → h0 + M * delta       ← 结构误差经后段反传
+    → 最后一个 UpBlock（保留原 Event LoRA）
+    → 输出卷积 → 原 scheduler.step → VAE decode → 增强图像
+
+delta 的形状为 [B,C,H_l,W_l]，与 h0 相同，绝不经过 rank=4 的投影瓶颈。
+它是每张图像从零创建的临时张量，不是网络权重，不进入 generator state_dict。
+M 是事件可靠区域缩放后的空间掩码，沿通道广播。掩码不能保证输出变化严格局部，
+仍需输出保护项。
+
+本方案不使用前后 RGB 亮度差，不恢复 ESG 正负事件分支，也不引入 idea7 的
+事件亮度观测模型。第一版针对边缘/轮廓和细边缘；不能仅凭边缘损失下降就宣称
+恢复了真实纹理。正式称谓为“DPS 启发的事件结构驱动主干特征在线优化”，不把
+学习得到的结构约束描述为已证明的物理似然或严格后验采样。
+
+扩散时间步保持一个；在线优化会增加前向和反向计算，不称为“一次前向”。
+最初一轮仅交付计划；后续用户已授权代码实现。本轮仍不执行正式训练、远端部署或提交/推送。
+
+二、最新 idea4 必须保留的能力
+
+1. 最新提交新增 event_lora_targets=auto/q,k,v,out/all/none，不能沿用早先
+   “仅替换 attn1.to_v”的假设。沿用 checkpoint 自动解析、显式配置一致性检查、
+   legacy V-only 回退和投影级独立 head。完整主干纠错与选用哪种投影解耦。
+2. 不改变原 LoRA A/B、alpha/rank、modulation_scale、普通 LoRA 激活分组，
+   不为开启纠错而迁移 targets 或偷偷启用 all。
+3. 保留 Stage1/2/3 训练、Stage4/5 decoder refinement 和 checkpoint 加载能力。
+   首轮正步数纠错只验证 refinement 关闭的 Stage3 路径；其余模式在未验证时
+   明确报不支持，不能静默关闭 refinement。steps=0 仍支持原 baseline 模式。
+4. 原 events / events_refinement 的表示、active bins、归一化及几何增强结果
+   保持不变。新结构输入是独立视图，不把旧 EventEncoder 从 5 通道改成 10 通道。
+5. 保留 DenoisingContext、固定采样 context、普通 denoise/decode 接口。
+6. 保留 _keep_event_features_for_checkpoint_backward 的训练语义。新版在
+   gradient checkpointing 重算需要时会保留事件特征，不能删 ESG 时改回
+   无条件 forward 后清理。
+
+三、ESG 清理清单与迁移顺序
+
+完成公共功能迁移、通过基线回归后，删除以下四个 ESG 专用文件：
+
+  models/event_self_swap_guidance.py
+  test_idea4_esg.py
+  test_scripts/test_idea4_esg.sh
+  tests/test_event_self_swap_guidance.py
+
+osediff_event_film.py 中删除：
+
+  - EventSelfSwapConfig / swap 相关 imports；
+  - _paired_timesteps（只服务正负双分支）；
+  - predict_denoised_latent_from_context 中 esg_config 参数、swap、正负分支
+    合批/顺序执行、差值外推与 ESG 专有统计；
+  - 其他调用中的 esg_config=None 及过时注释。
+
+保留普通预测路径、原 encoded_control 作为 scheduler 输入、耗时统计、事件
+缓存生命周期、DenoisingContext 和 decode/refinement。清理前先记录原普通路径
+的固定输入/RNG 输出，用来检查删除 ESG 是否改变了基线。
+
+以下 7 个 wrapper 依赖 ESG 总入口，必须改接后才能删入口：
+
+  test_scripts/test_idea4_stage3_70k_baseline_zyx111.sh
+  test_scripts/test_idea4_stage3_8-25-0020_outdoor_baseline.sh
+  test_scripts/test_idea4_stage3_8-25-1350_indoor_baseline.sh
+  test_scripts/test_idea4_stage4_9-15-1920_indoor.sh
+  test_scripts/test_idea4_stage4_9-15-2040_indoor.sh
+  test_scripts/test_idea4_stage4_9-2-2250_indoor_baseline.sh
+  test_scripts/test_idea4_stage4_9-2-2330_outdoor_baseline.sh
+
+迁移目标：中性 baseline shell 入口调用 test_idea8_structure_dps.py，强制
+guidance_steps=0，不要求结构头 checkpoint。保持原 wrapper 文件名、账户路径、
+checkpoint、seed、timestep、active bins、普通 LoRA 和 refinement 配置。
+特别检查 Stage3 refinement off；9-15-1920 的 legacy_fused + 两路 active_bins=1；
+9-15-2040 的 cgdrs、levels=2,3、gate_bias=-3、activity=abs_mean 和两路 bins=1；
+以及 9-2 室内/室外各自的权重、预训练 RGB-event encoder 配置。
+
+已核实一个容易漏掉的有效默认值差异：test_idea4_esg.py 继承 idea3 parser，
+unet_lora_parts 默认为 down,mid,up；ESG shell 没有覆盖它。因此上述 wrapper
+即使名字含 Stage3，也实际启用了全部普通 LoRA。迁移时必须显式传入
+--unet_lora_parts down,mid,up；不能因为改用 Stage3 parser 就落到 none。
+原 test_event_film_lora_osediff.py 的 Stage2/3 默认 none 仍保持。新方案的零步数
+与正步数比较必须使用同一显式激活配置，日志同时记录解析后的配置来源。
+
+迁移 test_idea4_esg.py 中的固定 seed+index、逐图/逐场景/总体指标、图像命名、
+refinement variants/both 和运行上下文归档能力；复用已有 metrics helper，
+避免再实现一套指标或沿用 ESG CSV 的无关字段。
+
+原 tests/test_event_self_swap_guidance.py 中三个公共测试意图必须迁移：
+  - 关闭指导时一次 UNet、scheduler 使用原 latent、输出与 baseline 一致；
+  - 各 Event LoRA variant 的普通路径和事件缓存清理；
+  - UNet 异常时清理缓存。
+
+以下 checkpoint 范围评测链与 ESG 无关，保留原行为/CSV schema：
+  test_event_film_lora_checkpoint_range.py
+    → test_event_film_lora_metrics.py
+    → test_event_film_lora_osediff.py / OSEDiffEventFiLMTest
+  tests/test_checkpoint_range_evaluation.py
+  docs/checkpoint_range_evaluation.txt
+
+不按 idea4 文件名前缀批量删除；Stage2/Stage4 训练脚本等不是 ESG。
+删除完成后扫描 tracked text 中的 ESG/import/exec bash 引用；历史计划说明可保留。
+
+四、新的事件结构输入：先解决目标时刻与空间对齐
+
+当前 sde_event_film_dataset.py 的 event_voxel_raw 是有符号 voxel，不是原始
+[t,x,y,p]；同 bin 正负事件会抵消。当前裁剪后用该区域首尾事件重新定义时间 bin，
+整段事件切片可能覆盖前后相邻帧，不能直接当作当前帧的精确边缘。
+
+新增独立的 events_structure 视图，第一版采用：
+  - 原始事件 [t,x,y,p]；先核对时间单位、目标帧参考时刻 t_ref 和配对规则；
+  - 围绕 t_ref 的固定短窗口，第一版明确为离线中心窗口，可使用未来事件，
+    不宣称因果在线推理；窗口长度从数据时间单位和验证结果确定；
+  - 5 个固定时间 bin，正负极性分开计数，得到 10 通道；
+  - 时间边界先固定，再空间 crop/flip/resize，裁剪不得重定义 bin；
+  - 计数使用固定配置的 log1p/尺度处理；参数只从训练数据确定并随权重保存；
+  - 与 low/normal 图像及原事件视图共用几何增强参数。
+
+保留原低光/正常光按场景、数值文件名排序后按索引配对的规则，核对正常光
+参考所对应的时间，不能强行要求文件同名。若曝光参考时刻/单位尚无可靠依据，
+先生成数据检查报告，不以猜测填充元数据。
+
+返回元数据至少包含：scene/frame、t_ref、t_start/t_end、时间单位、bin 边界、
+极性规则、窗口完整性、空间变换和表示版本。预存结构 voxel 仅在元数据齐全且
+兼容时接收；不能从原 signed voxel 伪造原始时间或正负计数。缺少所需原始数据
+时，开启纠错明确报错，steps=0 仍可使用原数据路径。
+
+代码组织：新增 dataloaders/sde_event_structure_dataset.py 和结构视图辅助函数。
+只对原 loader 做必要的共享几何参数提取，保留旧接口/返回值默认行为。新增
+推理数据路径允许没有 normal/GT；评测标签在外层独立加载。
+
+五、事件结构预测器：独立训练，再冻结用于推理
+
+第一版选择独立轻量 EventStructurePredictor，不让原 EventEncoder 或已有
+checkpoint 承担新 10 通道输入。这样也避免只使用原最高 1/8 特征而丢失细边缘。
+
+建议结构：10 通道输入 → 轻量 1/2、1/4、1/8 编码特征 → 多尺度融合 → 两尺度
+软边缘预测；保留高分辨率浅层跳连。初始通道可设 32/64/96，作为实现起点，
+不作为已验证最优配置。置信度头读取该预测器的冻结特征。
+
+固定结构算子 Phi：RGB 转统一灰度后，使用两尺度 Gaussian + Sobel 软幅值。
+输入域统一为 [0,1]；平滑尺度、幅值压缩尺度固定并版本化，禁止逐图 max
+归一化把不同对比度都变成“满幅边缘”。正常光图像通过同一个 Phi 产生标签。
+
+训练分两步，避免预测器通过把置信度降到零逃避结构监督：
+  A. 不用预测置信度加权结构监督，训练边缘预测器；
+  B. 冻结结构预测器，在独立校准场景上用其结构预测误差构造置信度标签，
+     例如 exp(-abs(error)/tau)，只训练置信度头。tau 及映射规则随权重保存。
+
+训练集按场景划分结构训练、置信度校准和验证子集，避免相邻帧泄漏；正式 test
+不用来训练头、校准置信度或选择指导强度。验证置信度与真实误差是否相符。
+
+推理时 C = 预测可信度 × 事件支持掩码；支持掩码由结构输入构建并允许小范围
+空间容差。没有事件不等于没有边缘：无支持区域不被当作“应当平滑”的负标签。
+S_E、C 只由事件和元数据产生，固定且 detach，不读取当前增强输出或 delta。
+
+新增 train_event_structure_head.py，支持 resume_from_checkpoint。结构权重独立
+保存，不重存整个生成器；记录模型结构、Phi 版本、窗口/极性/归一化配置、
+场景划分、优化器/步数、随机状态及校准配置。开启指导时必须有兼容结构权重，
+不能随机初始化后直接推理。原 OSEDiff + Event LoRA 不需为首版重新训练。
+
+六、主干纠错接口与执行流程
+
+models/unet_2d_condition.py 的 forward 新增可选 feature_guidance=None。
+在 up_blocks 循环、最后一个 UpBlock 执行前对 sample 调用一次注入接口。
+索引从 len(up_blocks)-1 解析，不固定写 3；返回值仍兼容原 UNet 输出。
+对象只属于当前调用，不注册参数/buffer，不改变权重键或保存格式。
+
+建议调用约定：
+  apply(hidden_states, up_block_index) → corrected_hidden_states
+  第一次抓取 h0.detach() 和实际形状；创建 FP32 leaf delta；后续注入
+  h0 + M * delta.to(h0.dtype)。仅对 delta 求梯度，不优化网络权重。
+
+osediff_event_film.py：
+  - 向普通 UNet 路径透传 feature_guidance；
+  - 复用 prepare_denoising_context，每样本 VAE latent 只采样一次；
+  - context 在 no_grad 下创建，不能在 inference_mode 下创建后直接参与反传；
+  - 新指导路径绕开 OSEDiffEventFiLMTest.forward 的 no_grad 装饰；
+  - 纠错入口 eval、requires_grad_(False)，第一版关闭 gradient checkpointing；
+    不修改原训练路径的 checkpoint 行为；
+  - 整个样本完成/异常后恢复开关、移除临时状态并清理事件缓存。
+
+每张图像的执行过程：
+  1. steps=0：直接走原 baseline，不加载结构头，不额外编码/调用 UNet。
+  2. 固定模型配置、采样 context、时间步和 scheduler 随机性；delta=0 得到 I0。
+  3. 从事件构造 S_E、C、M；支持为空时返回 I0。
+  4. 用当前 delta 生成候选，计算结构误差、输出保护项与幅度限制。
+  5. autograd.grad(loss, delta)，有限性检查后更新和投影，禁止跨样本积累。
+  6. 验收候选；不合格则缩小步长重试或返回已有最佳候选，初始 I0 始终可回退。
+  7. 输出最终图像、损失/修正幅度/置信度/耗时/调用次数/回退原因。
+
+旧模型保留所有冻结 Event LoRA；后段 cross-attention 重新计算，因为 Query
+依赖修正后的图像特征。仅事件编码可缓存，不能缓存其后段 cross-attention 输出。
+
+七、损失、数值域与可重复性
+
+核心损失：
+  L_struct = sum(C * Huber(Phi(I_delta)-S_E)) / (sum(C)+eps)
+  L_low    = 低通(I_delta) 与低通(I0)的差异，约束亮度与颜色
+  L_keep   = 低可信/非事件支持区域的 I_delta 与 I0 的差异
+  L_delta  = 归一化特征改变量的正则，可选
+
+保护参照是初始增强结果 I0，不是低光原图。除软正则外，必须限制实际注入量
+M*delta 相对于 h0 通道尺度的归一化幅度；尺度用固定 h0 统计并设置数值下限。
+delta=0 时 L_delta 的梯度为零，因此它不能替代第一次更新的硬幅度限制。
+FP32 保存 delta、梯度、损失和统计；模型输入转换到模型 dtype 的操作保留梯度。
+
+新增 decode 的 clamp_output=True 默认值以保持旧行为。指导可请求同一次 VAE
+解码的 raw 输出：优化损失在 (raw+1)/2 上计算，另加越界惩罚；最终显示和候选
+验收使用原 clamp 后图像。记录饱和比例。不得偷偷使用 straight-through clamp，
+也不得仅因为 raw 图像误差下降就接受最终 clamp 后更差的候选。
+
+候选验收只看无 GT 的结构目标和保护约束，不看测试 PSNR/LPIPS。若数值异常、
+越界/保护预算超限或没有可接受改善则回退。每次重试也计入真实计算开销。
+
+保持 scheduler.step(...).prev_sample 的原语义，不擅自换 pred_original_sample。
+外部 scheduler 配置目前尚未检查；实施时记录 prediction_type、variance、
+clip/threshold、实际 timestep/previous_timestep。set_timesteps(1) 不等于可
+假定 step 不消耗随机数。用每样本专用 generator 状态重放同一调度噪声；如版本
+接口不支持，则在局部 RNG 作用域内保存/恢复状态并验证，不扰动全局随机序列。
+每个候选始终使用同一 encoded_control，不把上一次输出继续作为 scheduler 输入。
+
+第一版启用范围：单样本、256×256 方形图、固定 checkpoint 匹配配置、Stage3
+refinement off。其他尺寸/批处理/拼块模式不静默套用方形或尺度假设。steps=0
+仍遵循既有支持范围。首先验证 FP32，随后验证 FP16 的梯度与饱和行为。
+
+八、分阶段修改文件
+
+阶段 A：迁移 baseline，删除 ESG，保持旧输出
+  修改：osediff_event_film.py
+  新增：test_idea8_structure_dps.py 的 steps=0 分支及必要的中性 baseline wrapper
+  改接：第三节列出的 7 个脚本
+  迁移：ESG 文件中的公共生命周期测试
+  删除：第三节四个专用文件
+  保留：原 metrics、checkpoint range、Stage1/2/3/4/5 训练与 checkpoint 逻辑
+
+阶段 B：建立数据和结构目标
+  新增：dataloaders/sde_event_structure_dataset.py
+  必要修改：dataloaders/sde_event_film_dataset.py（共享几何参数，默认行为不变）
+  新增：models/image_structure.py（唯一的固定 Phi 定义）
+  新增：models/event_structure_head.py
+  新增：train_event_structure_head.py
+  新增：事件时间/空间表示、结构标签及 checkpoint 元数据测试
+
+阶段 C：完整通道特征纠错最小版本
+  修改：models/unet_2d_condition.py（可选注入接口）
+  修改：osediff_event_film.py（透传接口、原始解码选项、固定推理上下文）
+  新增：models/event_structure_guidance.py（配置、loss、delta 更新、验收/回退）
+  完成：test_idea8_structure_dps.py 的正步数模式、无 GT 推理与指标隔离
+  第一版重放完整 UNet；冻结前段不保留其完整反传图，但仍有前段计算开销。
+
+阶段 D：在正确性与效果成立后优化后段重放
+  新增 prepare_feature_resume_context / forward_from_feature_context 类接口。
+  缓存 h0、尚未消费的 skip tensors、emb、处理后的 text/masks、kwargs、
+  upsample_size/forward_upsample_size 和 PEFT scale 执行上下文。
+  公共前向段落适度抽取，避免复制两份长期漂移的 UNet 实现。
+  scale_lora_layers / unscale_lora_layers 成对且异常安全。
+  完整版与缓存版必须在零/非零 delta 上同时通过输出与梯度一致性测试。
+  未通过前，不把“只重算后段”作为已完成能力。
+
+阶段 E：实验与文档
+  增加运行配置/结构 checkpoint 元数据/参数说明和结果日志。
+  必要时同步 AGENTS.md 与 AGENTS.zh-CN.md 的 idea8 用法，不重写无关规则。
+  当前计划无需确定服务器账号；实际新增/修改 .sh 前按仓库规则确认平台与账户。
+  已有 wrapper 的账户路径是迁移时的保留对象，不因新方案改到其他账户。
+  .sh 交付前完成参数逐项核对、独立重读、bash -n（可用时）、LF/BOM 检查，
+  环境变量覆盖与 archive_run_context 能力保留。不得在此阶段顺带启动训练。
+
+九、接口与参数约定
+
+生成器 checkpoint 与结构 checkpoint 分开传入；不要求重新训练/打包原生成器。
+建议新增参数：
+  --structure_checkpoint
+  --guidance_steps           默认 0；初始验证 1，再比较 2/3
+  --guidance_cut             默认 last_up_input
+  --guidance_lr
+  --guidance_trust_radius
+  --guidance_lambda_low / --guidance_lambda_keep / --guidance_lambda_range
+  --guidance_backtracking_steps
+  --structure_window_before / --structure_window_after / --structure_time_unit
+  --guidance_save_diagnostics
+
+正步数必须验证结构 checkpoint 与数据配置兼容。步长、trust radius、损失权重
+按归一化后的数值尺度设实现初值，在独立验证场景选择，并保存实际解析值；
+不得将未实验的数字表述为最优参数。保持 generator_timestep 与原实验一致，
+现有 Stage3 baseline 的 500 可作为复现起点，但不覆盖所有 checkpoint 配置。
+沿用 event_lora_targets=auto、普通 LoRA 激活组和 active_bins 的原入口规则。
+
+指导核心 API 只接收低光/事件/prompt/meta、固定 context 和结构观测，不接收 GT。
+评测脚本在图像生成后才读取/传给指标函数正常光标签。无 GT 也能完成推理。
+
+十、验收标准（实施后执行，本轮未运行）
+
+兼容性与清理：
+  - 删除 ESG 前后：同 checkpoint/input/RNG 的普通输出一致；steps=0 只有一次
+    UNet，且不加载结构头。delta=0 注入保持同输出。
+  - legacy V-only 与新 q/k/v/out checkpoint 的键、rank/scaling、targets、
+    普通 LoRA 激活组及各事件视图配置不漂移。
+  - 7 个 wrapper 不悬空，Stage3/4 配置保留；checkpoint range 和 metrics 原样可用。
+  - 原 targets/checkpoint、voxel/active bins、decoder refinement 等相关测试通过。
+
+梯度与状态：
+  - 受控小模型/合成边缘案例中，dL/ddelta 非零且有限，实际特征与输出会变化；
+    网络参数值与参数梯度不变。不是只检查张量 requires_grad 标志。
+  - 纠错结束/异常后清理事件缓存、临时回调和 delta；连续两样本没有状态串扰。
+  - 零事件支持、零梯度、NaN/Inf、无合格候选均有可解释回退。
+  - 调换或移除评测 GT 不改变同输入输出；无 GT 路径可运行。
+  - 同一 context/RNG 重复渲染可复现，scheduler 始终接收原 encoded_control。
+
+数据与结构目标：
+  - 合成时间戳/运动边缘案例证明：crop 不改变绝对 bin、极性不互相抵消、
+    RGB/GT/events_structure 的 crop/flip/resize 一致。
+  - 未知时间单位或缺失必要元数据不被猜测补齐；预存 voxel 不能伪造原始事件。
+  - 独立场景验证结构边缘定位、运动拖影与置信度可靠性，记录覆盖率与误差。
+  - 结构目标和可信度在在线更新期间固定，没有通过改变目标降低损失。
+
+性能与效果：
+  - FP32 通过后验证 FP16 梯度、饱和率与显存；不用“可导”代替实际梯度检查。
+  - 完整重放/后段缓存的输出与梯度一致，测试 skip、text、scale 与非零 delta。
+  - 报告 baseline、1 次和少量多次反馈的 PSNR/SSIM/LPIPS、边缘定位/细节
+    指标、逐场景结果、延迟、显存、真实完整/后段 forward 和 backward 次数。
+  - 比较正确、错时、错配事件；事件结构误差下降不能替代最终画质改善。
+
+建议诊断顺序：先在验证集用 GT 结构做“理想目标”接入能力诊断，再评估真实
+事件结构预测器，最后跑完整反馈。GT 诊断必须使用独立诊断入口、明确 oracle
+标记，不能混入实际无 GT 推理或正式方法指标。低秩修正可作为后续消融，不是
+idea8 第一版的主接入方式。
+
+十一、本轮已经完成与仍未验证的事项
+
+已完成：fetch 指定 GitHub origin；本地 idea4 快进 3bcec8d → 101182b；
+idea4 跟踪 origin/idea4；idea8 从 101182b 创建并检出；只读审计 ESG 依赖和
+主干接入/最新 targets 兼容性；生成本计划。
+
+本地旧 AGENTS 指南在同步前已备份至：
+D:\Codex\2026-10-18\事件扩散低光增强方案\work\idea8_sync_guides_20261025\
+
+更新：ESG 删除、模型/训练代码实现及合成数据 CPU 检查已执行。
+未执行：完整权重的 GPU 测试、真实数据结构头训练、时间对齐验证、后段缓存优化、
+远端运行、git commit 或 git push。详见当前使用说明中的检查记录和未验证事项。
+分支切换后出现的未跟踪 .pytest_cache/ 是原有缓存在新忽略规则下显露，保留不动。
+计划放在 docs/*.txt，沿用仓库已有文档位置，并避免当前 *.md 与 plan/ 忽略规则
+使计划在后续提交时被无意遗漏。

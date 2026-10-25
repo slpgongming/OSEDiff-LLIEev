@@ -1,0 +1,222 @@
+idea8 使用说明：事件结构驱动的 UNet 主干特征在线修正
+更新：2026-10-25
+
+1. 已实现的计算路径
+
+本分支基于 idea4 提交 101182b068d10f49a1e780da4467de02c1cf3c27。
+原 OSEDiff + Event LoRA（residual_cross_attn）仍负责生成初始增强结果。
+新增独立事件结构预测器：正负分离的 10 通道事件 → 两尺度软边缘 S 和置信度 C。
+推理在最后一个 UpBlock 之前，对主干特征执行 h = h0 + M * delta。
+delta 与 h0 同为 [B,C,H,W]，可修改全部通道，不经过 LoRA rank=4 瓶颈。
+delta 是当前样本的临时张量；生成器、VAE、事件编码器、LoRA、结构头权重均冻结。
+
+由 VAE 输出图像计算固定 Gaussian + Sobel 软边缘，与事件预测的结构比较；
+结构误差通过 VAE、scheduler 映射、UNet 后段反传到 delta。后段 Event LoRA
+的 cross-attention 会重新计算，其 Query 仍可随主干特征变化。
+候选必须在最终 clamp 图像上改善总目标，并满足输出变化预算，否则减半步长重试；
+全部重试失败则返回上一个已接受结果，至少保留初始增强结果作为回退。
+
+这是一种 DPS 启发的结构约束优化，不是原始 DPS 的严格后验采样。
+不比较前后两帧亮度变化；边缘损失下降也不等于恢复了真实纹理。
+扩散时间步仍固定为一个，开启修正会执行多次 UNet/VAE 前向和反向。
+当前版本完整重放 UNet，没有实现后段缓存加速；forward_calls 记录包括重试的实际次数。
+
+当前正步数支持：Stage3、refinement 关闭、batch=1、256×256 方形输入。
+含 decoder-refinement 权重的 checkpoint 不用于此版本的正步数修正。
+steps=0 则保持既有 baseline 能力，包括旧 Stage4 的 legacy_fused/CGDRS 路径。
+结构头未训练或未完成置信度阶段时，程序拒绝开启指导。
+
+2. 文件入口
+
+Git 同步范围（2026-10-25 更新）：train_scripts/ 和 test_scripts/ 已加入忽略规则，
+两个目录仅在本地保留。新 clone 可直接调用仓库中的 Python 训练/测试入口，
+使用 --help 查看参数，或另行复制本地启动脚本。下文 Bash 示例以本地脚本存在为前提。
+
+models/image_structure.py                 训练/推理共用、版本化的可导软边缘算子
+models/event_structure_head.py            独立事件结构头、置信度头和 checkpoint
+dataloaders/sde_event_structure_dataset.py 固定时间窗口、正负分离的额外事件视图
+models/event_structure_guidance.py        全通道 delta 优化、验收/回退、状态清理
+models/unet_2d_condition.py               最后一个 UpBlock 前的可选注入接口
+osediff_event_film.py                     固定 context 预测、可选 raw VAE 输出
+train_event_structure_head.py             结构头训练、置信度训练、epoch 边界续训
+test_idea8_structure_dps.py                统一 baseline/修正推理和四指标评测
+train_scripts/train_idea8_structure_head.sh 通用训练脚本
+test_scripts/test_idea8_structure_dps.sh   通用测试脚本
+tests/test_structure_dps.py               数据、训练、梯度、状态恢复和指标流程回归
+tests/test_event_inference_context.py     原事件分支/梯度检查点缓存生命周期回归
+
+已删除 ESG 专用模块、测试入口、总启动脚本及 ESG 专用单测；其公共生命周期测试
+迁入 test_event_inference_context.py。7 个旧 baseline wrapper 已接入新测试入口。
+原 Stage1/2/3 训练和 checkpoint-range 评测链保留。
+
+3. 数据、时间和场景划分
+
+数据沿用仓库的 SDE 结构：
+  DATA_ROOT/scene_name/low/<数字名称>.png
+  DATA_ROOT/scene_name/normal/<数字名称>.png
+  DATA_ROOT/scene_name/low/<事件片段>.npz
+或 low/lowlight_event.npz（完整事件流）。
+RGB/GT/事件片段仍按各自数字名称排序后的 index 配对，不要求同名。
+现有数据读取器扫描 PNG；JPG 数据需要先统一数据格式。
+
+原 5 通道 cLoRA/refinement 视图保持既有语义。结构视图单独读取原始 [t,x,y,p]，
+前 5 通道为正极性、后 5 通道为负极性；同点同 bin 的正负事件不会相消。
+时间先以 int64 减窗口起点，再按固定边界分箱。结构数据拒绝有符号预计算 voxel
+和已经丢失绝对时间精度的 float32 时间戳。
+计数归一化固定为 clamp(log1p(count)/3, 0, 1)，不做逐样本最大值归一化。
+RGB、GT、三种事件视图共享同一次裁剪/翻转/缩放参数。
+
+必须核对传感器元数据后显式提供：
+  STRUCTURE_TIME_UNIT=ms/us/ns
+  STRUCTURE_WINDOW_BEFORE=<目标时刻之前的整数 ticks>
+  STRUCTURE_WINDOW_AFTER=<目标时刻之后的整数 ticks>
+窗口为 [t_ref-before, t_ref+after)。允许 after=0 的因果窗口。
+若 after>0，使用了未来事件，不能宣称因果实时推理。
+单位声明不自动转换文件内容，事件与目标时间必须已在同一单位和时钟域。
+
+STRUCTURE_REFERENCE=filename（默认）：low PNG 名称必须是真实目标时间戳。
+若名称仅为帧序号，应使用 STRUCTURE_REFERENCE=manifest，提供 STRUCTURE_MANIFEST CSV：
+  scene,frame_id,t_ref,time_unit
+  scene_a,000001,1234567890000000,ns
+frame_id 必须与 low 文件 stem 一致；示例数值不代表实际数据的单位或偏移。
+STRUCTURE_TIMESTAMP_OFFSET 默认 0，在两种 reference 模式下都加到 t_ref。
+
+优先使用完整事件流；若只有分片，需自行确认每片覆盖目标窗口。
+没有传感器录制起止元数据时，诊断明确标记 recording_bounds_unverified。
+首/末事件并不等于录制边界；当前实现不会假装已验证窗口完整。
+窗口配置、单位、极性布局、算子参数随结构 checkpoint 保存，测试继承这些配置。
+manifest 模式的测试数据需另传与测试帧匹配的 STRUCTURE_MANIFEST。
+
+准备 scene_split.json，三组必须非空、互斥，场景实际位于 TRAIN_DATA_ROOT：
+  {"train":["scene_a","scene_b"],"calibration":["scene_c"],"validation":["scene_d"]}
+用实际场景名替换示例。必须按场景划分，避免相邻帧泄漏。
+正式 test 场景不参与结构训练、置信度训练或指导强度选择。
+
+4. 训练独立结构头
+
+以下均在服务器仓库根目录、已安装 requirements.txt 的环境运行。
+路径全部由环境变量传入，不绑定服务器账户；不会启动原生成器训练。
+先设置数据、划分和输出目录，并根据元数据设置时间单位与窗口。
+
+  export TRAIN_DATA_ROOT=/your/dataset/train
+  export SCENE_SPLIT=/your/config/scene_split.json
+  export OUTPUT_DIR=/your/results/idea8_structure
+  export STRUCTURE_TIME_UNIT=<ms或us或ns>
+  export STRUCTURE_WINDOW_BEFORE=<整数ticks>
+  export STRUCTURE_WINDOW_AFTER=<整数ticks>
+  PHASE=structure bash train_scripts/train_idea8_structure_head.sh
+
+上述尖括号是必须替换的占位符，不可原样复制执行。
+阶段 A 以正常光图像的固定软边缘作标签，训练结构预测器；不乘预测置信度。
+结构头初始编码通道为 32/64/96，输出 1/2 高分辨率融合后的两尺度边缘。
+
+阶段 B 在 calibration 场景上冻结结构分支，仅训练置信度头：
+
+  PHASE=confidence \
+  INIT_STRUCTURE_CHECKPOINT=/your/results/idea8_structure/checkpoint_last.pt \
+  OUTPUT_DIR=/your/results/idea8_confidence \
+  bash train_scripts/train_idea8_structure_head.sh
+
+置信度标签为 exp(-abs(预测边缘-正常光边缘)/tau)，默认 tau=0.1。
+训练完成这一阶段不代表已证明置信度可靠，仍需检查 validation 场景结果。
+
+默认 AdamW、lr=0.0001、10 epochs、batch=4、num_workers=0、seed=42。
+EPOCHS/BATCH_SIZE/LEARNING_RATE/CONFIDENCE_TAU/NUM_WORKERS/SEED 支持环境变量覆盖。
+附加 Python 参数可放在脚本末尾，例如 --base_channels 16 或 --device cpu。
+恢复训练使用同一 phase，EPOCHS 表示希望达到的总 epoch 数：
+
+  PHASE=confidence RESUME_FROM_CHECKPOINT=/your/results/idea8_confidence/checkpoint_last.pt \
+  OUTPUT_DIR=/your/results/idea8_confidence EPOCHS=20 \
+  bash train_scripts/train_idea8_structure_head.sh
+
+RESUME_FROM_CHECKPOINT 与 INIT_STRUCTURE_CHECKPOINT 互斥。续训恢复优化器、epoch
+和随机状态；改变阶段用 INIT。配置不兼容时报错。恢复精度为 epoch 边界。
+输出 checkpoint_last.pt、run_config.json、metrics.jsonl；日志在本地，不依赖 W&B。
+
+5. 基线与修正推理：默认四指标
+
+  export PRETRAINED_MODEL_NAME_OR_PATH=/your/models/stable-diffusion-2-1-base
+  export CHECKPOINT_PATH=/your/stage3/checkpoints/model_final.pkl
+  export TEST_DATA_ROOT=/your/dataset/test
+  export OUTPUT_DIR=/your/results/idea8_baseline
+  GUIDANCE_STEPS=0 bash test_scripts/test_idea8_structure_dps.sh
+
+开启纠错时，加载完成阶段 B 的 checkpoint：
+
+  GUIDANCE_STEPS=1 \
+  STRUCTURE_CHECKPOINT=/your/results/idea8_confidence/checkpoint_last.pt \
+  OUTPUT_DIR=/your/results/idea8_guided MIXED_PRECISION=fp32 \
+  bash test_scripts/test_idea8_structure_dps.sh
+
+先在 validation 上试 1 步，再比较 2/3 步；参数是实现初值，并非验证过的最优值。
+公平对比 baseline/guided 时固定数据、generator checkpoint、seed、prompt、
+timestep、精度、event_lora_targets、普通 LoRA 激活组和原事件 active bins。
+
+关键默认值（新通用脚本）：
+  GUIDANCE_STEPS=0；GENERATOR_TIMESTEP=500；IMAGE_SIZE=256；SEED=42
+  EVENT_LORA_VARIANT=residual_cross_attn；EVENT_LORA_TARGETS=auto
+  EVENT_LORA_MOD_CHANNELS=64；LORA_RANK=4；EVENT_LORA_MODULATION_SCALE=0.1
+  UNET_LORA_PARTS=none；DECODER_REFINEMENT_ENABLED=0
+  CLORA_EVENT_ACTIVE_BINS=5；RGB_EVENT_ACTIVE_BINS=5
+  MIXED_PRECISION=fp16；CUDA_VISIBLE_DEVICES=0；SAVE_IMAGES=0
+  GUIDANCE_LR=0.01；GUIDANCE_TRUST_RADIUS=0.03
+  GUIDANCE_LAMBDA_LOW=2.0；GUIDANCE_LAMBDA_KEEP=1.0；GUIDANCE_LAMBDA_RANGE=1.0
+  GUIDANCE_MAX_LOW_CHANGE=0.02；GUIDANCE_MAX_OUTSIDE_CHANGE=0.02
+  GUIDANCE_MIN_CONFIDENCE=0.25；GUIDANCE_BACKTRACKING_STEPS=3
+
+targets=auto 继承 checkpoint，不强行改成 all；旧无 targets 元数据的权重按 v 处理。
+新入口普通 LoRA 默认 none，7 个旧 baseline wrapper 则显式保留 down,mid,up。
+旧 wrapper 的原数据/权重路径、legacy_fused/CGDRS、bin=1 等实验配置仍各自保留。
+
+默认指标：PSNR(Y)、SSIM(Y)、LPIPS、整组 FID。
+前三项逐图计算并按样本数汇总；FID 在整组预测与 GT 分布之间计算，不能逐图平均。
+LPIPS 输入为 RGB [0,1]，由 PyIQA 处理。FID 沿用仓库 PNG 临时图像路径。
+指标模型权重须在运行环境可用；依赖、下载或计算失败会抛错，不静默省略指标。
+默认至少需要 2 张图；单图 smoke test 可显式 CALCULATE_FID=0。
+小样本 FID 仅适合流程检查，不适合得出论文结论。
+SAVE_IMAGES=1 保存预测/低光/GT；GUIDANCE_SAVE_DIAGNOSTICS=1 额外保存结构/置信度 tensor。
+没有 GT 的实际部署可在脚本后加 --inference_only，显式关闭指标、保存输出；
+此模式不读取 normal 图像。指导本身从来不接收 GT，也不据测试指标接受候选。
+
+两种脚本都支持 DRY_RUN=1，仅打印参数，不检查远端文件是否存在，不启动计算。
+实际运行会先检查路径，并调用 archive_run_context 保存运行上下文。
+
+6. 输出和诊断
+
+  idea8_summary.csv      总体 PSNR/SSIM/LPIPS/FID（默认四项齐全）
+  idea8_per_image.csv    逐图前三项指标与结果路径
+  idea8_scene.csv        逐场景前三项指标；FID 只在总体表中
+  idea8_diagnostics.json 每图调用次数、接受步数、回退原因、目标变化、耗时
+  run_config.json        实际参数、LoRA targets、普通 LoRA 分组、scheduler/结构配置
+
+有支持的指导还记录特征 shape、相对修正幅度、初始/最终损失、饱和比例、
+平均置信度和有效支持比例。可选 diagnostics/<scene>/<frame>.pt 保存 S/C。
+reason=no_event_support 表示事件有效支持为空；no_acceptable_candidate 表示
+没有通过验收的进一步改进。两者均回退到有效结果，不强行锐化。
+
+L_struct：C 加权 Huber 软边缘误差，Huber delta=0.1。
+L_low：相对初始增强结果的低通 RGB 差异；L_keep：低可信区域的 RGB 差异。
+L_range：raw VAE 输出超出显示范围的二次惩罚，避免依赖 clamp 导数。
+投影约束的是 M*delta 相对 h0 各通道 RMS 的归一化幅度。
+由于后段卷积/注意力会传播变化，空间掩码不代表输出变化绝对局部。
+FP32 保存 delta/loss；FP16 后段反传采用 1024 的损失缩放后还原梯度。
+数值异常或不合格候选不被接受；若初始生成器自身输出非有限值，则直接报错。
+
+7. 已做检查与未做实验
+
+本地 CPU 检查包括：实际小型 UNet 的零修正等价、非零梯度、全通道修改；
+residual_cross_attn 在 V-only 和 q/k/v/out 下的 FP32/FP16 前向反传；
+真实 DDPMScheduler + 小型 VAE 的解码链路、固定 RNG、模式/梯度开关恢复；
+事件时间精度/极性/裁剪、新旧视图一致、空支持/非有限候选回退；
+合成数据结构训练、置信度训练、epoch 续训；默认四指标文件收集与汇总。
+指标流程测试使用明确测试替身，不下载指标网络，产生的测试数值不是模型效果。
+2026-10-25 最终回归结果：48 passed、33 subtests passed；1 条依赖弃用警告。
+运行回归：python -m pytest -q tests
+
+脚本已逐项核对原 baseline 的有效默认值，并独立做 bash -n、DRY_RUN 参数解析、
+LF/BOM 检查。远端数据/模型路径的存在性仍需在运行服务器检查。
+共检查 9 个脚本，7 个历史 baseline 的有效默认值与原入口逐项匹配。
+未执行真实数据结构头训练、完整生成器权重的 GPU 推理、真实四指标测量或效果实验。
+本地测试环境 torch=2.5.1+cpu、diffusers=0.25.0；仓库要求的服务器 torch=2.0.1
+与 CUDA 路径仍需验证。暂不声称真实数据提分、实时性或纹理真实性。
+原计划中的后段缓存加速尚未实现，留待正确性和效果验证后再做。

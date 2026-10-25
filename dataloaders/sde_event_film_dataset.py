@@ -73,6 +73,8 @@ class SDEEventFilmDataset(Dataset):
         self.fixed_prompt = getattr(args, "fixed_prompt", "high quality, bright, detailed photo")
         self.neg_prompt = getattr(args, "neg_prompt", "")
         self.event_ablation_mode = getattr(args, "event_ablation_mode", "correct")
+        self.require_ground_truth = bool(getattr(args, "require_ground_truth", True))
+        self.return_geometry = bool(getattr(args, "return_geometry", False))
         if self.event_ablation_mode not in {"correct", "zero", "shuffled"}:
             raise ValueError(
                 f"Unsupported event_ablation_mode={self.event_ablation_mode}."
@@ -95,7 +97,8 @@ class SDEEventFilmDataset(Dataset):
     def __getitem__(self, index):
         sample = self.samples[index]
         low_img = Image.open(sample.low_path).convert("RGB")
-        normal_img = Image.open(sample.normal_path).convert("RGB")
+        # 无 GT 推理只用 low 的占位张量复用几何处理，绝不把它作为标签返回。
+        normal_img = Image.open(sample.normal_path).convert("RGB") if sample.normal_path else low_img
         width, height = low_img.size
 
         raw_or_voxel = self._load_event_for_sample(sample)
@@ -116,13 +119,15 @@ class SDEEventFilmDataset(Dataset):
         normal_t = transforms.ToTensor()(normal_img)
 
         # 所有几何增强共享同一个 crop/flip 参数，保证 RGB、GT、event 对齐。
-        low_t, normal_t, event_t = self._aligned_preprocess(
+        processed = self._aligned_preprocess(
             low_t=low_t,
             normal_t=normal_t,
             raw_or_voxel=raw_or_voxel,
             width=width,
             height=height,
+            return_geometry=self.return_geometry,
         )
+        low_t, normal_t, event_t = processed[:3]
 
         # RGB tensors use torchvision normalization: [0,1] -> [-1,1] per channel.
         # Keep torch.nn.functional as F for interpolation below; its normalize API is Lp-norm,
@@ -160,6 +165,11 @@ class SDEEventFilmDataset(Dataset):
         }
         if self.return_raw_event_voxel:
             output["event_voxel_raw"] = raw_event_t
+        if self.return_geometry:
+            output["geometry"] = processed[3]
+        if sample.normal_path is None:
+            output.pop("output_pixel_values")
+            output.pop("normal_path")
         return output
 
     def _validate_active_bins(self, value, name):
@@ -215,7 +225,7 @@ class SDEEventFilmDataset(Dataset):
                 continue
             low_dir = os.path.join(scene_dir, "low")
             normal_dir = os.path.join(scene_dir, "normal")
-            if not (os.path.isdir(low_dir) and os.path.isdir(normal_dir)):
+            if not os.path.isdir(low_dir) or (self.require_ground_truth and not os.path.isdir(normal_dir)):
                 continue
 
             low_files = sorted(
@@ -224,6 +234,8 @@ class SDEEventFilmDataset(Dataset):
             normal_files = sorted(
                 glob.glob(os.path.join(normal_dir, "*.png")), key=_timestamp_sort_key
             )
+            if not self.require_ground_truth:
+                normal_files = [None] * len(low_files)
             whole_event_path = os.path.join(low_dir, "lowlight_event.npz")
             split_event_files = sorted(
                 (
@@ -305,7 +317,8 @@ class SDEEventFilmDataset(Dataset):
         sliced = events[mask]
         return sliced if len(sliced) > 0 else events[:0]
 
-    def _aligned_preprocess(self, low_t, normal_t, raw_or_voxel, width, height):
+    def _aligned_preprocess(self, low_t, normal_t, raw_or_voxel, width, height, return_geometry=False):
+        scale = 1.0
         if self.split == "train":
             crop_h = crop_w = self.image_size
             if height < crop_h or width < crop_w:
@@ -338,7 +351,12 @@ class SDEEventFilmDataset(Dataset):
             low_crop = F.interpolate(low_crop.unsqueeze(0), size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)[0]
             normal_crop = F.interpolate(normal_crop.unsqueeze(0), size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)[0]
             event_crop = F.interpolate(event_crop.unsqueeze(0), size=(self.image_size, self.image_size), mode="nearest")[0]
-        return low_crop, normal_crop, event_crop
+        result = (low_crop, normal_crop, event_crop)
+        if return_geometry:
+            # 仅描述已经抽取的几何操作；新增视图不再抽取随机 crop/flip。
+            result += (dict(scale=scale, top=top, left=left, crop_h=crop_h,
+                            crop_w=crop_w, flip=do_flip, image_size=self.image_size),)
+        return result
 
     def _scale_event(self, event, scale):
         if event.ndim == 3:
