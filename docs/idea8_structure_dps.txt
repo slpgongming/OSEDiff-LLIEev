@@ -34,7 +34,7 @@ Git 同步范围（2026-10-25 更新）：train_scripts/ 和 test_scripts/ 已�
 
 models/image_structure.py                 训练/推理共用、版本化的可导软边缘算子
 models/event_structure_head.py            独立事件结构头、置信度头和 checkpoint
-dataloaders/sde_event_structure_dataset.py 固定时间窗口、正负分离的额外事件视图
+dataloaders/sde_event_structure_dataset.py idea4 兼容/固定窗口、正负分离的额外事件视图
 models/event_structure_guidance.py        全通道 delta 优化、验收/回退、状态清理
 models/unet_2d_condition.py               最后一个 UpBlock 前的可选注入接口
 osediff_event_film.py                     固定 context 预测、可选 raw VAE 输出
@@ -61,12 +61,23 @@ RGB/GT/事件片段仍按各自数字名称排序后的 index 配对，不要求
 
 原 5 通道 cLoRA/refinement 视图保持既有语义。结构视图单独读取原始 [t,x,y,p]，
 前 5 通道为正极性、后 5 通道为负极性；同点同 bin 的正负事件不会相消。
-时间先以 int64 减窗口起点，再按固定边界分箱。结构数据拒绝有符号预计算 voxel
+时间先以 int64 相减后再分箱。结构数据拒绝有符号预计算 voxel
 和已经丢失绝对时间精度的 float32 时间戳。
 计数归一化固定为 clamp(log1p(count)/3, 0, 1)，不做逐样本最大值归一化。
 RGB、GT、三种事件视图共享同一次裁剪/翻转/缩放参数。
 
-必须核对传感器元数据后显式提供：
+默认 STRUCTURE_MODE=idea4_compatible（2026-10-25 更新）：
+优先复用按排序 index 配对的事件分片；没有分片则使用原读取器，从完整事件流中
+按前/后相邻低光帧时间戳截取，严格排除窗口两端。第一帧/最后一帧使用事件流首/末时间作为外边界。
+共享空间裁剪后，以剩余首/末事件时间范围均分为 5 个 bin，末事件归入最后一个 bin；
+同一时刻事件归入第一个 bin，空事件输出零。分箱公式与 idea4 的相对时间 float32 比值一致。
+正负分开计数为 10 通道，不采用生成器的 active_bins 合并；保留结构头原有 log1p 归一化。
+不需要设置 STRUCTURE_TIME_UNIT / STRUCTURE_WINDOW_BEFORE / STRUCTURE_WINDOW_AFTER，
+也不使用 manifest/offset；遗留固定窗口参数应清除，避免误认为这些参数在兼容模式生效。
+完整流截取仍要求事件与图像文件名时间戳单位/时钟域一致。各样本的物理窗口长度可能不同，
+空间裁剪可能改变分箱边界；相邻帧窗口可能包含未来事件，不宣称因果实时推理。
+
+可选 STRUCTURE_MODE=fixed_window，必须核对传感器元数据后显式提供：
   STRUCTURE_TIME_UNIT=ms/us/ns
   STRUCTURE_WINDOW_BEFORE=<目标时刻之前的整数 ticks>
   STRUCTURE_WINDOW_AFTER=<目标时刻之后的整数 ticks>
@@ -81,10 +92,12 @@ STRUCTURE_REFERENCE=filename（默认）：low PNG 名称必须是真实目标�
 frame_id 必须与 low 文件 stem 一致；示例数值不代表实际数据的单位或偏移。
 STRUCTURE_TIMESTAMP_OFFSET 默认 0，在两种 reference 模式下都加到 t_ref。
 
-优先使用完整事件流；若只有分片，需自行确认每片覆盖目标窗口。
+固定窗口模式优先使用完整事件流；若只有分片，需自行确认每片覆盖目标窗口。
 没有传感器录制起止元数据时，诊断明确标记 recording_bounds_unverified。
 首/末事件并不等于录制边界；当前实现不会假装已验证窗口完整。
-窗口配置、单位、极性布局、算子参数随结构 checkpoint 保存，测试继承这些配置。
+模式、窗口配置、单位、极性布局、算子参数随结构 checkpoint 保存，测试继承这些配置。
+新预处理配置版本为 v2；缺少 mode 的旧 v1 checkpoint 仍按 fixed_window 读取。
+续训/置信度初始化显式指定不同 mode 会报错；换模式必须从头训练结构和置信度，不能静默复用。
 manifest 模式的测试数据需另传与测试帧匹配的 STRUCTURE_MANIFEST。
 
 准备 scene_split.json，三组必须非空、互斥，场景实际位于 TRAIN_DATA_ROOT：
@@ -96,17 +109,16 @@ manifest 模式的测试数据需另传与测试帧匹配的 STRUCTURE_MANIFEST�
 
 以下均在服务器仓库根目录、已安装 requirements.txt 的环境运行。
 路径全部由环境变量传入，不绑定服务器账户；不会启动原生成器训练。
-先设置数据、划分和输出目录，并根据元数据设置时间单位与窗口。
+先设置数据、划分和输出目录；默认兼容模式不需要时间单位/窗口。
 
   export TRAIN_DATA_ROOT=/your/dataset/train
   export SCENE_SPLIT=/your/config/scene_split.json
   export OUTPUT_DIR=/your/results/idea8_structure
-  export STRUCTURE_TIME_UNIT=<ms或us或ns>
-  export STRUCTURE_WINDOW_BEFORE=<整数ticks>
-  export STRUCTURE_WINDOW_AFTER=<整数ticks>
   PHASE=structure bash train_scripts/train_idea8_structure_head.sh
 
-上述尖括号是必须替换的占位符，不可原样复制执行。
+若需固定窗口，再设置 STRUCTURE_MODE=fixed_window 及前述三个时间参数。
+whb / SDE indoor 可直接运行 train_scripts/train_idea8_sde_indoor_whb.sh，默认依次完成两阶段；
+配套 test_scripts/test_idea8_sde_indoor_whb.sh 使用指定 Stage3 生成器、timestep=500。
 阶段 A 以正常光图像的固定软边缘作标签，训练结构预测器；不乘预测置信度。
 结构头初始编码通道为 32/64/96，输出 1/2 高分辨率融合后的两尺度边缘。
 
@@ -120,9 +132,19 @@ manifest 模式的测试数据需另传与测试帧匹配的 STRUCTURE_MANIFEST�
 置信度标签为 exp(-abs(预测边缘-正常光边缘)/tau)，默认 tau=0.1。
 训练完成这一阶段不代表已证明置信度可靠，仍需检查 validation 场景结果。
 
-默认 AdamW、lr=0.0001、10 epochs、batch=4、num_workers=0、seed=42。
+默认 AdamW、lr=0.0001、10 epochs、每卡 batch=4、num_workers=0、seed=42。
 EPOCHS/BATCH_SIZE/LEARNING_RATE/CONFIDENCE_TAU/NUM_WORKERS/SEED 支持环境变量覆盖。
-附加 Python 参数可放在脚本末尾，例如 --base_channels 16 或 --device cpu。
+附加 Python 参数可放在脚本末尾，例如 --base_channels 16；CPU 检查设置 DEVICE=cpu。
+whb 包装脚本默认 NUM_PROCESSES=2、CUDA_VISIBLE_DEVICES=0,1，全局 batch=8，学习率仍为 0.0001。
+通用脚本默认 NUM_PROCESSES=1；双卡可设 NUM_PROCESSES=2 CUDA_VISIBLE_DEVICES=0,1。
+单卡示例：NUM_PROCESSES=1 CUDA_VISIBLE_DEVICES=0 bash train_scripts/train_idea8_sde_indoor_whb.sh。
+若希望双卡全局 batch 仍为 4，设置 BATCH_SIZE=2。结构和置信度依次执行，每个阶段各自使用两卡。
+Bash 自动用 python -m torch.distributed.run 启动本机进程，不要再在外层套 torchrun/accelerate。
+CUDA 使用 NCCL，一进程一卡；CPU/Gloo 用于本地双进程回归。脚本实际启动前检查可见 GPU 数量。
+DDP 的 num_workers>0 时强制 spawn 创建数据 worker，避免在 NCCL 初始化后 fork 通信状态。
+训练数据按 DistributedSampler 分片，每轮 set_epoch；样本数不能被卡数整除时补齐少量重复样本，
+训练 loss 按实际处理样本数汇总。验证按 rank 分片不补齐，每个样本只计一次，允许某 rank 无验证样本。
+仅 rank 0 写配置、日志和 checkpoint；所有 rank 的 RNG 随 checkpoint 保存，推理仍单卡加载无 module. 前缀的权重。
 恢复训练使用同一 phase，EPOCHS 表示希望达到的总 epoch 数：
 
   PHASE=confidence RESUME_FROM_CHECKPOINT=/your/results/idea8_confidence/checkpoint_last.pt \
@@ -131,7 +153,21 @@ EPOCHS/BATCH_SIZE/LEARNING_RATE/CONFIDENCE_TAU/NUM_WORKERS/SEED 支持环境变�
 
 RESUME_FROM_CHECKPOINT 与 INIT_STRUCTURE_CHECKPOINT 互斥。续训恢复优化器、epoch
 和随机状态；改变阶段用 INIT。配置不兼容时报错。恢复精度为 epoch 边界。
+完整续训须保持 world_size、每卡 batch、num_workers、seed、设备类型不变，不能把旧单卡状态当双卡精确恢复。
+改变卡数可用 PHASE=structure INIT_STRUCTURE_CHECKPOINT=旧结构权重 OUTPUT_DIR=新目录，仅继承权重，从 epoch 0 重新建优化器。
+置信度阶段可从任意卡数训练完成的结构权重初始化；同样不继承结构阶段优化器或步数。
 输出 checkpoint_last.pt、run_config.json、metrics.jsonl；日志在本地，不依赖 W&B。
+
+终端 step 进度默认 LOG_INTERVAL=50（Python 参数 --log_interval 50，须为正整数）：
+  LOG_INTERVAL=20 bash train_scripts/train_idea8_sde_indoor_slpchen.sh
+每个 epoch 的训练和验证分别在开始、首 batch、每 N 个 batch、最后一个 batch 输出，立即 flush。
+仅 rank 0 输出 phase、stage、epoch、step/总步数、百分比、当前/累计 loss、阶段耗时、秒/步和预计剩余时间。
+step 按当前阶段的 batch 计数，每个 epoch 重置；DDP 训练的一个 step 是所有 rank 各处理一个 batch。
+loss_rank0/avg_loss_rank0 只反映主卡的当前/累计样本；epoch 末原有 JSON 仍是全卡汇总，metrics.jsonl 格式不变。
+ETA 只估计当前阶段的剩余时间，验证进度仅为主卡所分到的批次；不增加循环内通信，兼容验证样本数不均匀。
+指标/RNG 汇总、checkpoint 保存前后、等待其他 rank 和 epoch 完成也有独立提示。
+这是 step 进度，不是定时心跳；若数据读取或单步很慢，会等该步完成才更新。
+续训允许改变日志间隔。正在运行的旧进程不会自动更新；保存成功后重启并指定 PHASE/RESUME_FROM_CHECKPOINT。
 
 5. 基线与修正推理：默认四指标
 
@@ -204,13 +240,26 @@ FP32 保存 delta/loss；FP16 后段反传采用 1024 的损失缩放后还原�
 
 7. 已做检查与未做实验
 
+终端进度更新（2026-10-25）：累计 57 个测试及 33 个子测试通过。
+全套首轮 56 passed；新增日志测试因 Windows 默认编码读取 UTF-8 中文路径 JSON 失败，
+测试显式指定 UTF-8 后单独 1 passed。生产代码无需因该测试编码问题调整。
+检查实际训练/验证的间隔输出、首末步、保存提示；真实双进程中仅主进程输出，
+rank 1 无验证样本仍能完成，续训改变 log_interval 后与连续训练逐参数一致。
+
+双卡更新（2026-10-25）：当前回归合计 56 个测试及 33 个子测试通过。
+55 个原有测试在全套运行中通过；新增双进程测试修正 Windows 本地通信测试设置后独立通过。
+新增真实 CPU/Gloo 双进程测试（含 num_workers=1）：逐 rank 参数一致、结构/置信度两阶段、
+两阶段 epoch 恢复与连续训练逐参数一致、验证仅一个样本时无重复计数/死锁、单 rank 非有限 loss 全体退出。
+本机 TCPStore 主机名解析及 FileStore 中文路径有限制；测试采用系统临时目录 FileStore，自动清理。
+生产路径仍使用 torchrun env://；未执行服务器 CUDA/NCCL 双卡测试，不据 CPU 测试声称 GPU 性能。
+
 本地 CPU 检查包括：实际小型 UNet 的零修正等价、非零梯度、全通道修改；
 residual_cross_attn 在 V-only 和 q/k/v/out 下的 FP32/FP16 前向反传；
 真实 DDPMScheduler + 小型 VAE 的解码链路、固定 RNG、模式/梯度开关恢复；
 事件时间精度/极性/裁剪、新旧视图一致、空支持/非有限候选回退；
 合成数据结构训练、置信度训练、epoch 续训；默认四指标文件收集与汇总。
 指标流程测试使用明确测试替身，不下载指标网络，产生的测试数值不是模型效果。
-2026-10-25 最终回归结果：48 passed、33 subtests passed；1 条依赖弃用警告。
+2026-10-25 初始实现回归结果：48 passed、33 subtests passed；1 条依赖弃用警告。
 运行回归：python -m pytest -q tests
 
 脚本已逐项核对原 baseline 的有效默认值，并独立做 bash -n、DRY_RUN 参数解析、

@@ -65,12 +65,18 @@ class EventStructurePredictor(nn.Module):
 
 def load_structure_checkpoint(path, device="cpu", require_calibrated=True):
     """无兼容且完成校准的权重时拒绝指导；绝不使用随机结构头。"""
+    from dataloaders.sde_event_structure_dataset import StructureEventConfig
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if checkpoint.get("format") != "idea8-event-structure-v1":
         raise ValueError("Not an idea8 structure checkpoint.")
+    # 在所有加载入口统一恢复时间语义；旧 checkpoint 缺少 mode 时保留固定窗口。
+    event_config = StructureEventConfig.from_dict(checkpoint["event_config"])
+    checkpoint["event_config"] = asdict(event_config)
     if require_calibrated and not checkpoint.get("confidence_trained", False):
         raise ValueError("Train the confidence phase before guided inference.")
     config = StructureHeadConfig(**checkpoint["head_config"])
+    if config.bins != event_config.bins:
+        raise ValueError("Structure head/event bin mismatch.")
     operator = StructureOperatorConfig(**checkpoint["operator_config"])
     if config.scales != len(operator.sigmas):
         raise ValueError("Structure head/operator scale mismatch.")

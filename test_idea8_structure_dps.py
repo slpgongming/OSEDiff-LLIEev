@@ -98,7 +98,7 @@ def main(args):
     head = checkpoint = operator = None
     if config.steps:
         head, checkpoint, operator = load_structure_checkpoint(args.structure_checkpoint)
-        event_config = StructureEventConfig(**checkpoint["event_config"])
+        event_config = StructureEventConfig.from_dict(checkpoint["event_config"])
         if checkpoint.get("image_size") != args.image_size:
             raise ValueError("Structure checkpoint preprocessing image_size mismatch.")
         if head.config.bins != event_config.bins:
