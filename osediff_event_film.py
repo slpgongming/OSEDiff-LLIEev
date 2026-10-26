@@ -28,6 +28,7 @@ from models.decoder_refinement import (
 from models.event_lora_utils import (
     clear_event_feats_for_all_event_lora,
     collect_event_lora_debug,
+    collect_event_lora_regularization,
     copy_compatible_state_dict,
     event_lora_state_keys,
     iter_event_lora_modules,
@@ -1006,6 +1007,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         events_refinement=None,
         decoder_fusion_enabled=None,
         refinement_fusion_mode=None,
+        return_regularization=False,
     ):
         x_denoised, prompt_embeds, neg_prompt_embeds = self.predict_denoised_latent(
             c_t, events, timesteps, batch
@@ -1017,6 +1019,13 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             decoder_fusion_enabled=decoder_fusion_enabled,
             refinement_fusion_mode=refinement_fusion_mode,
         )
+        if return_regularization:
+            # DDP 的 unused-parameter 检测只追踪 forward 返回的计算图。
+            # 事件头参数的 L2 正则必须在这里返回，避免参数在 forward 外首次入图后被标记两次。
+            smooth_reg, mod_reg = collect_event_lora_regularization(
+                self.unet, device=output_image.device,
+            )
+            return output_image, x_denoised, prompt_embeds, neg_prompt_embeds, smooth_reg, mod_reg
         return output_image, x_denoised, prompt_embeds, neg_prompt_embeds
 
     def debug_stats(self):
@@ -1546,6 +1555,10 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
         if not _keep_event_features_for_checkpoint_backward(self.unet_update):
             clear_event_feats_for_all_event_lora(self.unet_update)
         return result
+
+    def forward(self, latents, prompt_embeds, timesteps, events):
+        # regularizer 的可训练路径必须经过 DDP 包装器，确保两张卡同步梯度。
+        return self.diff_loss(latents, prompt_embeds, timesteps, events)
 
     def diff_loss(self, latents, prompt_embeds, timesteps, events):
         latents, prompt_embeds = latents.detach(), prompt_embeds.detach()

@@ -16,7 +16,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from tqdm.auto import tqdm
 
 from dataloaders.sde_event_film_dataset import SDEEventFilmDataset
-from models.event_lora_utils import collect_event_lora_regularization, clear_event_feats_for_all_event_lora
+from models.event_lora_utils import clear_event_feats_for_all_event_lora
 from models.event_film_lora import parse_event_lora_targets
 from osediff_event_film import (
     OSEDiffEventFiLMGen,
@@ -482,16 +482,12 @@ def main(args):
                 batch["neg_prompt"] = [args.neg_prompt] * bsz
                 shared_timestep = sample_shared_timestep(args.generator_train_timestep, x_src.device)
 
-                x_pred, latents_pred, prompt_embeds, neg_prompt_embeds = model_gen(
-                    x_src, events, shared_timestep, batch=batch
+                x_pred, latents_pred, prompt_embeds, neg_prompt_embeds, smooth_reg, mod_reg = model_gen(
+                    x_src, events, shared_timestep, batch=batch, return_regularization=True,
                 )
                 loss_l2 = F.mse_loss(x_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
                 loss_lpips = net_lpips(x_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
                 loss_edge = event_edge_loss(x_pred.float(), x_tgt.float(), events.float()) * args.lambda_edge
-                smooth_reg, mod_reg = collect_event_lora_regularization(
-                    accelerator.unwrap_model(model_gen).unet,
-                    device=x_src.device,
-                )
                 loss_smooth = smooth_reg * args.lambda_smooth
                 loss_mod = mod_reg * args.lambda_mod
                 loss = loss_l2 + loss_lpips + loss_edge + loss_smooth + loss_mod
@@ -511,7 +507,7 @@ def main(args):
                     loss_kl = torch.zeros((), device=x_src.device)
 
                 if args.lambda_vsd_lora > 0:
-                    loss_d = reg_runner.diff_loss(
+                    loss_d = model_reg(
                         latents=latents_pred,
                         prompt_embeds=prompt_embeds,
                         timesteps=shared_timestep,
