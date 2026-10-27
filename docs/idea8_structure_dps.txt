@@ -196,9 +196,20 @@ timestep、精度、event_lora_targets、普通 LoRA 激活组和原事件 activ
   CLORA_EVENT_ACTIVE_BINS=5；RGB_EVENT_ACTIVE_BINS=5
   MIXED_PRECISION=fp16；CUDA_VISIBLE_DEVICES=0；SAVE_IMAGES=0
   GUIDANCE_LR=0.01；GUIDANCE_TRUST_RADIUS=0.03
-  GUIDANCE_LAMBDA_LOW=2.0；GUIDANCE_LAMBDA_KEEP=1.0；GUIDANCE_LAMBDA_RANGE=1.0
+  GUIDANCE_PROTECTION_MODE=quadratic
+  GUIDANCE_LAMBDA_LOW=1.0；GUIDANCE_LAMBDA_KEEP=0.5；GUIDANCE_LAMBDA_RANGE=1.0
   GUIDANCE_MAX_LOW_CHANGE=0.02；GUIDANCE_MAX_OUTSIDE_CHANGE=0.02
   GUIDANCE_MIN_CONFIDENCE=0.25；GUIDANCE_BACKTRACKING_STEPS=3
+  GUIDANCE_TRACE_CANDIDATES=1；REPRODUCIBLE_INFERENCE=0
+
+2026-10-26 软保护修订：先前 L1 权重 2/1 在服务器诊断的 104 个候选中，
+保护成本均超过结构误差下降量，导致全部回退。当前默认改用零点附近平滑的二次惩罚，
+并将权重设为 1/0.5；这只是本轮重测配置，不表示已经验证为最优超参数。
+low/keep 的硬变化阈值仍按 L1 计算，不能把阈值错误地应用到平方误差上。
+复现旧目标：GUIDANCE_PROTECTION_MODE=l1 GUIDANCE_LAMBDA_LOW=2 GUIDANCE_LAMBDA_KEEP=1。
+基线与指导对照建议同时设置 MIXED_PRECISION=fp32 REPRODUCIBLE_INFERENCE=1：
+关闭 TF32/快速 SDP 并控制 cuDNN；不支持严格确定性的 CUDA 算子只告警，不声称反向完全确定。
+SAMPLE_MANIFEST 可指向 scene,frame_id 两列 CSV，选择验证子集；不会重编号或改变 seed+原索引。
 
 targets=auto 继承 checkpoint，不强行改成 all；旧无 targets 元数据的权重按 v 处理。
 新入口普通 LoRA 默认 none，7 个旧 baseline wrapper 则显式保留 down,mid,up。
@@ -223,6 +234,7 @@ SAVE_IMAGES=1 保存预测/低光/GT；GUIDANCE_SAVE_DIAGNOSTICS=1 额外保存�
   idea8_per_image.csv    逐图前三项指标与结果路径
   idea8_scene.csv        逐场景前三项指标；FID 只在总体表中
   idea8_diagnostics.json 每图调用次数、接受步数、回退原因、目标变化、耗时
+  idea8_diagnostics.jsonl 每完成一张图立即追加，保留中断前的诊断
   run_config.json        实际参数、LoRA targets、普通 LoRA 分组、scheduler/结构配置
 
 有支持的指导还记录特征 shape、相对修正幅度、初始/最终损失、饱和比例、
@@ -231,7 +243,12 @@ reason=no_event_support 表示事件有效支持为空；no_acceptable_candidate
 没有通过验收的进一步改进。两者均回退到有效结果，不强行锐化。
 
 L_struct：C 加权 Huber 软边缘误差，Huber delta=0.1。
-L_low：相对初始增强结果的低通 RGB 差异；L_keep：低可信区域的 RGB 差异。
+L_low/L_keep 的软保护默认使用均方差；低通外观与低可信区域权重分别为 1/0.5。
+日志中的 low/keep 始终表示 L1 变化量，供 0.02 的硬预算检查；
+penalty_low/penalty_keep 表示实际软惩罚，protection 为两者加权之和。
+candidate_history 保存各步/回溯的学习率、raw/clamp 分项损失、相对特征变化、结构收益、
+accepted 和 rejection_reasons；gradient_history 保存求梯度时的 raw 损失及梯度 RMS。
+拒绝条件可区分 objective_not_lower、low_budget、keep_budget、nonfinite_candidate 和 nonfinite_objective。
 L_range：raw VAE 输出超出显示范围的二次惩罚，避免依赖 clamp 导数。
 投影约束的是 M*delta 相对 h0 各通道 RMS 的归一化幅度。
 由于后段卷积/注意力会传播变化，空间掩码不代表输出变化绝对局部。

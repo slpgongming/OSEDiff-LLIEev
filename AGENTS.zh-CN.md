@@ -241,6 +241,7 @@ Event-LoRA 目标选择与 checkpoint 规则：
 - 正步数指导当前只支持无 decoder refinement 的 Stage3、batch=1、256 方形输入，且需要独立训练并完成置信度阶段的结构 checkpoint。只优化最后一个 UpBlock 前的临时完整通道特征 delta；生成器权重与 GT 不参与指导优化。
 - 先训练独立结构头，再在互斥校准场景训练置信度头。新训练默认 `idea4_compatible`：复用分片优先/相邻帧截取规则，共享空间裁剪后按首末事件分箱，正负计数分离为 10 通道，不改变原有 5 通道输入。可选 `fixed_window` 模式必须明确时间单位/窗口。checkpoint 保存预处理模式；缺少 mode 的旧 v1 checkpoint 仍按固定窗口解释，续训/校准禁止切换模式。不得由首/末事件推断录制覆盖范围。
 - 用户已选择新 idea8 脚本采用环境变量通用路径。历史 wrapper 保留各自账号默认路径。当前实现完整 UNet 重放，后段缓存属于后续优化，尚未实现。
+- 指导默认采用二次软保护，low/keep 权重为 1.0/0.5；硬预算仍按 L1 衡量，阈值保持 0.02/0.02。显式选择 `l1` 并设权重 2/1 可复现旧目标。默认保存逐候选历史和增量 JSONL 诊断。配对比较使用 `--reproducible_inference`；torch 2.0.1 不支持 replicate-padding 反向的严格确定性，因此采用明确的 warn-only 检查。`--sample_manifest` 可选择验证帧，同时保留全局索引和随机种子。
 - 根据用户 2026-10-25 的要求，`train_scripts/` 和 `test_scripts/` 为仅本地保留的忽略目录。保留本地文件，不要强制加入 Git；Python 训练/测试入口继续跟踪。
 - 结构/置信度训练支持单进程和 torchrun DDP（CUDA/NCCL，CPU/Gloo 用于测试）。whb/slpchen 脚本默认双卡、每卡 batch=4（全局 8），通用脚本默认单进程。分布式验证不得补齐/重复样本；只有 rank 0 写输出。checkpoint 保存各 rank RNG；epoch 续训须保持卡数、每卡 batch、workers、seed、设备类型不变，改变卡数使用仅权重初始化。
 - 训练/验证 step 进度由 `--log_interval` / `LOG_INTERVAL` 控制（默认 50，正整数）。仅 rank 0 打印；step loss 是本 rank 指标，epoch JSON 仍全卡汇总。不得为日志在不等长验证循环内增加通信。续训允许修改日志间隔。

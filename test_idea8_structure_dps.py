@@ -2,8 +2,10 @@
 
 import argparse
 from collections import defaultdict
+import csv
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 import time
 
@@ -34,15 +36,21 @@ def build_parser():
     parser.add_argument("--guidance_steps", type=int, default=0)
     parser.add_argument("--guidance_lr", type=float, default=0.01)
     parser.add_argument("--guidance_trust_radius", type=float, default=0.03)
-    parser.add_argument("--guidance_lambda_low", type=float, default=2.0)
-    parser.add_argument("--guidance_lambda_keep", type=float, default=1.0)
+    parser.add_argument("--guidance_lambda_low", type=float, default=1.0)
+    parser.add_argument("--guidance_lambda_keep", type=float, default=0.5)
     parser.add_argument("--guidance_lambda_range", type=float, default=1.0)
     parser.add_argument("--guidance_max_low_change", type=float, default=0.02)
     parser.add_argument("--guidance_max_outside_change", type=float, default=0.02)
     parser.add_argument("--guidance_backtracking_steps", type=int, default=3)
     parser.add_argument("--guidance_min_confidence", type=float, default=0.25)
+    parser.add_argument("--guidance_protection_mode", choices=("quadratic", "l1"), default="quadratic")
+    parser.add_argument("--guidance_trace_candidates", action=argparse.BooleanOptionalAction, default=True,
+                        help="保存每个候选的损失、步长和拒绝条件；默认开启。")
     parser.add_argument("--guidance_save_diagnostics", action="store_true")
     parser.add_argument("--max_samples", type=int, default=0)
+    parser.add_argument("--sample_manifest", help="验证子集 CSV，列为 scene,frame_id；保持全数据集索引与随机种子。")
+    parser.add_argument("--reproducible_inference", action="store_true",
+                        help="关闭 TF32/快速 SDP 并控制 cuDNN，便于零步对照；不保证所有 CUDA 反向严格确定。")
     return parser
 
 
@@ -53,7 +61,9 @@ def guidance_config(args):
                           max_low_change=args.guidance_max_low_change,
                           max_outside_change=args.guidance_max_outside_change,
                           backtracking_steps=args.guidance_backtracking_steps,
-                          min_confidence=args.guidance_min_confidence)
+                          min_confidence=args.guidance_min_confidence,
+                          protection_mode=args.guidance_protection_mode,
+                          trace_candidates=args.guidance_trace_candidates)
 
 
 def parse_args(argv=None):
@@ -82,7 +92,47 @@ def _sync(device):
         torch.cuda.synchronize(device)
 
 
+def evaluation_indices(dataset, args):
+    """清单只选择样本，不重排全局索引；基线/指导均以 seed+原索引固定随机性。"""
+    indices = list(range(len(dataset)))
+    if args.sample_manifest:
+        with open(args.sample_manifest, newline="", encoding="utf-8-sig") as handle:
+            rows = list(csv.DictReader(handle))
+        keys = [(row["scene"], row["frame_id"]) for row in rows]
+        if not keys or len(set(keys)) != len(keys):
+            raise ValueError("Sample manifest must be nonempty and contain unique scene/frame_id pairs.")
+        lookup = {(s.scene_name, Path(s.low_path).stem): i for i, s in enumerate(dataset.samples)}
+        missing = set(keys) - set(lookup)
+        if missing:
+            raise ValueError(f"Unknown samples in manifest: {sorted(missing)[:5]}")
+        indices = sorted(lookup[key] for key in keys)
+    return indices[:args.max_samples] if args.max_samples else indices
+
+
+def configure_inference_numerics(reproducible):
+    if reproducible:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        # torch 2.0.1 的 replicate padding 反向不支持严格确定性，明确记录 warn-only。
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    return dict(reproducible_requested=reproducible, torch_version=str(torch.__version__),
+                cudnn_benchmark=torch.backends.cudnn.benchmark,
+                cudnn_deterministic=torch.backends.cudnn.deterministic,
+                cudnn_allow_tf32=torch.backends.cudnn.allow_tf32,
+                matmul_allow_tf32=torch.backends.cuda.matmul.allow_tf32,
+                flash_sdp=torch.backends.cuda.flash_sdp_enabled(),
+                memory_efficient_sdp=torch.backends.cuda.mem_efficient_sdp_enabled(),
+                deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
+                determinism_warn_only=torch.is_deterministic_algorithms_warn_only_enabled())
+
+
 def main(args):
+    numeric_settings = configure_inference_numerics(args.reproducible_inference)
     import pyiqa
     from osediff_event_film import OSEDiffEventFiLMTest, resolve_decoder_refinement_args
     from test_event_film_lora_osediff import FIDEvaluator, tensor_to_pil
@@ -107,7 +157,10 @@ def main(args):
     else:
         # 真正 bypass：steps=0 不需要结构数据/权重，保留旧 checkpoint 的数据行为。
         dataset = SDEEventFilmDataset("test", args, args.input_image)
-    count = min(len(dataset), args.max_samples) if args.max_samples else len(dataset)
+    indices = evaluation_indices(dataset, args)
+    count = len(indices)
+    if not count:
+        raise ValueError("Evaluation requires at least one sample.")
     if args.calculate_fid and count < 2:
         raise ValueError("Default four-metric evaluation requires >=2 images for FID; use --no-calculate_fid for a one-image smoke test.")
     output = Path(args.output_dir)
@@ -129,6 +182,7 @@ def main(args):
                     actual_event_lora_targets=list(model.gen.event_lora_config.targets),
                     actual_unet_lora_parts=list(args.unet_lora_parts),
                     structure_event_config=checkpoint["event_config"] if checkpoint else None,
+                    selected_indices=indices, numeric_settings=numeric_settings,
                     scheduler=dict(model.gen.noise_scheduler.config), scheduler_timesteps=model.timesteps.tolist())
     scheduler = model.gen.noise_scheduler
     manifest["scheduler_class"] = type(scheduler).__name__
@@ -137,8 +191,9 @@ def main(args):
     (output / "run_config.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     rows, diagnostic_rows = [], []
     totals, scene_totals, scene_counts = defaultdict(float), defaultdict(lambda: defaultdict(float)), defaultdict(int)
+    diagnostic_log = (output / "idea8_diagnostics.jsonl").open("w", encoding="utf-8")
     try:
-        for index in range(count):
+        for ordinal, index in enumerate(indices):
             sample = dataset[index]
             rgb = sample["conditioning_pixel_values"][None].to(device, dtype)
             events = sample["events"][None].to(device, dtype)
@@ -181,14 +236,19 @@ def main(args):
             rows.append(dict(scene=scene, frame_id=sample["frame_id"], **values, result_path=result_path))
             diagnostic_rows.append(dict(scene=scene, frame_id=sample["frame_id"], **stats,
                                         structure_meta=sample.get("structure_meta")))
+            diagnostic_log.write(json.dumps(diagnostic_rows[-1], ensure_ascii=False, allow_nan=False) + "\n")
+            diagnostic_log.flush()
             if args.guidance_save_diagnostics and observation is not None:
                 diagnostic_dir = output / "diagnostics" / scene
                 diagnostic_dir.mkdir(parents=True, exist_ok=True)
                 torch.save(dict(edges=observation.edges.cpu(), confidence=observation.confidence.cpu()),
                            diagnostic_dir / f"{sample['frame_id']}.pt")
-            print(f"[{index+1}/{count}] {scene}/{sample['frame_id']} {values} {stats}", flush=True)
+            print(f"[{ordinal+1}/{count}] {scene}/{sample['frame_id']} {values} "
+                  f"accepted={stats['accepted_steps']} reason={stats['reason']} "
+                  f"forward={stats['forward_calls']} backward={stats['backward_calls']}", flush=True)
         fid_score = fid.compute([mode])[mode] if fid else None
     finally:
+        diagnostic_log.close()
         if fid is not None:
             fid.cleanup()
     write_csv(output / "idea8_per_image.csv", rows, ["scene", "frame_id", *metrics, "result_path"])

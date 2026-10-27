@@ -13,15 +13,21 @@ class GuidanceConfig:
     steps: int = 0
     learning_rate: float = 0.01
     trust_radius: float = 0.03
-    lambda_low: float = 2.0
-    lambda_keep: float = 1.0
+    lambda_low: float = 1.0
+    lambda_keep: float = 0.5
     lambda_range: float = 1.0
     max_low_change: float = 0.02
     max_outside_change: float = 0.02
     backtracking_steps: int = 3
     min_confidence: float = 0.25
+    protection_mode: str = "quadratic"
+    trace_candidates: bool = True
 
     def __post_init__(self):
+        if self.protection_mode not in {"quadratic", "l1"}:
+            raise ValueError("protection_mode must be quadratic or l1.")
+        if not isinstance(self.trace_candidates, bool):
+            raise ValueError("trace_candidates must be bool.")
         if any(not isinstance(value, int) or isinstance(value, bool) or value < 0
                for value in (self.steps, self.backtracking_steps)):
             raise ValueError("Guidance step counts must be nonnegative integers.")
@@ -100,12 +106,30 @@ def _losses(raw, baseline, observation, operator, config):
         raise ValueError("Image/observation structure shape mismatch.")
     residual = F.huber_loss(edges, observation.edges, reduction="none", delta=0.1)
     structure = (confidence * residual).sum() / confidence.sum().clamp_min(1e-8)
-    low = (gaussian_blur(image, 3.0) - gaussian_blur(base, 3.0)).abs().mean()
+    low_difference = gaussian_blur(image, 3.0) - gaussian_blur(base, 3.0)
+    difference = image - base
+    low = low_difference.abs().mean()
     outside = 1 - confidence.mean(1, keepdim=True)
-    keep = (outside * (image-base).abs()).sum() / (3 * outside.sum()).clamp_min(1e-8)
+    denominator = (3 * outside.sum()).clamp_min(1e-8)
+    keep = (outside * difference.abs()).sum() / denominator
+    # 软惩罚与硬预算分离：二次项在零点附近平滑，避免 L1 成本压过微小结构收益。
+    # low/keep 始终保留 L1 含义，不能因更换软惩罚而放宽 0.02 的验收阈值。
+    if config.protection_mode == "quadratic":
+        penalty_low = low_difference.square().mean()
+        penalty_keep = (outside * difference.square()).sum() / denominator
+    else:
+        penalty_low, penalty_keep = low, keep
+    protection = config.lambda_low * penalty_low + config.lambda_keep * penalty_keep
     range_loss = (F.relu(-image).square() + F.relu(image-1).square()).mean()
-    total = structure + config.lambda_low*low + config.lambda_keep*keep + config.lambda_range*range_loss
-    return total, dict(structure=structure, low=low, keep=keep, range=range_loss)
+    total = structure + protection + config.lambda_range * range_loss
+    return total, dict(structure=structure, low=low, keep=keep, range=range_loss,
+                      penalty_low=penalty_low, penalty_keep=penalty_keep, protection=protection)
+
+
+def _loss_numbers(values):
+    """只保存有限标量；异常候选使用 null，避免生成含 NaN/Infinity 的诊断 JSON。"""
+    numbers = {key: float(value.detach()) for key, value in values.items()}
+    return {key: value if math.isfinite(value) else None for key, value in numbers.items()}
 
 
 def optimize_features(render, observation, config, operator=None):
@@ -116,6 +140,9 @@ def optimize_features(render, observation, config, operator=None):
     """
     operator = operator or StructureOperatorConfig()
     stats = dict(forward_calls=0, backward_calls=0, accepted_steps=0, reason="disabled")
+    if config.trace_candidates:
+        stats["candidate_history"] = []
+        stats["gradient_history"] = []
     if config.steps == 0:
         with torch.no_grad():
             image = render(None).detach().clamp(-1, 1)
@@ -148,11 +175,15 @@ def optimize_features(render, observation, config, operator=None):
             with torch.no_grad():
                 score, initial_values = _losses(baseline, baseline, observation, operator, config)
                 current_score = float(score)
+                current_structure = float(initial_values["structure"])
             stats.update(initial_objective=current_score, reason="completed", relative_delta=0.0,
                          feature_shape=list(correction.h0.shape),
-                         initial_losses={key: float(value) for key, value in initial_values.items()})
-            for _ in range(config.steps):
-                loss, _ = _losses(raw, baseline, observation, operator, config)
+                         protection_mode=config.protection_mode, initial_losses=_loss_numbers(initial_values))
+            for step in range(config.steps):
+                loss, raw_values = _losses(raw, baseline, observation, operator, config)
+                if config.trace_candidates:
+                    stats["gradient_history"].append(dict(step=step + 1,
+                        raw_losses=_loss_numbers(dict(total=loss, **raw_values))))
                 if not torch.isfinite(loss):
                     stats["reason"] = "nonfinite_loss"
                     break
@@ -166,6 +197,8 @@ def optimize_features(render, observation, config, operator=None):
                     stats["reason"] = "nonfinite_gradient"
                     break
                 norm = gradient.square().mean().sqrt()
+                if config.trace_candidates:
+                    stats["gradient_history"][-1]["gradient_rms"] = float(norm)
                 if float(norm) < 1e-12:
                     stats["reason"] = "zero_gradient"
                     break
@@ -173,20 +206,41 @@ def optimize_features(render, observation, config, operator=None):
                 direction = gradient / norm.clamp_min(1e-12) * correction.channel_scale
                 accepted = False
                 for retry in range(config.backtracking_steps + 1):
-                    proposal = old_delta - config.learning_rate * (0.5 ** retry) * direction
+                    step_size = config.learning_rate * (0.5 ** retry)
+                    proposal = old_delta - step_size * direction
                     correction.delta = correction.project(proposal, config.trust_radius)
                     candidate_raw = render(correction)
                     stats["forward_calls"] += 1
                     if not torch.isfinite(candidate_raw).all():
+                        if config.trace_candidates:
+                            stats["candidate_history"].append(dict(step=step + 1, retry=retry,
+                                learning_rate=step_size, accepted=False, rejection_reasons=["nonfinite_candidate"]))
                         continue
                     candidate = candidate_raw.detach().clamp(-1, 1)
                     with torch.no_grad():
                         score, values = _losses(candidate, baseline, observation, operator, config)
-                        allowed = (torch.isfinite(score) and float(score) < current_score
-                                   and float(values["low"]) <= config.max_low_change
-                                   and float(values["keep"]) <= config.max_outside_change)
+                        reasons = []
+                        if not torch.isfinite(score):
+                            reasons.append("nonfinite_objective")
+                        elif float(score) >= current_score:
+                            reasons.append("objective_not_lower")
+                        if float(values["low"]) > config.max_low_change:
+                            reasons.append("low_budget")
+                        if float(values["keep"]) > config.max_outside_change:
+                            reasons.append("keep_budget")
+                        allowed = not reasons
+                        if config.trace_candidates:
+                            raw_score, raw_parts = _losses(candidate_raw, baseline, observation, operator, config)
+                            improvement = current_structure - float(values["structure"])
+                            stats["candidate_history"].append(dict(step=step + 1, retry=retry,
+                                learning_rate=step_size, accepted=allowed, rejection_reasons=reasons,
+                                objective_before=current_score, losses=_loss_numbers(dict(total=score, **values)),
+                                raw_losses=_loss_numbers(dict(total=raw_score, **raw_parts)),
+                                structure_improvement=improvement if math.isfinite(improvement) else None,
+                                relative_delta=float(correction.relative_norm(correction.delta))))
                     if allowed:
                         raw, result, current_score = candidate_raw, candidate, float(score)
+                        current_structure = float(values["structure"])
                         stats["accepted_steps"] += 1
                         stats["relative_delta"] = float(correction.relative_norm(correction.delta).detach())
                         accepted = True
@@ -197,7 +251,7 @@ def optimize_features(render, observation, config, operator=None):
             with torch.no_grad():
                 _, final_values = _losses(result, baseline, observation, operator, config)
             stats.update(final_objective=current_score,
-                         final_losses={key: float(value) for key, value in final_values.items()},
+                         final_losses=_loss_numbers(final_values),
                          saturated_fraction=float((result.abs() >= 1).float().mean()))
             return result, stats
     finally:
