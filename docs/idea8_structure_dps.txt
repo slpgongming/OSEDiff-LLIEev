@@ -1,6 +1,15 @@
 idea8 使用说明：事件结构驱动的 UNet 主干特征在线修正
 更新：2026-10-25
 
+2026-10-27 离线目标替换诊断：
+默认 --guidance_target_source event 保留事件预测目标；显式 gt_oracle 仅在有 GT、
+guidance_steps>0 的离线评测启用，禁止与 --inference_only 混用。GT 通过结构权重
+保存的同一 image_structure 算子产生两尺度目标，仅替换目标，原事件结构损失权重 W、
+特征掩码 M0=mean(W)、保护区域 K0=1-mean(W) 固定。run_config 显式记录 GT 使用。
+--sample_manifest 继续保留全数据集索引/种子；日志保存 latent/W/M0/K0 哈希供跨组核对。
+--save_float_predictions 保存未量化预测与评测 GT，用于结构/纹理配对分析。
+GT 目标结果是离线机制诊断，不能当作可部署方法性能，也不是严格性能上界。
+
 1. 已实现的计算路径
 
 本分支基于 idea4 提交 101182b068d10f49a1e780da4467de02c1cf3c27。
@@ -106,6 +115,9 @@ manifest 模式的测试数据需另传与测试帧匹配的 STRUCTURE_MANIFEST�
 正式 test 场景不参与结构训练、置信度训练或指导强度选择。
 
 4. 训练独立结构头
+
+2026-10-27：H0/H1 区域监督、结构诊断、best/last 与续训规则见 docs/idea8_structure_training.txt。
+新训练默认仍为原 smooth_l1；region_balanced 必须显式启用，正式对照前先固定区域阈值。
 
 以下均在服务器仓库根目录、已安装 requirements.txt 的环境运行。
 路径全部由环境变量传入，不绑定服务器账户；不会启动原生成器训练。

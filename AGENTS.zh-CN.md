@@ -244,7 +244,9 @@ Event-LoRA 目标选择与 checkpoint 规则：
 - 指导默认采用二次软保护，low/keep 权重为 1.0/0.5；硬预算仍按 L1 衡量，阈值保持 0.02/0.02。显式选择 `l1` 并设权重 2/1 可复现旧目标。默认保存逐候选历史和增量 JSONL 诊断。配对比较使用 `--reproducible_inference`；torch 2.0.1 不支持 replicate-padding 反向的严格确定性，因此采用明确的 warn-only 检查。`--sample_manifest` 可选择验证帧，同时保留全局索引和随机种子。
 - 根据用户 2026-10-25 的要求，`train_scripts/` 和 `test_scripts/` 为仅本地保留的忽略目录。保留本地文件，不要强制加入 Git；Python 训练/测试入口继续跟踪。
 - 结构/置信度训练支持单进程和 torchrun DDP（CUDA/NCCL，CPU/Gloo 用于测试）。whb/slpchen 脚本默认双卡、每卡 batch=4（全局 8），通用脚本默认单进程。分布式验证不得补齐/重复样本；只有 rank 0 写输出。checkpoint 保存各 rank RNG；epoch 续训须保持卡数、每卡 batch、workers、seed、设备类型不变，改变卡数使用仅权重初始化。
+- 离线目标替换必须显式使用 `--guidance_target_source gt_oracle`、正修正步数与 GT 评测，禁止配合 `--inference_only`。该诊断只用 checkpoint 同一结构算子替换目标，固定原事件产生的 W/M0/K0，并记录 `uses_gt_for_guidance=true`；默认 `event` 推理仍不使用 GT。观测新增可选独立掩码，省略时保留原行为；latent/权重/掩码哈希及可选浮点输出用于配对核查。Oracle 结果不能作为可部署方法性能。
 - 训练/验证 step 进度由 `--log_interval` / `LOG_INTERVAL` 控制（默认 50，正整数）。仅 rank 0 打印；step loss 是本 rank 指标，epoch JSON 仍全卡汇总。不得为日志在不等长验证循环内增加通信。续训允许修改日志间隔。
+- 结构头 H0/H1 训练见 `docs/idea8_structure_training.txt`：默认 `smooth_l1` 保留原损失；显式 `region_balanced` 按每样本/尺度分别平均 GT 平坦、弱边缘、强边缘区域，跳过空区域。阈值 0.05/0.2 仅为待确认初值，正式对照前固定相同阈值。保存 last/best，结构阶段统一按区域平衡验证 MAE 选模，置信度阶段按验证 MSE，并记录逐尺度/逐场景误差、偏差、平坦区响应和边缘匹配。续训继承并核验监督/选模配置及历史 best；旧权重续训明确开启新的选择窗口。新增验证通信必须位于不等长循环之外。本次不含全分辨率架构改动。
 
 ## 代码开发要求
 
@@ -417,3 +419,5 @@ references/eglol.py               事件预处理参考
 - 如果用户要求解释参数，例如 `modulation_scale`、`lambda_edge`、`lambda_mod`、`lambda_smooth`、`control_*`，必须从当前实现路径解释，不要只按名字猜。
 - 如果用户说不要运行代码，就只修改文件并给出可复制的命令，不主动训练/推理。
 - 回答代码问题时优先引用具体文件和函数。
+
+- H2/H3 显式使用 `--head_variant full_detail`：stride=1 浅层事件分支与上采样的半分辨率上下文融合，在全分辨率上预测。H2 保留 Smooth L1，H3 使用区域平衡。默认 `half` 与旧权重输出保持兼容；checkpoint 记录结构版本，加载时继承并拒绝显式不匹配。保持预处理/结构算子、共同初始化、训练预算及场景划分不变；分别从新结构 best 重新校准置信度。

@@ -15,7 +15,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-def _worker(rank, root, store_path):
+def _worker(rank, root, store_path, loss_mode, head_variant):
     os.environ.update(WORLD_SIZE="2", RANK=str(rank), LOCAL_RANK=str(rank),
                       USE_LIBUV="0")
     torch.set_num_threads(1)
@@ -40,7 +40,8 @@ def _worker(rank, root, store_path):
     training.phase_loss, training.capture_rng = checked_loss, checked_capture
     root = Path(root)
     common = ["--data_root", str(root / "data"), "--scene_split", str(root / "split.json"),
-              "--base_channels", "4", "--batch_size", "2", "--device", "cpu", "--num_workers", "1"]
+              "--base_channels", "4", "--batch_size", "2", "--device", "cpu", "--num_workers", "1",
+              "--structure_loss", loss_mode, "--head_variant", head_variant]
     # Windows TCPStore 的本地主机名解析不稳定；只将 rendezvous 换成临时 FileStore，
     # 梯度/指标仍经真实 Gloo 通信。测试复用进程组，避免无外部同步地销毁/重建进程组。
     store = dist.FileStore(store_path, 2)
@@ -91,14 +92,16 @@ def _dataset(root):
     (root / "split.json").write_text(json.dumps(dict(train=["a"],calibration=["b"],validation=["c"])),encoding="utf-8")
 
 
-def test_two_process_training_resume_and_validation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("head_variant", ["half", "full_detail"])
+@pytest.mark.parametrize("loss_mode", ["smooth_l1", "region_balanced"])
+def test_two_process_training_resume_and_validation(tmp_path, monkeypatch, loss_mode, head_variant):
     if not dist.is_available() or not dist.is_gloo_available():
         pytest.skip("PyTorch Gloo is unavailable")
     _dataset(tmp_path)
     # 当前 Windows PyTorch FileStore 不支持中文路径；只把临时 rendezvous 放系统 temp，
     # 自动清理；数据、checkpoint 和验证记录仍放本次任务的 tmp_path。
     with tempfile.TemporaryDirectory(prefix="idea8_ddp_store_") as store_dir:
-        context = mp.spawn(_worker, args=(str(tmp_path), str(Path(store_dir) / "store")), nprocs=2, join=False)
+        context = mp.spawn(_worker, args=(str(tmp_path), str(Path(store_dir) / "store"), loss_mode, head_variant), nprocs=2, join=False)
         deadline = time.monotonic() + 240
         try:
             while not context.join(timeout=1):
@@ -111,6 +114,12 @@ def test_two_process_training_resume_and_validation(tmp_path, monkeypatch):
                 process.join(timeout=10)
     load = lambda name: torch.load(tmp_path / name / "checkpoint_last.pt", weights_only=False)
     structure, confidence = load("structure"), load("confidence")
+    for name, last in (("structure", structure), ("confidence", confidence)):
+        best = torch.load(tmp_path / name / "checkpoint_best.pt", weights_only=False)
+        assert best["epoch"] == last["selection_state"]["best_epoch"]
+        assert best["metrics"][best["selection_config"]["metric"]] == last["selection_state"]["best_score"]
+        assert last["supervision_config"]["mode"] == loss_mode
+        assert last["metrics"]["by_scene"]["c"]["samples"] == 1
     for resumed, uninterrupted in ((structure, load("continuous")), (confidence, load("confidence_continuous"))):
         for key in resumed["state_dict"]:
             torch.testing.assert_close(resumed["state_dict"][key], uninterrupted["state_dict"][key], rtol=0, atol=0)

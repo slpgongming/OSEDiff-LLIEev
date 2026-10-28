@@ -1,0 +1,95 @@
+idea8 结构头 H0/H1 训练与选模（2026-10-27）
+
+范围
+新增区域平衡监督、分区域/逐尺度/逐场景验证和 best/last 保存。
+结构网络、事件预处理、结构算子、生成器与置信度标签保持原定义。
+本次没有增加全分辨率通路；先通过 H0/H1 对照判断监督是否是主要限制。
+
+损失与阈值
+--structure_loss smooth_l1：H0，新训练的默认值，保持原全像素 Smooth L1(beta=0.1)。
+--structure_loss region_balanced：H1，按每个样本、每个尺度单独计算区域均值。
+区域顺序为平坦/弱边缘/强边缘，依据 GT 结构划分，不依据预测结构或置信度。
+--region_thresholds WEAK STRONG：默认初值 0.05 0.2，满足 0<WEAK<STRONG<1。
+平坦 T<WEAK；弱边缘 WEAK<=T<STRONG；强边缘 T>=STRONG。
+--region_weights FLAT WEAK STRONG：默认 1 1 1，三项均须有限且大于零。
+区域内先除以自身像素数，再按权重组合；空区域跳过，并对剩余权重重新归一化。
+之后对样本与尺度平均，保留平坦区惩罚，防止放大假边缘。
+阈值是待确认初值，尚未从训练数据估计或验证最优。正式 H0/H1 开跑前应查看训练 GT
+结构分布，固定同一组阈值、权重、初始化、划分、事件配置、训练预算和选模规则。
+首轮仅改变 structure_loss 和独立输出目录；勿用正式 test 选择阈值。
+
+验证与 best
+--best_metric auto：结构阶段按 balanced_mae，置信度阶段按 validation_loss。
+--best_metric balanced_mae：区域等权绝对误差，独立于训练 region_weights。
+--best_metric validation_loss：当前阶段实际验证损失；H0/H1 建议统一用 balanced_mae。
+置信度阶段结构分支冻结，禁止用 balanced_mae 选择置信度模型。
+--validation_border 默认 4：仅从结构诊断去除边界，不改训练标签及原验证 loss。
+--edge_tolerance 默认 2：固定像素容差的双向边缘 precision/recall/F1。
+全无边缘且无误报时 F1=1；空区域指标记为 null，并记录实际计数。
+常量结构图的 Pearson 相关性未定义，记为 null，不当作 0 分混入均值。
+
+metrics.jsonl 保留原 train_loss/validation_loss/edge_mae/confidence_mae，新增：
+  balanced_mae、flat/weak/strong_mae、weak/strong_bias、flat_response；
+  edge_precision/edge_recall/edge_f1、spatial_correlation；
+  scale_0_*、scale_1_*（顺序与 operator_config.sigmas 一致）；
+  by_scene、metric_counts、global_step、selection_score、best_score、best_epoch。
+诊断按样本/尺度平均，不按区域像素数加权；逐场景另行记录，供一致性检查。
+负 strong_bias 表示强边缘系统性偏弱，flat_response 是 GT 平坦区预测结构均值。
+不乘各自预测置信度，避免通过挑选容易区域制造改善。
+
+每轮原子保存 checkpoint_last.pt；选模分数严格更低时才更新 checkpoint_best.pt。
+同分保留较早权重；best_epoch 与旧 epoch 字段一样从 0 开始计数。
+best 是所选验证指标下的最佳权重，不能自动等同于最终增强效果最佳。
+候选仍需固定 72 帧增强检查和完整验证场景核实，最后才进入正式测试。
+
+命令示意（路径由环境变量提供，本文件不启动训练）
+H0：
+  python train_event_structure_head.py --data_root "$TRAIN_DATA_ROOT" \
+    --scene_split "$SCENE_SPLIT" --output_dir "$H0_OUTPUT_DIR" \
+    --structure_loss smooth_l1 --region_thresholds 0.05 0.2 --best_metric balanced_mae
+H1：
+  python train_event_structure_head.py --data_root "$TRAIN_DATA_ROOT" \
+    --scene_split "$SCENE_SPLIT" --output_dir "$H1_OUTPUT_DIR" \
+    --structure_loss region_balanced --region_thresholds 0.05 0.2 --best_metric balanced_mae
+双卡沿用已有 torchrun 入口，每卡 batch=4 时全局为 8。global_step 只计优化器更新，
+不再乘卡数。验证不补齐，每帧仅处理一次，新增统计只在验证循环外通信。
+
+续训与校准
+监督与选模配置写入 run_config 和 checkpoint。完整续训默认继承，显式改损失、
+阈值、权重、选模指标、边界或容差会报错。改变监督时使用结构阶段的
+--init_structure_checkpoint 仅继承权重，以新优化器开始。
+旧 checkpoint 缺少监督元信息时按历史 smooth_l1 解释；缺少 best 历史时，明确从
+本次续训实际验证开始记录新选择窗口，不虚构早期最佳权重。
+新 checkpoint 续训恢复已有 best；移动目录时同时保留 last/best。
+历史 best 早于 last 且找不到兼容 best 时，拒绝把 last 冒充 best。
+置信度阶段从选中的结构 checkpoint_best.pt 初始化，保留监督/阈值定义；
+置信度标签与 MSE 不变，结构参数冻结，train/calibration/validation 场景继续互斥。
+模型 state_dict 和原 checkpoint 格式兼容，无需改动生成器或部署结构算子。
+
+slpchen H1 启动入口（2026-10-27）
+脚本为 train_scripts/train_idea8_H1_slpchen.sh，仅训练 H1 结构阶段，默认不加载任何 checkpoint。
+默认 seed=42、base_channels=32，并在实际启动前核对初始参数指纹是否与八卡 H0 一致。
+本轮阈值已用 24 个训练场景的固定 768 帧裁剪核查，固定为 0.05/0.2；未用验证或测试图选择。
+激活 slpchen 原有训练环境后运行：bash train_scripts/train_idea8_H1_slpchen.sh。
+加 --dry-run 仅打印命令，不查数据/GPU、不创建训练输出、不启动训练。
+默认沿用调度器 CUDA_VISIBLE_DEVICES；未设置时为 0,1，两进程、每卡 batch=4、全局 8。
+默认 10 epochs、lr=0.0001、num_workers=0，学习率与监督参数均支持环境变量覆盖。
+PYTHON_BIN 使用当前已激活环境的 python，可显式提供其他解释器路径；不硬编码八卡 Conda 路径。
+RESUME_FROM_CHECKPOINT 用于 epoch 续训，默认沿用该文件的父目录作为输出目录。
+INIT_STRUCTURE_CHECKPOINT 仅权重初始化；两者互斥，默认均为空。
+续训需保留 checkpoint_best.pt 和 checkpoint_last.pt，且监督配置、卡数、batch、workers 等一致。
+用户要求的 OSEDiff_idea8 上传文件夹不包含任何 checkpoints，不需要生成器或 Stable Diffusion 权重。
+运行时会生成 launch_preflight_*.json、console.log、metrics.jsonl 与 best/last。
+slpchen 的路径和运行环境仍需在该平台实际核实；本地参数检查不能替代目标平台运行验证。
+
+H2/H3 全分辨率细节通路（2026-10-27）
+--head_variant half 为新训练默认，旧 checkpoint 缺少 variant 时仍恢复原结构。
+--head_variant full_detail 增加 10→32 的 stride=1 浅层分支，将半分辨率融合特征
+上采样后与浅层特征拼接，经 64→32 融合块，在 H×W 上预测两尺度边缘与置信度。
+H2 用 smooth_l1，H3 用 region_balanced；其他监督/算子/预处理均沿用 H0/H1。
+新参数在原模块之后初始化，相同 seed 的共有参数保持一致；H2/H3 使用同一完整初始化。
+架构名称写入 head_config；恢复、校准和推理从 checkpoint 自动构建对应网络。
+显式 head_variant 与加载的 checkpoint 不符时报错；不能把旧 half 权重直接当成 full_detail。
+训练预算沿用 10 epochs、双卡每卡 batch=4、全局 8、lr=1e-4、seed=42。
+结构 best 按 balanced_mae；完成后各自从结构 best 校准置信度，再做固定 72 帧配对验证。
+全分辨率路径会增加计算/显存；实际耗时和参数量必须记录，不预先宣称提升。

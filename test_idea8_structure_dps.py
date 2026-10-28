@@ -3,7 +3,8 @@
 import argparse
 from collections import defaultdict
 import csv
-from dataclasses import asdict
+from dataclasses import asdict, replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,8 @@ import torch
 from dataloaders.sde_event_film_dataset import SDEEventFilmDataset
 from dataloaders.sde_event_structure_dataset import SDEEventStructureDataset, StructureEventConfig
 from models.event_structure_head import load_structure_checkpoint
-from models.event_structure_guidance import GuidanceConfig, observe_events, restore_sample
+from models.event_structure_guidance import GuidanceConfig, observe_events, restore_sample, freeze_observation_masks
+from models.image_structure import image_structure
 
 
 METRIC_NAMES = ("psnr", "ssim", "lpips", "fid")
@@ -33,6 +35,10 @@ def build_parser():
     parser.add_argument("--inference_only", action="store_true", help="无 GT 推理，显式关闭所有指标并保存图像。")
     parser.add_argument("--structure_checkpoint")
     parser.add_argument("--structure_manifest")
+    parser.add_argument("--guidance_target_source", choices=("event", "gt_oracle"), default="event",
+                        help="gt_oracle 仅用于离线目标替换诊断，固定原事件置信度及 M0/K0。")
+    parser.add_argument("--save_float_predictions", action="store_true",
+                        help="保存未经 PNG 量化的输出与 GT，供结构/纹理配对分析。")
     parser.add_argument("--guidance_steps", type=int, default=0)
     parser.add_argument("--guidance_lr", type=float, default=0.01)
     parser.add_argument("--guidance_trust_radius", type=float, default=0.03)
@@ -80,6 +86,8 @@ def parse_args(argv=None):
         parser.error("Initial guidance requires refinement off and image_size=256.")
     if args.max_samples < 0:
         parser.error("max_samples must be nonnegative.")
+    if args.guidance_target_source == "gt_oracle" and (args.inference_only or args.guidance_steps == 0):
+        parser.error("gt_oracle requires positive guidance_steps and ground-truth offline evaluation.")
     if args.inference_only:
         args.calculate_fid, args.save_images = False, True
     args.require_ground_truth = not args.inference_only
@@ -90,6 +98,26 @@ def parse_args(argv=None):
 def _sync(device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def diagnostic_observation(observation, source, target=None, operator=None):
+    """GT 只替换结构目标；W、M0、K0 均由同一事件观测固定，不构造 GT 掩码。"""
+    observation = freeze_observation_masks(observation)
+    if source == "gt_oracle":
+        if target is None:
+            raise ValueError("Oracle diagnostic requires an aligned ground-truth tensor.")
+        with torch.no_grad():
+            edges = image_structure(target.float() * 0.5 + 0.5, operator).detach()
+        observation = replace(observation, edges=edges)
+    elif source != "event":
+        raise ValueError("Unknown guidance target source.")
+    observation.validate()
+    return observation
+
+
+def tensor_digest(tensor):
+    # 记录未量化张量的哈希，跨组核查 latent、结构权重及掩码完全一致。
+    return hashlib.sha256(tensor.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
 
 
 def evaluation_indices(dataset, args):
@@ -177,12 +205,17 @@ def main(args):
                        ssim=pyiqa.create_metric("ssim", test_y_channel=True, color_space="ycbcr").to(device),
                        lpips=pyiqa.create_metric("lpips", device=device).to(device))
     mode = "baseline" if not config.steps else f"structure_dps_{config.steps}"
+    if args.guidance_target_source == "gt_oracle":
+        mode += "_gt_oracle"
     fid = FIDEvaluator([mode], device) if args.calculate_fid else None
     manifest = dict(arguments=vars(args), guidance=asdict(config), metrics=list(metrics) + (["fid"] if fid else []),
                     actual_event_lora_targets=list(model.gen.event_lora_config.targets),
                     actual_unet_lora_parts=list(args.unet_lora_parts),
                     structure_event_config=checkpoint["event_config"] if checkpoint else None,
                     selected_indices=indices, numeric_settings=numeric_settings,
+                    uses_gt_for_guidance=args.guidance_target_source == "gt_oracle",
+                    guidance_target_source=args.guidance_target_source,
+                    mask_policy="original_event_confidence_M0_K0",
                     scheduler=dict(model.gen.noise_scheduler.config), scheduler_timesteps=model.timesteps.tolist())
     scheduler = model.gen.noise_scheduler
     manifest["scheduler_class"] = type(scheduler).__name__
@@ -198,7 +231,7 @@ def main(args):
             rgb = sample["conditioning_pixel_values"][None].to(device, dtype)
             events = sample["events"][None].to(device, dtype)
             refinement = sample["events_refinement"][None].to(device, dtype)
-            # 生成函数只收到白名单输入；GT 不进入 context、结构观测或候选验收。
+            # 生成器 context 始终只收到 RGB/事件；GT 仅可由显式 oracle 诊断提供结构目标。
             torch.manual_seed(args.seed + index)
             _sync(device)
             start = time.perf_counter()
@@ -206,10 +239,20 @@ def main(args):
                 context = model.gen.prepare_denoising_context(
                     rgb, events, dict(prompt=[args.fixed_prompt], neg_prompt=[args.neg_prompt]))
                 observation = observe_events(head, sample["events_structure"][None].to(device), config.min_confidence) if head else None
+                if observation is not None:
+                    oracle_gt = sample["output_pixel_values"][None].to(device) if args.guidance_target_source == "gt_oracle" else None
+                    observation = diagnostic_observation(observation, args.guidance_target_source, oracle_gt, operator)
             prediction, stats = restore_sample(model.gen, context, model.timesteps, rgb, config,
                                                 observation, operator, refinement, args.decoder_refinement_enabled)
             _sync(device)
             stats["inference_ms"] = (time.perf_counter() - start) * 1000
+            stats.update(sample_index=index, sample_seed=args.seed + index,
+                         latent_sha256=tensor_digest(context.encoded_control) if hasattr(context, "encoded_control") else None)
+            if observation is not None:
+                stats.update(structure_weight_sha256=tensor_digest(observation.confidence),
+                             feature_mask_sha256=tensor_digest(observation.feature_mask),
+                             protection_mask_sha256=tensor_digest(observation.protection_mask),
+                             target_sha256=tensor_digest(observation.edges))
             values = {}
             if metrics:
                 target = sample["output_pixel_values"][None].to(device)
@@ -241,8 +284,18 @@ def main(args):
             if args.guidance_save_diagnostics and observation is not None:
                 diagnostic_dir = output / "diagnostics" / scene
                 diagnostic_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(dict(edges=observation.edges.cpu(), confidence=observation.confidence.cpu()),
+                torch.save(dict(edges=observation.edges.cpu(), confidence=observation.confidence.cpu(),
+                                feature_mask=observation.feature_mask.cpu(), protection_mask=observation.protection_mask.cpu(),
+                                uses_gt=args.guidance_target_source == "gt_oracle"),
                            diagnostic_dir / f"{sample['frame_id']}.pt")
+            if args.save_float_predictions:
+                float_dir = output / "float_predictions" / scene
+                float_dir.mkdir(parents=True, exist_ok=True)
+                payload = dict(prediction=prediction.detach().cpu(), sample_index=index,
+                               sample_seed=args.seed + index, frame_id=sample["frame_id"])
+                if metrics:
+                    payload["target"] = target.detach().cpu()
+                torch.save(payload, float_dir / f"{sample['frame_id']}.pt")
             print(f"[{ordinal+1}/{count}] {scene}/{sample['frame_id']} {values} "
                   f"accepted={stats['accepted_steps']} reason={stats['reason']} "
                   f"forward={stats['forward_calls']} backward={stats['backward_calls']}", flush=True)

@@ -13,10 +13,13 @@ class StructureHeadConfig:
     bins: int = 5
     base_channels: int = 32
     scales: int = 2
+    variant: str = "half"
 
     def __post_init__(self):
         if self.bins < 1 or self.base_channels < 4 or self.scales < 1:
             raise ValueError("Invalid structure head dimensions.")
+        if self.variant not in {"half", "full_detail"}:
+            raise ValueError("Unknown structure head variant.")
 
 
 def _block(in_channels, out_channels, stride=1):
@@ -29,7 +32,8 @@ def _block(in_channels, out_channels, stride=1):
 class EventStructurePredictor(nn.Module):
     """输入 [B,2*bins,H,W]；输出两组 [B,S,H,W] 的边缘和可信度。
 
-    编码器保留 1/2 尺度跳连；置信度在结构分支冻结后单独训练。
+    half 保留 1/2 尺度跳连；full_detail 额外融合 H×W 浅层特征。
+    置信度在结构分支冻结后单独训练。
     """
     def __init__(self, config=None):
         super().__init__()
@@ -42,6 +46,11 @@ class EventStructurePredictor(nn.Module):
         self.edge = nn.Conv2d(c, self.config.scales, 1)
         self.confidence = nn.Sequential(nn.Conv2d(c, c, 3, padding=1), nn.SiLU(),
                                         nn.Conv2d(c, self.config.scales, 1))
+        # H2/H3：保留 [B,10,H,W] 中的浅层定位信息，与半分辨率上下文融合。
+        # 放在原模块之后初始化，使相同 seed 下原有参数与 half 版本保持一致。
+        if self.config.variant == "full_detail":
+            self.detail = _block(2 * self.config.bins, c)
+            self.detail_fuse = _block(2 * c, c)
 
     def forward(self, events):
         if events.ndim != 4 or events.shape[1] != 2 * self.config.bins:
@@ -51,6 +60,11 @@ class EventStructurePredictor(nn.Module):
         x3 = self.enc3(x2)
         x = self.fuse(torch.cat((x1, F.interpolate(x2, x1.shape[-2:], mode="bilinear", align_corners=False),
                                 F.interpolate(x3, x1.shape[-2:], mode="bilinear", align_corners=False)), dim=1))
+        if self.config.variant == "full_detail":
+            # 在 H×W 上执行可学习融合及预测，而非仅把低分辨率 logits 插值放大。
+            detail = self.detail(events)
+            context = F.interpolate(x, events.shape[-2:], mode="bilinear", align_corners=False)
+            x = self.detail_fuse(torch.cat((detail, context), dim=1))
         edge = torch.sigmoid(F.interpolate(self.edge(x), events.shape[-2:], mode="bilinear", align_corners=False))
         confidence = torch.sigmoid(F.interpolate(self.confidence(x.detach()), events.shape[-2:],
                                                  mode="bilinear", align_corners=False))

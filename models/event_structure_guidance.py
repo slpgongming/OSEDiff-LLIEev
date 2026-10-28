@@ -1,6 +1,6 @@
-"""固定事件结构目标，在推理时优化完整通道主干特征；没有 GT 输入。"""
+"""固定结构观测，在推理时优化完整通道主干特征；默认观测仅依赖事件。"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import torch
 import torch.nn.functional as F
@@ -44,6 +44,9 @@ class GuidanceConfig:
 class StructureObservation:
     edges: torch.Tensor
     confidence: torch.Tensor
+    # 独立控制结构误差、允许修改的区域、需要保护的区域；None 保留原推理行为。
+    feature_mask: torch.Tensor = None
+    protection_mask: torch.Tensor = None
 
     def validate(self):
         if self.edges.ndim != 4 or not self.edges.numel() or self.edges.shape != self.confidence.shape:
@@ -51,6 +54,19 @@ class StructureObservation:
         for tensor in (self.edges, self.confidence):
             if not torch.isfinite(tensor).all() or tensor.min() < 0 or tensor.max() > 1:
                 raise ValueError("Structure observations must be finite and in [0,1].")
+        expected = (self.edges.shape[0], 1, *self.edges.shape[-2:])
+        for tensor in (self.feature_mask, self.protection_mask):
+            if tensor is not None and (tuple(tensor.shape) != expected or
+                    not torch.isfinite(tensor).all() or tensor.min() < 0 or tensor.max() > 1):
+                raise ValueError("Independent guidance masks must be finite [B,1,H,W] maps in [0,1].")
+
+
+def freeze_observation_masks(observation):
+    """从原事件置信度固定 M0/K0；随后替换目标或误差权重不会改变它们。"""
+    mean_confidence = observation.confidence.detach().mean(1, keepdim=True)
+    return replace(observation,
+                   feature_mask=mean_confidence if observation.feature_mask is None else observation.feature_mask.detach(),
+                   protection_mask=1 - mean_confidence if observation.protection_mask is None else observation.protection_mask.detach())
 
 
 @torch.no_grad()
@@ -109,7 +125,9 @@ def _losses(raw, baseline, observation, operator, config):
     low_difference = gaussian_blur(image, 3.0) - gaussian_blur(base, 3.0)
     difference = image - base
     low = low_difference.abs().mean()
-    outside = 1 - confidence.mean(1, keepdim=True)
+    outside = observation.protection_mask
+    if outside is None:
+        outside = 1 - confidence.mean(1, keepdim=True)
     denominator = (3 * outside.sum()).clamp_min(1e-8)
     keep = (outside * difference.abs()).sum() / denominator
     # 软惩罚与硬预算分离：二次项在零点附近平滑，避免 L1 成本压过微小结构收益。
@@ -151,7 +169,9 @@ def optimize_features(render, observation, config, operator=None):
     if observation is None:
         raise ValueError("Positive guidance steps require a fixed event observation.")
     observation.validate()
-    observation = StructureObservation(observation.edges.detach(), observation.confidence.detach())
+    observation = replace(observation, edges=observation.edges.detach(), confidence=observation.confidence.detach(),
+                          feature_mask=observation.feature_mask.detach() if observation.feature_mask is not None else None,
+                          protection_mask=observation.protection_mask.detach() if observation.protection_mask is not None else None)
     stats.update(mean_confidence=float(observation.confidence.mean()),
                  supported_fraction=float((observation.confidence.amax(1) > 0).float().mean()))
     if observation.edges.shape[0] != 1:
@@ -161,7 +181,10 @@ def optimize_features(render, observation, config, operator=None):
             image = render(None).detach().clamp(-1, 1)
         stats.update(forward_calls=1, reason="no_event_support")
         return image, stats
-    correction = FullFeatureCorrection(observation.confidence.mean(1, keepdim=True))
+    feature_mask = observation.feature_mask
+    if feature_mask is None:
+        feature_mask = observation.confidence.mean(1, keepdim=True)
+    correction = FullFeatureCorrection(feature_mask)
     try:
         with torch.enable_grad():
             raw = render(correction)
