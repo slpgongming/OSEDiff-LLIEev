@@ -377,7 +377,8 @@ def main(args):
     model, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, dataloader, lr_scheduler
     )
-    lpips_metric = pyiqa.create_metric("lpips").to(accelerator.device).eval()
+    # 启用对预测图像的梯度；冻结 LPIPS 参数不影响梯度传回 decoder refinement。
+    lpips_metric = pyiqa.create_metric("lpips", as_loss=True, device=accelerator.device).eval()
     lpips_metric.requires_grad_(False)
     if accelerator.is_main_process and args.report_to:
         tracker_config = vars(args).copy()
@@ -433,6 +434,9 @@ def main(args):
                     prediction.float().clamp(-1, 1) * 0.5 + 0.5,
                     target.float().clamp(-1, 1) * 0.5 + 0.5,
                 ).mean()
+                # 防止感知损失只进入日志、却因计算图断开而未参与训练。
+                if args.lambda_lpips > 0 and not loss_lpips.requires_grad:
+                    raise RuntimeError("LPIPS loss is detached; perceptual supervision cannot backpropagate.")
                 edge_events = batch.get("event_voxel_raw", events_refinement)
                 loss_edge = event_edge_loss(
                     prediction.float(), target.float(), edge_events.float()
