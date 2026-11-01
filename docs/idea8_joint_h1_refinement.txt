@@ -1,0 +1,34 @@
+H1 与 decoder refinement 联合微调（2026-10-30）
+
+这是独立试验入口 train_joint_h1_refinement.py，不改变旧冻结 H1 的 Stage4 训练。
+从无 H1 Stage4 10-28-2230 和原校准 H1 初始化；Stage3固定10-1-1700。
+只更新d123与H1结构分支，d0旁路/冻结，HDRev、Stage3、原置信度末端冻结。
+独立复制整个原H1作固定教师，其共享编码特征也冻结。教师提供置信度、事件支持域、修正/保护掩码；学生只提供结构目标。
+一步delta修正保留create_graph=True、归一化与信赖域投影的梯度，最终图像监督经过完整decoder回传到H1与fusion。
+候选验收延用原目标下降、low/keep硬预算；离散分支不求导，对选定分支精确展开。GT只用于外层图像/结构监督。
+未接受的候选回退到基线图像，H1仍接受结构锚定监督；不会伪称拒绝分支有图像梯度。
+
+试验预算：1000全局更新，每卡1帧，双卡global batch=2；固定lr，fusion1e-5，head1e-6，AdamW .9/.999、wd0、eps1e-8，两组梯度分别clip1。
+外层损失：L2 + 0.1 LPIPS + 0.1 event-edge + 0.01 region-balanced structure。
+结构权重0.01是根据首个真实训练样本的梯度量级设定的试验起点，未经验证集调优，不声称最优。
+内层step1/lr0.01/trust0.03/threshold0.25，refinement fp16、backbone FP32，普通LoRA none，t500。
+cLoRA5bin，HDRev bin0，H1正负分离10通道；所有图像几何变换共享。
+
+训练只用原scene_split中的24个train场景（8960帧）；验证用6个validation场景每场景固定12帧。
+验证阶段0与每250步分别测H1开/关PSNR(Y)、SSIM(Y)、LPIPS及结构监督损失；不将72帧指标冒充全量测试。
+这些验证场景对本次微调留出，但原Stage4曾见过，不能称整个模型独立未见过的验证集。
+checkpoint_best按验证开启H1的PSNR保存，初始权重也可保持best；last/final保留联合权重与优化器。
+
+checkpoint格式joint-h1-refinement-v1：fusion/head/teacher+初始化哈希与签名+optimizer/scaler。
+不能直接当作旧Stage4 model_final.pkl或普通H1单头checkpoint使用；加载必须恢复独立teacher，否则置信度会漂移。
+resume要求超参、world size、场景划分及预算一致。每步根据step/rank确定随机种子和样本序列，可重放后续批次；CUDA确定性仍为warn-only。
+手动同步外层梯度，避免DDP reducer与内层autograd.grad冲突；双卡smoke核对参数哈希相同。
+真实验收必须确认仅图像损失对H1的梯度非零，以及冻结参数逐位不变，不能只用结构监督的梯度证明联合训练。
+
+best250 完整测试入口：test_joint_h1_refinement.py。
+读取 joint_run/run_config.json 和 checkpoint_best.pt；--expected_sha256 必填，核验格式/步数250/签名。
+先重建原冻结Stage3/Stage4基座，再严格恢复fusion、学生head、独立teacher，并验证冻结参数哈希。
+固定d123、强度1.0，每帧使用seed42+全局index分别求H1_off/H1_on；GT从引导输入字典中剔除。
+每个进程处理index%shards互斥分片，默认完整2741帧，原子records支持恢复。--limit仅用于明确小样本验收。
+--audit重放两个原验证样本并核对step250指标，不能将audit/limit结果当正式测试。
+--aggregate复用全集合FID聚合，不平均分片FID；每条件保存PNG、逐图/逐场景三指标和全量四指标。

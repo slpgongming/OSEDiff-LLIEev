@@ -806,21 +806,10 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         )
         return x_denoised, context.prompt_embeds, context.neg_prompt_embeds
 
-    def decode_denoised_latent(
-        self,
-        x_denoised,
-        c_t,
-        events_refinement=None,
-        decoder_fusion_enabled=None,
-        refinement_fusion_mode=None,
-        clamp_output=True,
-    ):
-        """对固定 z0 只执行一次 decoder，供 off/on 公平对比复用。"""
-        vae_dtype = _first_parameter_dtype(self.vae, default=x_denoised.dtype)
-        fusion_enabled = (
-            self.decoder_fusion_enabled
-            if decoder_fusion_enabled is None else bool(decoder_fusion_enabled)
-        )
+    def prepare_decoder_refinement_condition(self, c_t, events_refinement, refinement_fusion_mode=None):
+        """固定 RGB/events 的无梯度条件，供同一样本所有 H1 候选复用。"""
+        from models.decoder_refinement import DecoderRefinementCondition
+
         fusion_mode = refinement_fusion_mode or self.refinement_fusion_mode
         fused_features = None
         rgb_features = None
@@ -877,13 +866,35 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
                     self.last_refinement_stats[f"{prefix}/mean"] = detached.mean().item()
                     self.last_refinement_stats[f"{prefix}/std"] = detached.std(unbiased=False).item()
                     self.last_refinement_stats[f"{prefix}/abs_max"] = detached.abs().max().item()
+        return DecoderRefinementCondition(fused_features, rgb_features, event_features, event_activity)
+
+    def decode_denoised_latent(
+        self,
+        x_denoised,
+        c_t,
+        events_refinement=None,
+        decoder_fusion_enabled=None,
+        refinement_fusion_mode=None,
+        clamp_output=True,
+        refinement_condition=None,
+    ):
+        """解码固定 z0；缓存条件仅复用 RGB/event 特征，不能 detach latent 到输出的梯度。"""
+        vae_dtype = _first_parameter_dtype(self.vae, default=x_denoised.dtype)
+        fusion_enabled = (
+            self.decoder_fusion_enabled
+            if decoder_fusion_enabled is None else bool(decoder_fusion_enabled)
+        )
+        fusion_mode = refinement_fusion_mode or self.refinement_fusion_mode
+        condition = refinement_condition
+        if condition is None:
+            condition = self.prepare_decoder_refinement_condition(c_t, events_refinement, fusion_mode)
         output = (
             self.vae.decode(
                 x_denoised.to(dtype=vae_dtype) / self.vae.config.scaling_factor,
-                fused_features=fused_features,
-                rgb_features=rgb_features,
-                event_features=event_features,
-                event_activity=event_activity,
+                fused_features=condition.fused_features,
+                rgb_features=condition.rgb_features,
+                event_features=condition.event_features,
+                event_activity=condition.event_activity,
                 fusion_enabled=fusion_enabled,
                 fusion_weight=self.decoder_fusion_weight,
                 fusion_mode=fusion_mode,

@@ -421,3 +421,11 @@ references/eglol.py               事件预处理参考
 - 回答代码问题时优先引用具体文件和函数。
 
 - H2/H3 显式使用 `--head_variant full_detail`：stride=1 浅层事件分支与上采样的半分辨率上下文融合，在全分辨率上预测。H2 保留 Smooth L1，H3 使用区域平衡。默认 `half` 与旧权重输出保持兼容；checkpoint 记录结构版本，加载时继承并拒绝显式不匹配。保持预处理/结构算子、共同初始化、训练预算及场景划分不变；分别从新结构 best 重新校准置信度。
+
+- H1 Stage4 通过 `train_idea3_decoder_refinement.py --h1_structure_checkpoint` 显式启用：冻结 FP32 的逐样本 H1 引导在关闭 refinement 时只捕获接受的 latent，再 detach 后训练外层 decoder fusion。Stage3/H1/HDRev 均冻结；cLoRA 用5bin，HDRev 用bin0，H1保持原10通道视图。保存并在续训时核验流水线元信息及H1权重包；后续推理必须沿用 H1→refinement 顺序。见 `docs/idea8_h1_stage4.txt`。
+
+- 无H1 Stage4消融不提供结构权重，显式使用 `--frozen_backbone_fp32 --global_step_lr_schedule --h1_guidance_steps 0`。新训练通过 `--decoder_refinement_init_checkpoint` 加载共同fusion初始化，核验Stage3/HDRev/结构/seed并恢复初始化后的RNG；禁止同时resume。保持在跑H1组的源码快照不变。
+
+- 完整 decoder H1 Stage4 训练显式使用 `--h1_decoder_path full_refinement`：逐样本内层通过完整 decoder 求解时暂时冻结全部当前权重，接受 latent detach 后恢复 fusion 梯度，供外层 GT 损失更新。训练启用全部四层，内外层 refinement 精度/强度一致；禁用内层 autocast 权重缓存。记录 v2 流水线并拒绝旧优化器续训；测试入口的 `auto` 模式继承训练引导路径。见 `docs/idea8_h1_stage4.txt`。
+
+- H1/refinement 联合微调用独立入口 `train_joint_h1_refinement.py`。冻结 Stage3/HDRev/d0 和完整的初始 H1 教师，只更新 d123 与学生结构分支。固定置信度/掩码由包含共享特征的教师提供；保留一步高阶梯度及无 GT 候选验收，GT 仅用于外层图像/结构监督。保存同时包含学生、教师的 `joint-h1-refinement-v1`，禁止作为普通 Stage4 或单头 checkpoint 加载。启动前验证图像损失对 H1 的梯度、冻结参数一致、双卡同步和断点恢复。见 `docs/idea8_joint_h1_refinement.txt`。

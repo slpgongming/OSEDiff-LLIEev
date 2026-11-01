@@ -497,6 +497,20 @@ class FeatureAwareDecoder(Decoder):
         except TypeError:
             return torch.utils.checkpoint.checkpoint(custom_forward, *inputs)
 
+    def set_inference_fusion_levels(self, levels=None):
+        """测试时按 decoder 执行顺序选择 d0..d3；None 保留原始全层行为。
+
+        禁用层直接旁路整个融合残差，不把条件置零；不改变模型参数或 checkpoint 结构。
+        """
+        if levels is not None:
+            levels = tuple(levels)
+            if len(set(levels)) != len(levels) or any(
+                not isinstance(i, int) or i < 0 or i >= len(self.feature_fusion_blocks)
+                for i in levels
+            ):
+                raise ValueError(f"Invalid decoder execution levels: {levels}")
+        self.inference_fusion_levels = levels
+
     def _validate_conditions(self, fused_features, rgb_features, event_features, event_activity, fusion_enabled):
         if not fusion_enabled:
             return None
@@ -552,7 +566,8 @@ class FeatureAwareDecoder(Decoder):
             sample = self._checkpoint(self.mid_block, sample, latent_embeds)
             sample = sample.to(upscale_dtype)
             for index, up_block in enumerate(self.up_blocks):
-                if conditions is not None:
+                if conditions is not None and (getattr(self, "inference_fusion_levels", None) is None
+                                               or index in self.inference_fusion_levels):
                     if self.refinement_variant == "legacy_fused":
                         sample = self.feature_fusion_blocks[index](
                             conditions["fused"][index], sample, fusion_weight=fusion_weight
@@ -571,7 +586,8 @@ class FeatureAwareDecoder(Decoder):
             sample = self.mid_block(sample, latent_embeds)
             sample = sample.to(upscale_dtype)
             for index, up_block in enumerate(self.up_blocks):
-                if conditions is not None:
+                if conditions is not None and (getattr(self, "inference_fusion_levels", None) is None
+                                               or index in self.inference_fusion_levels):
                     if self.refinement_variant == "legacy_fused":
                         sample = self.feature_fusion_blocks[index](
                             conditions["fused"][index], sample, fusion_weight=fusion_weight

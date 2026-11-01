@@ -1,0 +1,36 @@
+Stage4 层组合与残差强度配对测试（2026-10-29）
+
+入口：test_idea8_stage4_sweep.py --run_dir TRAIN_RUN --output_dir TEST_OUTPUT。
+训练目录需要 run_config.json、launch/manager_state.json=completed 和 global_step=20000 的最终checkpoint。
+H1组核验Stage3/H1哈希与checkpoint内嵌H1 bundle，使用训练相同guided_latents；无H1组使用frozen_stage3_latents。
+两组骨干FP32，每帧seed=42+全局index；GT只用于指标，不进入引导。每帧同一latent复用八个decoder设置。
+
+d0..d3 指VAE decoder up_blocks/feature_fusion_blocks执行顺序，输入空间尺度32/64/128/256（256输入）。
+与condition pyramid反转前的层号不同，不得用cgdrs_event_levels替代：当前训练结构是legacy_fused。
+FeatureAwareDecoder.set_inference_fusion_levels(None)保持全层默认；空tuple全关；(2,3)/(1,2,3)为本次两种组合。
+全局强度0.25/0.5/0.75/1.0传给原fusion_weight，缩放整个训练残差；未选层直接绕过fusion block。
+默认路径与权重格式不变，测试的运行时mask不写入训练checkpoint。
+
+分片：--shard 0 --shards 2 与 --shard 1 --shards 2 分别处理index模2的互斥集合，不padding。
+逐帧records原子写入，恢复先检查八张图片均存在；manifest不同则拒绝恢复。
+--limit 2仅用于独立smoke目录；正式测试不设limit（完整2741帧）。
+--aggregate在全部分片done后核验全量无重复，再计算每个设置的PSNR(Y)、SSIM(Y)、LPIPS和全量FID。
+PSNR/SSIM/LPIPS使用未量化输出，与现有测试协议一致；FID使用保存的PNG。
+images保存全部增强图；references保存low/GT；records保留原始路径、场景内序号、seed、latent哈希及H1诊断。
+每设置summary.json/per_image.csv/per_scene.csv；整个组summary.csv/complete.json用于可恢复队列。
+
+本次服务器目录：/home/data1/cjl/OSEDiff_Project/Test_results/idea8_stage4_sweep_20261029/
+launch/source_snapshot为独立固定测试快照，不修改原两组训练代码或权重。
+launch/manager.py先执行两组真实smoke及四指标，再启用0/1号卡H1、2/3号卡无H1分片推理，最后按组全量FID。
+视觉审阅须另行查看真实PNG，不能用高频统计单独推断平滑；比较帧应覆盖多个场景和指标改善/退化两端。
+
+2026-10-29：新增 H1 对完整 refinement decoder 求导的推理模式
+在独立输出目录运行 test_idea8_stage4_sweep.py，显式传入 --h1_decoder_path full_refinement。
+此模式要求 Stage4 H1 训练组的完成 checkpoint 与对应结构头，校验原训练的 H1/Stage3 权重元信息。
+--settings d123_w100 可只测试 d1/d2/d3、强度1；--settings d0123_w100 使用训练时的全部四层。
+每个配置独立以 seed+global_index 求解临时 UNet 特征 delta，基线、候选验收及返回图像使用同一层、
+强度和 FP16 autocast decoder；Stage3/H1/HDRev/refinement 权重冻结，事件结构观测不接收 GT。
+RGB/event 条件特征在每个样本和设置内缓存，避免候选重复计算。最终图像直接采用已经验收的结果。
+records 的每个设置记录诊断及接受 latent 的哈希；manifest 记录 decoder 路径/设置并阻止混合恢复。
+默认 auto 继承训练的引导语义；对旧训练显式使用 full_refinement 属于推理时修改，不能称为原训练路径。
+旧结果与新版本 manifest 不混用，务必指定新的 output_dir；--limit 是小样本测试而非完整指标。

@@ -1,6 +1,7 @@
 """idea3 Phase 1B：只训练 VAE decoder feature-fusion blocks。"""
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -36,6 +37,16 @@ def event_edge_loss(prediction, target, events):
     )
 
 
+def collate_h1_refinement(samples):
+    """仅拼接三路事件/RGB/GT张量与提示词；诊断metadata中的None不进入训练batch。"""
+    keys = ("conditioning_pixel_values", "output_pixel_values", "events", "events_refinement",
+            "events_structure", "event_voxel_raw")
+    batch = {key: torch.stack([sample[key] for sample in samples])
+             for key in keys if key in samples[0]}
+    batch.update({key: [sample[key] for sample in samples] for key in ("prompt", "neg_prompt")})
+    return batch
+
+
 def find_latest_checkpoint(checkpoint_dir):
     if not os.path.isdir(checkpoint_dir):
         return None
@@ -55,7 +66,7 @@ def load_checkpoint_file(path):
         return torch.load(path, map_location="cpu")
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_model_name_or_path", required=True)
     parser.add_argument("--train_data_root", required=True)
@@ -181,7 +192,29 @@ def parse_args():
     parser.add_argument("--resume_from_checkpoint", default=None)
     parser.add_argument("--resume_ignore_mismatch", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--decoder_refinement_init_checkpoint", help="消融实验的融合模块共同初始权重，仅用于新训练。")
+    parser.add_argument("--frozen_backbone_fp32", action="store_true",
+                        help="无H1对照保持骨干FP32、逐样本latent与scheduler随机作用域。")
+    parser.add_argument("--global_step_lr_schedule", action="store_true",
+                        help="按全局优化更新次数衰减；无H1对照组显式使用以匹配H1学习率。")
+    parser.add_argument("--h1_structure_checkpoint", help="可选：冻结且已校准的 H1，先修正 latent 再训练 refinement。")
+    parser.add_argument("--h1_decoder_path", choices=("legacy_stage3", "full_refinement"), default="legacy_stage3",
+                        help="full_refinement：每步在冻结当前完整 decoder 上引导，再只更新外层 fusion。")
+    parser.add_argument("--h1_guidance_steps", type=int, default=1)
+    parser.add_argument("--h1_guidance_lr", type=float, default=0.01)
+    parser.add_argument("--h1_guidance_trust_radius", type=float, default=0.03)
+    parser.add_argument("--h1_min_confidence", type=float, default=0.25)
+    args = parser.parse_args(argv)
+    if args.resume_from_checkpoint and args.decoder_refinement_init_checkpoint:
+        parser.error("Use resume or decoder refinement initialization, not both.")
+    if args.h1_decoder_path == 'full_refinement' and not args.h1_structure_checkpoint:
+        parser.error("Full-refinement H1 training requires --h1_structure_checkpoint.")
+    if args.h1_structure_checkpoint:
+        from models.event_structure_guidance import GuidanceConfig
+        GuidanceConfig(steps=args.h1_guidance_steps, learning_rate=args.h1_guidance_lr,
+                       trust_radius=args.h1_guidance_trust_radius, min_confidence=args.h1_min_confidence)
+        if args.h1_guidance_steps < 1 or args.image_size != 256:
+            parser.error("H1 Stage4 requires positive guidance and image_size=256.")
     args.decoder_refinement_enabled = False
     args.event_ablation_mode = "correct"
     args.return_raw_event_voxel = args.lambda_edge > 0
@@ -195,6 +228,10 @@ def validate_paths(args):
         "stage1_checkpoint": args.stage1_checkpoint,
         "event_lora_checkpoint": args.event_lora_checkpoint,
     }
+    if args.h1_structure_checkpoint:
+        required_files["h1_structure_checkpoint"] = args.h1_structure_checkpoint
+    if args.decoder_refinement_init_checkpoint:
+        required_files["decoder_refinement_init_checkpoint"] = args.decoder_refinement_init_checkpoint
     required_dirs = {
         "pretrained_model_name_or_path": args.pretrained_model_name_or_path,
         "train_data_root": args.train_data_root,
@@ -273,6 +310,9 @@ def save_checkpoint(
         timestep_config={"generator_timestep": args.generator_timestep},
         additional_info={
             "step_in_epoch": step_in_epoch,
+            "decoder_refinement_initialization": getattr(args, "decoder_refinement_init_record", None),
+            "frozen_backbone_fp32": args.frozen_backbone_fp32,
+            "global_step_lr_schedule": bool(args.h1_structure_checkpoint or args.global_step_lr_schedule),
             "event_normalization": "dual_view_clora_plus_nonzero_global_mean_std_v1",
             "event_active_bins": {
                 "clora": args.clora_event_active_bins,
@@ -293,6 +333,7 @@ def main(args):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
+        project_dir=os.path.join(args.output_dir, "logs"),
         # CGDRS 默认屏蔽 level 0 event 分支；DDP 需允许该分支参数本轮无梯度。
         kwargs_handlers=[
             DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -314,7 +355,14 @@ def main(args):
     resume_checkpoint = load_checkpoint_file(resume_path) if resume_path else None
 
     # 初始化顺序：base -> Stage1 -> cLoRA checkpoint -> RGB-event -> feature decoder -> resume。
-    model = OSEDiffEventFiLMGen(args)
+    if args.h1_structure_checkpoint:
+        from models.h1_decoder_refinement import H1DecoderRefinementGen
+        model = H1DecoderRefinementGen(args)
+    elif args.frozen_backbone_fp32:
+        from models.decoder_refinement_control import NoH1DecoderRefinementGen
+        model = NoH1DecoderRefinementGen(args)
+    else:
+        model = OSEDiffEventFiLMGen(args)
     model.load_stage1_full(args.stage1_checkpoint)
     model.load_event_checkpoint(load_checkpoint_file(args.event_lora_checkpoint))
     args.decoder_refinement_enabled = True
@@ -330,6 +378,12 @@ def main(args):
 
     model.activate_lora_adapters(args.unet_lora_active_parts)
 
+    if args.decoder_refinement_init_checkpoint:
+        from models.decoder_refinement_initialization import load_refinement_initialization
+        args.decoder_refinement_init_record = load_refinement_initialization(
+            model, args.decoder_refinement_init_checkpoint, args)
+    elif resume_checkpoint is not None:
+        args.decoder_refinement_init_record = resume_checkpoint.get("additional_info", {}).get("decoder_refinement_initialization")
     trainable_parameters = model.set_train_decoder_refinement()
     trainable_names = [
         name for name, parameter in model.named_parameters() if parameter.requires_grad
@@ -349,7 +403,20 @@ def main(args):
         logging.info("Dry run complete; no training step was executed.")
         return
 
-    dataset = SDEEventFilmDataset(split="train", args=args, root_dir=args.train_data_root)
+    if args.h1_structure_checkpoint:
+        from dataloaders.sde_event_structure_dataset import SDEEventStructureDataset, StructureEventConfig
+        dataset = SDEEventStructureDataset("train", args,
+            StructureEventConfig.from_dict(model.h1_metadata["event_config"]), args.train_data_root)
+    else:
+        dataset = SDEEventFilmDataset(split="train", args=args, root_dir=args.train_data_root)
+    if accelerator.is_main_process:
+        config = dict(vars(args), world_size=accelerator.num_processes,
+            global_batch_size=args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps,
+            training_samples=len(dataset), trainable_parameters=trainable_count,
+            scheduler_ticks_per_global_update=accelerator.num_processes if (args.h1_structure_checkpoint or args.global_step_lr_schedule) else 1,
+            trainable_names=trainable_names, h1_pipeline=getattr(model, "h1_pipeline", None))
+        with open(os.path.join(args.output_dir, "run_config.json"), "w", encoding="utf-8") as handle:
+            json.dump(config, handle, ensure_ascii=False, indent=2)
     dataloader = DataLoader(
         dataset,
         batch_size=args.train_batch_size,
@@ -357,6 +424,10 @@ def main(args):
         num_workers=args.dataloader_num_workers,
         pin_memory=True,
         drop_last=True,
+        # 两个逐样本骨干路径都保留 prompt 的样本轴；默认 collate 会转置样本内列表。
+        collate_fn=collate_h1_refinement if (args.h1_structure_checkpoint or args.frozen_backbone_fp32) else None,
+        **({"multiprocessing_context": "spawn"}
+           if args.dataloader_num_workers > 0 and accelerator.num_processes > 1 else {}),
     )
     optimizer = torch.optim.AdamW(
         trainable_parameters,
@@ -365,8 +436,11 @@ def main(args):
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
+    # Accelerate 在非 split_batches 的多卡模式每次更新推进 world_size 个刻度。
+    # H1及显式global调度的对照组同比扩展刻度，覆盖max_train_steps次全局更新。
+    schedule_factor = accelerator.num_processes if (args.h1_structure_checkpoint or args.global_step_lr_schedule) else 1
     lr_scheduler = build_scheduler(
-        optimizer, args.lr_warmup_steps, args.max_train_steps
+        optimizer, args.lr_warmup_steps * schedule_factor, args.max_train_steps * schedule_factor
     )
     if resume_checkpoint is not None:
         if "optimizer_state_dict" in resume_checkpoint:
@@ -382,6 +456,11 @@ def main(args):
     lpips_metric.requires_grad_(False)
     if accelerator.is_main_process and args.report_to:
         tracker_config = vars(args).copy()
+        if "tensorboard" in args.report_to or args.report_to == "all":
+            # TensorBoard hparams 只接受标量；保留完整语义为JSON字符串，不改变实际训练参数。
+            tracker_config = {key: value if isinstance(value, (int, float, str, bool))
+                              else json.dumps(value, ensure_ascii=False)
+                              for key, value in tracker_config.items()}
         init_kwargs = {}
         if "wandb" in args.report_to or args.report_to == "all":
             init_kwargs["wandb"] = {}
@@ -470,6 +549,11 @@ def main(args):
                         "train/gradient_norm": step_gradient_norm,
                         "time/elapsed_seconds": time.time() - started_at,
                     }
+                    if accelerator.is_main_process:
+                        with open(os.path.join(args.output_dir, "metrics.jsonl"), "a", encoding="utf-8") as handle:
+                            json.dump(dict(step=global_step, epoch=epoch, **logs,
+                                **getattr(accelerator.unwrap_model(model), "last_h1_stats", {})), handle)
+                            handle.write("\n")
                     logs.update(accelerator.unwrap_model(model).debug_stats())
                     accelerator.log(logs, step=global_step)
                     progress.set_postfix(loss=f"{logs['loss/total']:.4f}")

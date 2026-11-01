@@ -150,11 +150,12 @@ def _loss_numbers(values):
     return {key: value if math.isfinite(value) else None for key, value in numbers.items()}
 
 
-def optimize_features(render, observation, config, operator=None):
+def optimize_features(render, observation, config, operator=None, on_accept=None):
     """render(correction) 返回 [-1,1] 定义下的 raw RGB；只对 delta 反传。
 
     render 必须使用固定 latent/条件/RNG，且权重冻结。所有接受判断在最终 clamp
     后图像上进行；优化 raw 域以免饱和像素断梯度。重试计入 forward 次数。
+    on_accept 可捕获最近一次 render 的 latent；仅初始基线和通过验收的候选触发。
     """
     operator = operator or StructureOperatorConfig()
     stats = dict(forward_calls=0, backward_calls=0, accepted_steps=0, reason="disabled")
@@ -165,6 +166,8 @@ def optimize_features(render, observation, config, operator=None):
         with torch.no_grad():
             image = render(None).detach().clamp(-1, 1)
         stats["forward_calls"] = 1
+        if on_accept is not None:
+            on_accept()
         return image, stats
     if observation is None:
         raise ValueError("Positive guidance steps require a fixed event observation.")
@@ -180,6 +183,8 @@ def optimize_features(render, observation, config, operator=None):
         with torch.no_grad():
             image = render(None).detach().clamp(-1, 1)
         stats.update(forward_calls=1, reason="no_event_support")
+        if on_accept is not None:
+            on_accept()
         return image, stats
     feature_mask = observation.feature_mask
     if feature_mask is None:
@@ -195,6 +200,8 @@ def optimize_features(render, observation, config, operator=None):
                 raise RuntimeError("Baseline itself is non-finite; cannot provide a safe fallback.")
             baseline = raw.detach().clamp(-1, 1)
             result = baseline
+            if on_accept is not None:
+                on_accept()
             with torch.no_grad():
                 score, initial_values = _losses(baseline, baseline, observation, operator, config)
                 current_score = float(score)
@@ -263,6 +270,8 @@ def optimize_features(render, observation, config, operator=None):
                                 relative_delta=float(correction.relative_norm(correction.delta))))
                     if allowed:
                         raw, result, current_score = candidate_raw, candidate, float(score)
+                        if on_accept is not None:
+                            on_accept()
                         current_structure = float(values["structure"])
                         stats["accepted_steps"] += 1
                         stats["relative_delta"] = float(correction.relative_norm(correction.delta).detach())

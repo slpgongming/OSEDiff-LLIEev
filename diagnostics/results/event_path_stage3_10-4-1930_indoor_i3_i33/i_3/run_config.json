@@ -1,0 +1,21 @@
+{
+  "scene": "i_3",
+  "samples": 244,
+  "seed": 42,
+  "checkpoint": "/home/data1/cjl/OSEDiff_Project/TrainedWeights/OSEDiff_idea4_stage3_10-4-1930/checkpoints/model_final.pkl",
+  "data_root": "/home/data/Chen_data/SDE_dataset/sde_in_release/test",
+  "pretrained_model": "/home/data1/cjl/PretrainedModel/stable-diffusion-2-1-base",
+  "generator_timestep": 500,
+  "unet_lora_parts": [
+    "down",
+    "mid",
+    "up"
+  ],
+  "event_bins": 5,
+  "event_channels": 5,
+  "clora_event_active_bins": 5,
+  "mixed_precision": "fp16",
+  "torch_version": "2.0.1+cu118",
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "method": "One RGB/VAE latent/prompt per image; direct head contrast fixes its query; no ESG or decoder refinement."
+}
