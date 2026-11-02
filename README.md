@@ -1,4 +1,6 @@
-﻿<div align="center">
+> 本分支是事件引导低光增强最终版。当前入口与参数见 [最终版使用说明](docs/final_code.txt)。下方保留上游 OSEDiff 论文与项目介绍；其中原始 SR/face 命令不适用于本分支。
+
+<div align="center">
 
 
 <h1>One-Step Effective Diffusion Network for Real-World Image Super-Resolution</h1>

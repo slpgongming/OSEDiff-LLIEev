@@ -202,51 +202,16 @@ train_scripts/train_event_film_lora_stage3.sh
 test_scripts/test_event_film_lora_stage3.sh
 ```
 
-## Current Event-FiLM LoRA Design
+## Final architecture (final-code)
 
-Core idea:
-
-- Replace only selected UNet self-attention projections; never replace text cross-attention `attn2`.
-- Reshape the ordinary LoRA low-rank feature `z = A(x)` into a spatial feature map.
-- Use multi-scale event features from the event encoder to predict spatially varying `dgamma/dbeta`.
-- Apply FiLM modulation in the LoRA low-rank space:
-
-```text
-z_mod = (1 + s * tanh(dgamma)) * z + s * dbeta
-```
-
-- Pass the modulated low-rank feature through LoRA up projection to obtain `lora_out`.
-- The last layer of the modulation head should be zero-initialized so Stage 2 starts nearly equivalent to the Stage 1 ordinary LoRA.
-
-Implementation notes:
-
-- Event features are scoped to the current UNet pass. Clear them after forward normally, or after backward when gradient checkpointing needs them for recomputation.
-- The current implementation assumes self-attention tokens form a square spatial grid and usually infers `H=W` from `sqrt(N)`. Explicitly handle `H,W` before supporting non-square inputs.
-- When migrating Stage 1 PEFT LoRA A/B into Event-LoRA, check projection paths, adapter names, ranks, scaling, and tensor shapes carefully.
-
-Event-LoRA target selection and checkpoint rules:
-
-- `--event_lora_targets auto` uses `v` for a new Stage 1 initialization and inherits the target set from an Event checkpoint. Explicit subsets use `q,k,v,out`; `all` and `none` are also supported.
-- `none` leaves all self-attention PEFT LoRA modules unchanged. EventEncoder and event heads do not train in this mode; a Stage 2/3 run must have another trainable generator path.
-- Stage 2 freezes Event-LoRA A/B and trains event modulation. Stage 3 trains both. `--unet_lora_active_parts` and `--unet_lora_trainable_parts` independently control the remaining ordinary LoRA by down/mid/up group; trainable groups must be active.
-- Inference uses `--unet_lora_parts` for ordinary LoRA. Stage 2/3 inference defaults to `none`; the idea3 inference parser keeps its historical default.
-- Resume and ordinary inference require the checkpoint's Event-LoRA target set. Use `--init_from_event_checkpoint` with explicit targets for weights-only migration to a new target set; do not restore an old optimizer or step count across target changes.
-- V-only checkpoints without target metadata are interpreted as legacy `v`. Key evidence must agree with the declared target set. The historical V shared-head state keys remain unchanged.
-- After building Stage 2, run a zero-init consistency check: Stage 1 output and untrained Stage 2 output should be nearly identical.
-
-## idea8 Event-Structure Feature Guidance
-
-- See `docs/idea8_structure_dps.txt` for the current implementation and runnable workflow. ESG-only code has been removed; the seven historical baseline wrappers now use the idea8 entry with guidance disabled and preserve ordinary LoRA `down,mid,up`.
-- `test_idea8_structure_dps.py` defaults to PSNR(Y), SSIM(Y), LPIPS and whole-set FID. Disabling FID or all metrics must be explicit. The new generic shell defaults to `GUIDANCE_STEPS=0`, ordinary LoRA `none`, residual cross-attention, timestep 500, and inherits Event-LoRA targets from the checkpoint.
-- Positive guidance currently requires a Stage3 generator without decoder refinement, batch size 1, 256-square input, and a separately trained/calibrated structure checkpoint. Only a transient full-channel feature delta before the last UpBlock is optimized; generator weights are frozen and GT never enters guidance.
-- Train the independent structure head, then its confidence head on disjoint calibration scenes. New training defaults to `idea4_compatible`: reuse split-file priority / neighboring-frame slicing, then bin by the first/last events after the shared spatial crop. Keep positive/negative counts separate (10 channels); do not alter the original five-channel inputs. Optional `fixed_window` requires explicit timestamp units/windows. Checkpoints carry the preprocessing mode; old v1 checkpoints without mode remain fixed-window, and resume/calibration cannot switch modes. Timestamp recording coverage is never inferred from the first/last event.
-- The user selected generic environment-variable paths for the new idea8 scripts. Preserve existing account defaults in historical wrappers. Full UNet replay is implemented; cached suffix execution is a later optimization, not current behavior.
-- Guidance defaults to quadratic soft protection with low/keep weights 1.0/0.5; the hard low/keep budgets remain L1 with thresholds 0.02/0.02. Explicit `l1` with weights 2/1 reproduces the former objective. Candidate histories and incremental JSONL diagnostics are enabled by default. Use `--reproducible_inference` for paired comparisons; CUDA determinism is warn-only because replicate-padding backward is unsupported in torch 2.0.1. A `--sample_manifest` selects validation frames without changing their global indices/seeds.
-- Offline target replacement uses explicit `--guidance_target_source gt_oracle` with positive steps and GT evaluation; it is forbidden with `--inference_only`. This diagnostic replaces only the target using the checkpoint's structure operator, freezes original event-derived W/M0/K0, and marks `uses_gt_for_guidance=true`. Default `event` inference remains GT-free. Independent optional observation masks preserve legacy behavior when omitted. Latent/weight/mask hashes and optional float predictions support paired audits; oracle results must never be reported as deployable method performance.
-- `train_scripts/` and `test_scripts/` are local-only, ignored directories as requested on 2026-10-25. Keep their local files, but do not force-add them to Git. The Python training/testing entry points remain tracked.
-- Structure/confidence training supports single-process and torchrun DDP (CUDA/NCCL; CPU/Gloo for tests). The whb/slpchen wrappers default to two GPUs, batch size 4 per GPU (global 8); the generic wrapper defaults to one process. Distributed validation must never pad/repeat samples; only rank 0 writes outputs. Save each rank's RNG state; epoch resume requires unchanged world size, per-rank batch, workers, seed and device type. Use weights-only initialization when changing world size.
-- Training/validation step progress uses `--log_interval` / `LOG_INTERVAL` (default 50, positive integer). Only rank 0 prints; step losses are rank-local and epoch JSON metrics remain globally aggregated. Do not add collectives to the uneven validation loop for logging. The interval may change on resume.
-- Structure-head H0/H1 training is documented in `docs/idea8_structure_training.txt`: default `smooth_l1` preserves the old loss; explicit `region_balanced` averages flat/weak/strong GT regions per sample/scale and skips empty regions. Threshold defaults 0.05/0.2 are provisional, not claimed as fitted values; lock common thresholds before formal comparisons. Save last/best, use common region-balanced validation MAE for structure selection and validation MSE for confidence selection, and log per-scale/per-scene errors, bias, flat response and edge matching. Resume inherits and verifies supervision/selection metadata and historical best; legacy resumes start an explicit new selection window. Keep all new validation collectives outside uneven loops. No full-resolution architecture change is included.
+- Branch from idea8: residual_cross_attn cLoRA only, mod_channels=64 for new training. Preserve saved widths when loading existing compatible checkpoints.
+- Decoder refinement uses REDF (RGB-Event Decoder Fusion), configured as rgb_event_decoder_fusion, with the RGBEventEncoder pyramid. CGDRS, FiLM/CBAM/BAx cLoRA, H2/H3 full_detail, Stage5 full tuning, frozen-H1 Stage4 paths and Stage3-only/oracle guidance entry points are removed.
+- H1 is named E-SFR (Event-guided Structure Feature Refinement). Use train_esfr.py / test_esfr.py and models/esfr.py. Keep the half-resolution H1 structure head; new structure training defaults to region_balanced supervision.
+- Joint training freezes Stage3, RGBEventEncoder and the complete initial structure teacher. Only the student structure branch and selected decoder fusion layers train. Confidence/masks remain teacher-derived; one-step higher-order guidance and candidate acceptance never read GT. GT is only outer supervision.
+- --fusion_layers accepts d0,d1,d2,d3 (deepest to shallowest), numeric equivalents, all, or none. Stage4 defaults to all; joint E-SFR defaults to d1,d2,d3 for historical compatibility. Training requires a nonempty subset; inference may disable all layers and defaults to checkpoint settings. Only selected layers execute and receive gradients; all four parameter sets remain serialized.
+- Keep joint-h1-refinement-v1 format and historical H1 metadata keys for checkpoint compatibility. Old joint configs without fusion_layers mean d1,d2,d3; old Stage4 checkpoints without layers mean all. Resume must retain layers, optimizer structure and experiment signature. Deleted architectures must fail explicitly; do not silently reinterpret their weights.
+- Keep Stage1 RGB baseline, Stage2/3 cLoRA training, Stage4 decoder pretraining, independent structure/confidence pretraining, dataset/metrics and final-path tests. Historical shell directories are local-only; do not force-add or rewrite them without account context. See docs/final_code.txt for current usage; old experiment scripts should be run on idea8.
+- Validate selected-layer forward/gradient behavior, checkpoint reload, image-loss-to-structure gradients, frozen teacher consistency, and one-step inference parity. Full GPU training, multi-GPU synchronization and resume still require real model/data validation before formal runs.
 
 ## Code Development Requirements
 
@@ -419,13 +384,3 @@ Packaging procedure:
 - If explaining parameters such as `modulation_scale`, `lambda_edge`, `lambda_mod`, `lambda_smooth`, or `control_*`, explain from the current implementation path rather than guessing from the name.
 - If the user says not to run code, only edit files and provide runnable commands; do not start training or inference.
 - When answering code questions, prefer references to specific files and functions.
-
-- H2/H3 use explicit `--head_variant full_detail`: a stride-1 shallow event branch fused with upsampled half-resolution context before full-resolution prediction. H2 keeps Smooth L1; H3 uses regional balancing. Default `half` and legacy checkpoint outputs remain compatible. Checkpoints record the variant; loading inherits it and rejects explicit mismatches. Preserve preprocessing/operator, shared initialization, training budget and split; recalibrate confidence for each new structure best.
-
-- H1 Stage4 is explicit via `train_idea3_decoder_refinement.py --h1_structure_checkpoint`: frozen FP32 per-sample H1 guidance with refinement disabled captures only accepted latents, then detaches them for outer decoder-fusion training. Keep Stage3/H1/HDRev frozen; cLoRA uses 5 bins, HDRev uses bin0, H1 keeps its original 10-channel view. Save/check the pipeline metadata and H1 bundle on resume; subsequent inference must use the same H1-before-refinement path. See `docs/idea8_h1_stage4.txt`.
-
-- For the no-H1 Stage4 ablation, use explicit `--frozen_backbone_fp32 --global_step_lr_schedule --h1_guidance_steps 0` without a structure checkpoint. Load paired fusion initialization with `--decoder_refinement_init_checkpoint` for a fresh run only; validate Stage3/HDRev/topology/seed and restore post-initialization RNG. Keep the running H1 source snapshot unchanged.
-
-- Full-decoder H1 Stage4 training is explicit via `--h1_decoder_path full_refinement`: temporarily freeze all current weights for each sample's inner solve through the complete decoder, detach the accepted latent, then restore fusion gradients for the outer GT loss. Keep all four decoder layers active and inner/outer refinement precision/strength identical; disable inner autocast weight caching. Record pipeline v2 and reject legacy optimizer resume. The sweep entry's `auto` mode inherits the training guidance path. See `docs/idea8_h1_stage4.txt`.
-
-- Joint H1/refinement fine-tuning uses the separate `train_joint_h1_refinement.py` entry. Freeze Stage3/HDRev/d0 and a complete initial H1 teacher; update only d123 and the student structure branch. The teacher, including shared features, supplies fixed confidence/masks. Preserve one-step higher-order gradients and GT-free candidate acceptance; GT supervises only the outer image/structure losses. Save the `joint-h1-refinement-v1` bundle with both student and teacher, never load it as an ordinary Stage4 or single-head checkpoint. Validate image-loss-to-H1 gradients, frozen parameter equality, two-rank synchronization and resume before launch. See `docs/idea8_joint_h1_refinement.txt`.

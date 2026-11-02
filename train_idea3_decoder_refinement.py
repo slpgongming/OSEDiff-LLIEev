@@ -1,3 +1,5 @@
+from models.fusion_selection import parse_fusion_layers
+from models.decoder_refinement import normalize_refinement_variant
 """idea3 Phase 1B：只训练 VAE decoder feature-fusion blocks。"""
 
 import argparse
@@ -91,15 +93,8 @@ def parse_args(argv=None):
 
     parser.add_argument(
         "--event_lora_variant",
-        default="cbam_lowrank_residual",
-        choices=(
-            "film_affine",
-            "film",
-            "cbam_lowrank_residual",
-            "cbam_output_gate",
-            "residual_cross_attn",
-            "residual_cross_attn_bax",
-        ),
+        default="residual_cross_attn",
+        choices=("residual_cross_attn",),
     )
     parser.add_argument("--lora_rank", type=int, default=4)
     parser.add_argument("--event_channels", type=int, default=5)
@@ -113,13 +108,10 @@ def parse_args(argv=None):
         "--rgb_event_active_bins", type=int, default=5,
         help="RGB-event encoder 输入使用的前置有效 event bin 数；1 将全部事件聚集到 bin 0，通道数仍为 5。",
     )
-    parser.add_argument("--mod_channels", type=int, default=32)
+    parser.add_argument("--mod_channels", type=int, default=64)
     parser.add_argument("--modulation_scale", type=float, default=0.1)
     parser.add_argument("--mod_num_heads", type=int, default=4)
     parser.add_argument("--mod_window_size", type=int, default=8)
-    parser.add_argument("--event_lora_cbam_reduction", type=int, default=8)
-    parser.add_argument("--event_lora_cbam_spatial_kernel", type=int, default=7)
-    parser.add_argument("--event_lora_output_gate_channels", default="spatial")
 
     parser.add_argument(
         "--decoder_fusion_enabled",
@@ -130,20 +122,10 @@ def parse_args(argv=None):
     parser.add_argument("--decoder_fusion_init", default="near_zero", choices=("near_zero",))
     parser.add_argument(
         "--decoder_refinement_variant",
-        default="legacy_fused",
-        choices=("legacy_fused", "cgdrs"),
-        help="Decoder refinement implementation; legacy_fused preserves the previous path.",
-    )
-    parser.add_argument(
-        "--cgdrs_event_levels",
-        default="1,2,3",
-        help="CGDRS encoder pyramid levels that may receive event residuals (0-based).",
-    )
-    parser.add_argument("--cgdrs_gate_bias", type=float, default=-2.0)
-    parser.add_argument(
-        "--cgdrs_activity_mode",
-        choices=("abs_mean", "abs_sum"),
-        default="abs_mean",
+        type=normalize_refinement_variant,
+        default="rgb_event_decoder_fusion",
+        choices=("rgb_event_decoder_fusion",),
+        help="REDF: RGB-Event Decoder Fusion.",
     )
     parser.add_argument(
         "--refinement_fusion_mode", default="both", choices=("both", "rgb", "event")
@@ -197,24 +179,11 @@ def parse_args(argv=None):
                         help="无H1对照保持骨干FP32、逐样本latent与scheduler随机作用域。")
     parser.add_argument("--global_step_lr_schedule", action="store_true",
                         help="按全局优化更新次数衰减；无H1对照组显式使用以匹配H1学习率。")
-    parser.add_argument("--h1_structure_checkpoint", help="可选：冻结且已校准的 H1，先修正 latent 再训练 refinement。")
-    parser.add_argument("--h1_decoder_path", choices=("legacy_stage3", "full_refinement"), default="legacy_stage3",
-                        help="full_refinement：每步在冻结当前完整 decoder 上引导，再只更新外层 fusion。")
-    parser.add_argument("--h1_guidance_steps", type=int, default=1)
-    parser.add_argument("--h1_guidance_lr", type=float, default=0.01)
-    parser.add_argument("--h1_guidance_trust_radius", type=float, default=0.03)
-    parser.add_argument("--h1_min_confidence", type=float, default=0.25)
+    parser.add_argument("--fusion_layers", type=parse_fusion_layers, default=None)
     args = parser.parse_args(argv)
+    if args.fusion_layers == ():parser.error("Stage4 requires at least one fusion layer.")
     if args.resume_from_checkpoint and args.decoder_refinement_init_checkpoint:
         parser.error("Use resume or decoder refinement initialization, not both.")
-    if args.h1_decoder_path == 'full_refinement' and not args.h1_structure_checkpoint:
-        parser.error("Full-refinement H1 training requires --h1_structure_checkpoint.")
-    if args.h1_structure_checkpoint:
-        from models.event_structure_guidance import GuidanceConfig
-        GuidanceConfig(steps=args.h1_guidance_steps, learning_rate=args.h1_guidance_lr,
-                       trust_radius=args.h1_guidance_trust_radius, min_confidence=args.h1_min_confidence)
-        if args.h1_guidance_steps < 1 or args.image_size != 256:
-            parser.error("H1 Stage4 requires positive guidance and image_size=256.")
     args.decoder_refinement_enabled = False
     args.event_ablation_mode = "correct"
     args.return_raw_event_voxel = args.lambda_edge > 0
@@ -228,8 +197,6 @@ def validate_paths(args):
         "stage1_checkpoint": args.stage1_checkpoint,
         "event_lora_checkpoint": args.event_lora_checkpoint,
     }
-    if args.h1_structure_checkpoint:
-        required_files["h1_structure_checkpoint"] = args.h1_structure_checkpoint
     if args.decoder_refinement_init_checkpoint:
         required_files["decoder_refinement_init_checkpoint"] = args.decoder_refinement_init_checkpoint
     required_dirs = {
@@ -310,9 +277,10 @@ def save_checkpoint(
         timestep_config={"generator_timestep": args.generator_timestep},
         additional_info={
             "step_in_epoch": step_in_epoch,
+            "fusion_layers": list(args.fusion_layers),
             "decoder_refinement_initialization": getattr(args, "decoder_refinement_init_record", None),
             "frozen_backbone_fp32": args.frozen_backbone_fp32,
-            "global_step_lr_schedule": bool(args.h1_structure_checkpoint or args.global_step_lr_schedule),
+            "global_step_lr_schedule": bool(args.global_step_lr_schedule),
             "event_normalization": "dual_view_clora_plus_nonzero_global_mean_std_v1",
             "event_active_bins": {
                 "clora": args.clora_event_active_bins,
@@ -334,7 +302,7 @@ def main(args):
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_dir=os.path.join(args.output_dir, "logs"),
-        # CGDRS 默认屏蔽 level 0 event 分支；DDP 需允许该分支参数本轮无梯度。
+        # 仅选中融合层参与训练，兼容不同输入的条件分支。
         kwargs_handlers=[
             DistributedDataParallelKwargs(find_unused_parameters=True)
         ],
@@ -353,12 +321,15 @@ def main(args):
         if resume_path is None:
             raise FileNotFoundError("No numeric checkpoint found for --resume_from_checkpoint latest.")
     resume_checkpoint = load_checkpoint_file(resume_path) if resume_path else None
+    # 恢复时继承训练层；显式更换层必须新训练，不能复用原优化器。
+    saved_layers = tuple((resume_checkpoint or {}).get("additional_info", {}).get("fusion_layers", (0,1,2,3)))
+    if args.fusion_layers is None:
+        args.fusion_layers = saved_layers if resume_checkpoint else (0,1,2,3)
+    if resume_checkpoint and args.fusion_layers != saved_layers:
+        raise ValueError("Resume fusion layers differ from checkpoint.")
 
     # 初始化顺序：base -> Stage1 -> cLoRA checkpoint -> RGB-event -> feature decoder -> resume。
-    if args.h1_structure_checkpoint:
-        from models.h1_decoder_refinement import H1DecoderRefinementGen
-        model = H1DecoderRefinementGen(args)
-    elif args.frozen_backbone_fp32:
+    if args.frozen_backbone_fp32:
         from models.decoder_refinement_control import NoH1DecoderRefinementGen
         model = NoH1DecoderRefinementGen(args)
     else:
@@ -403,17 +374,12 @@ def main(args):
         logging.info("Dry run complete; no training step was executed.")
         return
 
-    if args.h1_structure_checkpoint:
-        from dataloaders.sde_event_structure_dataset import SDEEventStructureDataset, StructureEventConfig
-        dataset = SDEEventStructureDataset("train", args,
-            StructureEventConfig.from_dict(model.h1_metadata["event_config"]), args.train_data_root)
-    else:
-        dataset = SDEEventFilmDataset(split="train", args=args, root_dir=args.train_data_root)
+    dataset = SDEEventFilmDataset(split="train", args=args, root_dir=args.train_data_root)
     if accelerator.is_main_process:
         config = dict(vars(args), world_size=accelerator.num_processes,
             global_batch_size=args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps,
             training_samples=len(dataset), trainable_parameters=trainable_count,
-            scheduler_ticks_per_global_update=accelerator.num_processes if (args.h1_structure_checkpoint or args.global_step_lr_schedule) else 1,
+            scheduler_ticks_per_global_update=accelerator.num_processes if (args.global_step_lr_schedule) else 1,
             trainable_names=trainable_names, h1_pipeline=getattr(model, "h1_pipeline", None))
         with open(os.path.join(args.output_dir, "run_config.json"), "w", encoding="utf-8") as handle:
             json.dump(config, handle, ensure_ascii=False, indent=2)
@@ -425,7 +391,7 @@ def main(args):
         pin_memory=True,
         drop_last=True,
         # 两个逐样本骨干路径都保留 prompt 的样本轴；默认 collate 会转置样本内列表。
-        collate_fn=collate_h1_refinement if (args.h1_structure_checkpoint or args.frozen_backbone_fp32) else None,
+        collate_fn=collate_h1_refinement if (args.frozen_backbone_fp32) else None,
         **({"multiprocessing_context": "spawn"}
            if args.dataloader_num_workers > 0 and accelerator.num_processes > 1 else {}),
     )
@@ -438,7 +404,7 @@ def main(args):
     )
     # Accelerate 在非 split_batches 的多卡模式每次更新推进 world_size 个刻度。
     # H1及显式global调度的对照组同比扩展刻度，覆盖max_train_steps次全局更新。
-    schedule_factor = accelerator.num_processes if (args.h1_structure_checkpoint or args.global_step_lr_schedule) else 1
+    schedule_factor = accelerator.num_processes if (args.global_step_lr_schedule) else 1
     lr_scheduler = build_scheduler(
         optimizer, args.lr_warmup_steps * schedule_factor, args.max_train_steps * schedule_factor
     )

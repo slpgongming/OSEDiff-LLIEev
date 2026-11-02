@@ -2,8 +2,8 @@
 import torch
 from models.event_structure_guidance import GuidanceConfig, StructureObservation, freeze_observation_masks, optimize_features
 from models.image_structure import StructureOperatorConfig,image_structure
-from models.joint_h1_refinement import differentiable_guidance
-from models.joint_h1_refinement import joint_observation
+from models.esfr import differentiable_guidance
+from models.esfr import joint_observation
 from models.event_structure_head import EventStructurePredictor,StructureHeadConfig
 import copy
 

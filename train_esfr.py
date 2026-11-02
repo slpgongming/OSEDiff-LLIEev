@@ -1,4 +1,4 @@
-"""冻结 Stage3，联合微调 H1 结构目标和 d123；一步可微引导，独立固定置信度。
+"""E-SFR：冻结 Stage3，联合微调事件结构目标和所选 decoder 融合层；一步可微引导，独立固定置信度。
 
 torchrun 一卡一进程，外层梯度完成后手动平均，避免 DDP reducer 与 autograd.grad 冲突。
 训练/验证按原场景划分；固定验证帧仅用于本次微调选模，不读取正式 test 图像。
@@ -18,17 +18,20 @@ from models.event_structure_guidance import GuidanceConfig
 from models.event_lora_utils import iter_event_lora_modules,clear_event_feats_for_all_event_lora
 from models.image_structure import image_structure
 from models.structure_supervision import StructureSupervisionConfig,structure_supervision_loss
-from models.joint_h1_refinement import guided_forward
-from test_idea8_structure_dps import configure_inference_numerics
+from models.esfr import guided_forward
+from my_utils.evaluation import configure_inference_numerics
 from train_event_structure_head import read_scene_split
 from train_idea3_decoder_refinement import event_edge_loss
-from test_idea8_stage4_sweep import atomic_json,file_hash
+from my_utils.evaluation import atomic_json,file_hash
+from models.fusion_selection import parse_fusion_layers, select_fusion_layers
 
 
 def parse_args():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--stage4_run',required=True)
-    p.add_argument('--h1_checkpoint',required=True)
+    p.add_argument('--structure_checkpoint', '--h1_checkpoint', dest='h1_checkpoint', required=True)
+    p.add_argument('--fusion_layers', type=parse_fusion_layers, default=(1,2,3), help='Active and trainable decoder layers; default d1,d2,d3.')
+    p.add_argument('--stage4_checkpoint', default='checkpoints/model_final.pkl')
     p.add_argument('--scene_split',required=True)
     p.add_argument('--output_dir',required=True)
     p.add_argument('--max_steps',type=int,default=1000)
@@ -41,6 +44,9 @@ def parse_args():
     p.add_argument('--resume_from_checkpoint')
     p.add_argument('--smoke',action='store_true')
     a=p.parse_args()
+    if not a.fusion_layers:p.error('Joint training requires at least one fusion layer.')
+    for path in [Path(a.stage4_run)/'run_config.json', Path(a.stage4_run)/a.stage4_checkpoint, Path(a.h1_checkpoint), Path(a.scene_split)]:
+        if not path.is_file():p.error(f'Missing input: {path}')
     if min(a.max_steps,a.validation_every,a.validation_per_scene,a.refinement_lr,a.head_lr,a.lambda_structure)<=0:p.error('Positive parameters required')
     return a
 
@@ -61,29 +67,28 @@ def clear(gen):
         layer.last_aux={};layer.last_visuals={};layer.last_z_delta=None
 
 
-def build(a,rank):
+def build(a,rank,load_data=True):
     run=Path(a.stage4_run);train=json.loads((run/'run_config.json').read_text())
-    final=run/'checkpoints/model_final.pkl'
-    assert file_hash(final)=='003aba4ece3c62f25033fb06d9d405a6552b72be7997c4bf7f840fcc7a0df5d7'
-    assert file_hash(train['event_lora_checkpoint'])=='5496c3bfe39d59c73d9a211ce1d1c1d16dd2725475b61ebaf8fd0636932f5b31'
-    assert file_hash(a.h1_checkpoint)=='7401ca39363f52a4a0d440cf410593967f07f57218e5417b9bfd97cc94d0459d'
+    final=run/getattr(a,'stage4_checkpoint','checkpoints/model_final.pkl')
     cfg=argparse.Namespace(**train);cfg.decoder_refinement_enabled=False
     gen=NoH1DecoderRefinementGen(cfg)
     gen.load_stage1_full(cfg.stage1_checkpoint)
-    gen.load_event_checkpoint(torch.load(cfg.event_lora_checkpoint,map_location='cpu'))
+    gen.load_event_checkpoint(torch.load(cfg.event_lora_checkpoint,map_location='cpu',weights_only=False))
     cfg.decoder_refinement_enabled=True;gen.decoder_refinement_enabled=True
     gen.install_decoder_refinement()
-    checkpoint=torch.load(final,map_location='cpu');assert checkpoint['global_step']==20000
+    checkpoint=torch.load(final,map_location='cpu',weights_only=False)
     gen.load_event_checkpoint(checkpoint);del checkpoint
     gen.activate_lora_adapters(cfg.unet_lora_active_parts)
     gen.eval().requires_grad_(False).cuda()
-    gen.vae.decoder.set_inference_fusion_levels((1,2,3));gen.decoder_fusion_weight=1.
-    for i in (1,2,3):gen.vae.decoder.feature_fusion_blocks[i].requires_grad_(True)
+    # 旧 run_config 无层配置时继承原联合训练 d123；新配置显式保存。
+    select_fusion_layers(gen.vae.decoder, getattr(a,'fusion_layers',(1,2,3)), trainable=True)
+    gen.decoder_fusion_weight=1.
     for m in gen.modules():
         if hasattr(m,'gradient_checkpointing'):m.gradient_checkpointing=False
     head,meta,operator=load_structure_checkpoint(a.h1_checkpoint,require_calibrated=True)
     teacher=copy.deepcopy(head).eval().requires_grad_(False).cuda()
     head.cuda().eval();head.set_training_phase('structure')
+    if not load_data:return gen,head,teacher,meta,operator,None,None,None,train
     split=read_scene_split(a.scene_split)
     evcfg=StructureEventConfig.from_dict(meta['event_config'])
     trainset=SDEEventStructureDataset('train',cfg,evcfg,cfg.train_data_root,scenes=split['train'])
@@ -116,13 +121,13 @@ def main():
     initial_hash=frozen_hash(gen,teacher,head)
     initial_ref={n:p.detach().cpu().clone() for n,p in gen.named_parameters() if p.requires_grad} if a.smoke else None
     initial_head={n:p.detach().cpu().clone() for n,p in head.named_parameters() if p.requires_grad} if a.smoke else None
-    signature=dict(format='joint-h1-refinement-v1',stage4_sha256=file_hash(Path(a.stage4_run)/'checkpoints/model_final.pkl'),stage3_sha256=file_hash(base_config['event_lora_checkpoint']),h1_sha256=file_hash(a.h1_checkpoint),levels=[1,2,3],weight=1.,confidence='frozen_initial_full_head',guidance=asdict(guidance),structure_supervision=asdict(supervision),world_size=world,global_batch_size=world,seed=a.seed,split=read_scene_split(a.scene_split),validation_indices=validation,refinement_lr=a.refinement_lr,head_lr=a.head_lr,lambda_structure=a.lambda_structure,max_steps=a.max_steps)
-    if rank==0:atomic_json(out/'run_config.json',dict(**vars(a),signature=signature,base_train_config=base_config,train_count=len(trainset),validation_count=len(validation),frozen_initial_sha256=initial_hash,gradient_mode='exact_one_step_unroll_piecewise_acceptance',refinement_precision='fp16',backbone_precision='fp32',trainable_refinement=sum(p.numel() for p in rp),trainable_head=sum(p.numel() for p in hp)))
+    signature=dict(format='joint-h1-refinement-v1',stage4_sha256=file_hash(Path(a.stage4_run)/a.stage4_checkpoint),stage3_sha256=file_hash(base_config['event_lora_checkpoint']),h1_sha256=file_hash(a.h1_checkpoint),levels=list(a.fusion_layers),weight=1.,confidence='frozen_initial_full_head',guidance=asdict(guidance),structure_supervision=asdict(supervision),world_size=world,global_batch_size=world,seed=a.seed,split=read_scene_split(a.scene_split),validation_indices=validation,refinement_lr=a.refinement_lr,head_lr=a.head_lr,lambda_structure=a.lambda_structure,max_steps=a.max_steps)
     step0=0;best=float('-inf')
     if a.resume_from_checkpoint:
-        c=torch.load(a.resume_from_checkpoint,map_location='cpu');assert c['signature']==signature and c['frozen_sha256']==initial_hash
+        c=torch.load(a.resume_from_checkpoint,map_location='cpu',weights_only=False);assert c['signature']==signature and c['frozen_sha256']==initial_hash
         gen.vae.decoder.feature_fusion_blocks.load_state_dict(c['fusion']);head.load_state_dict(c['head']);teacher.load_state_dict(c['teacher'])
         optimizer.load_state_dict(c['optimizer']);scaler.load_state_dict(c['scaler']);step0=c['step'];best=c['best_psnr'];del c
+    if rank==0:atomic_json(out/'run_config.json',dict(**vars(a),signature=signature,base_train_config=base_config,train_count=len(trainset),validation_count=len(validation),frozen_initial_sha256=initial_hash,gradient_mode='exact_one_step_unroll_piecewise_acceptance',refinement_precision='fp16',backbone_precision='fp32',trainable_refinement=sum(p.numel() for p in rp),trainable_head=sum(p.numel() for p in hp)))
     def save(step,label):
         if rank==0:
             path=out/(label+'.pt');temp=path.with_suffix('.tmp')

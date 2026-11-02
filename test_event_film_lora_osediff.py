@@ -368,30 +368,13 @@ def parse_args():
         help="为统一数据集接口保留；该 Stage2/3 推理入口不使用 decoder refinement。",
     )
     parser.add_argument("--event_base_channels", type=int, default=32)
-    parser.add_argument("--mod_channels", type=int, default=32)
+    parser.add_argument("--mod_channels", type=int, default=64)
     parser.add_argument("--modulation_scale", type=float, default=0.1)
     parser.add_argument(
         "--event_lora_variant",
         type=str,
-        default="film_affine",
-        choices=[
-            "film_affine",
-            "film",
-            "cbam_lowrank_residual",
-            "cbam_output_gate",
-            "residual_cross_attn",
-            "residual_cross_attn_bax",
-        ],
-    )
-    parser.add_argument("--event_lora_cbam_reduction", type=int, default=8)
-    parser.add_argument(
-        "--event_lora_cbam_spatial_kernel", type=int, default=7, choices=[3, 7]
-    )
-    parser.add_argument(
-        "--event_lora_output_gate_channels",
-        type=str,
-        default="spatial",
-        choices=["spatial", "channel_spatial"],
+        default="residual_cross_attn",
+        choices=["residual_cross_attn"],
     )
     parser.add_argument("--mod_num_heads", type=int, default=4)
     parser.add_argument("--mod_window_size", type=int, default=8)

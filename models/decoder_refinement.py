@@ -11,13 +11,15 @@ import torch.utils.checkpoint
 from diffusers.models.autoencoders.vae import Decoder
 
 
-REFINEMENT_VARIANTS = ("legacy_fused", "cgdrs")
-CGDRS_ACTIVITY_MODES = ("abs_mean", "abs_sum")
+REFINEMENT_VARIANTS = ("rgb_event_decoder_fusion",)
+# 仅在输入边界兼容旧 checkpoint/run_config；新保存配置统一使用 REDF 名称。
+REFINEMENT_VARIANT_ALIASES = {"legacy_fused": "rgb_event_decoder_fusion"}
 
 
 def normalize_refinement_variant(value, allow_auto=False):
     """统一 decoder refinement variant 名称，避免 checkpoint/CLI 使用不同拼写。"""
     value = str(value or "").strip().lower()
+    value = REFINEMENT_VARIANT_ALIASES.get(value, value)
     allowed = set(REFINEMENT_VARIANTS)
     if allow_auto:
         allowed.add("auto")
@@ -29,23 +31,8 @@ def normalize_refinement_variant(value, allow_auto=False):
     return value
 
 
-def normalize_refinement_levels(value):
-    """解析 CLI 的逗号列表或 Python 序列，返回去重后的 level tuple。"""
-    if isinstance(value, str):
-        value = [item.strip() for item in value.split(",") if item.strip()]
-    levels = tuple(sorted({int(level) for level in value}))
-    return levels
 
 
-def normalize_activity_mode(value):
-    """统一 CGDRS event activity 聚合方式。"""
-    value = str(value or "abs_mean").strip().lower()
-    if value not in CGDRS_ACTIVITY_MODES:
-        raise ValueError(
-            f"Unsupported CGDRS activity mode={value!r}; "
-            f"expected one of {CGDRS_ACTIVITY_MODES}."
-        )
-    return value
 
 
 @dataclass
@@ -199,211 +186,8 @@ class DecoderFeatureFusionBlock(nn.Module):
         return output
 
 
-class _CGDRSBranch(nn.Module):
-    """CGDRS 的轻量卷积残差分支；仅最后一层零初始化。"""
-
-    def __init__(self, in_channels, hidden_channels, out_channels):
-        super().__init__()
-        self.body = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, 3, padding=1),
-            nn.GroupNorm(
-                num_groups=_largest_divisor_at_most(hidden_channels),
-                num_channels=hidden_channels,
-                eps=1e-6,
-            ),
-            nn.SiLU(),
-            nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1),
-            nn.SiLU(),
-        )
-        self.output = nn.Conv2d(hidden_channels, out_channels, 1)
-        # 只将最终输出置零，保证初始时不改变原 decoder，同时让前级投影有梯度。
-        nn.init.zeros_(self.output.weight)
-        nn.init.zeros_(self.output.bias)
-
-    def forward(self, x):
-        return self.output(self.body(x))
 
 
-class ConfidenceGatedDualResidualSkipBlock(nn.Module):
-    """RGB 主导、event 可信度门控的双残差 decoder skip。
-
-    ``rgb_features`` 负责内容和颜色细化；``event_features`` 只能通过 spatial
-    gate 控制的残差进入 decoder。event activity 为零时，event residual 被严格
-    屏蔽，便于 zero/shuffled event 消融并保护原始 VAE 分布。
-    """
-
-    def __init__(
-        self,
-        condition_channels,
-        decoder_channels,
-        fusion_weight=1.0,
-        gate_bias=-2.0,
-        event_enabled=True,
-        allow_interpolation=True,
-    ):
-        super().__init__()
-        self.condition_channels = int(condition_channels)
-        self.decoder_channels = int(decoder_channels)
-        self.fusion_weight = float(fusion_weight)
-        self.gate_bias = float(gate_bias)
-        self.event_enabled = bool(event_enabled)
-        self.allow_interpolation = bool(allow_interpolation)
-        self.hidden_channels = min(128, max(32, self.decoder_channels))
-
-        hidden = self.hidden_channels
-        self.decoder_projection = nn.Conv2d(self.decoder_channels, hidden, 1)
-        self.rgb_projection = nn.Conv2d(self.condition_channels, hidden, 1)
-        self.event_projection = nn.Conv2d(self.condition_channels, hidden, 1)
-
-        self.rgb_branch = _CGDRSBranch(hidden * 2, hidden, self.decoder_channels)
-        self.event_branch = _CGDRSBranch(hidden * 3, hidden, self.decoder_channels)
-        self.gate_body = nn.Sequential(
-            nn.Conv2d(hidden * 3 + 1, hidden, 3, padding=1),
-            nn.GroupNorm(
-                num_groups=_largest_divisor_at_most(hidden),
-                num_channels=hidden,
-                eps=1e-6,
-            ),
-            nn.SiLU(),
-        )
-        self.gate_output = nn.Conv2d(hidden, 1, 1)
-        # gate 初始为 sigmoid(gate_bias)，且不被随机纹理驱动。
-        nn.init.zeros_(self.gate_output.weight)
-        nn.init.constant_(self.gate_output.bias, self.gate_bias)
-        self.alpha = nn.Parameter(torch.tensor(1.0))
-        self.last_stats = {}
-        self.forward_count = 0
-
-    @staticmethod
-    def _resize_like(condition, decoder_feature, allow_interpolation):
-        if condition is None:
-            return None
-        if condition.shape[-2:] == decoder_feature.shape[-2:]:
-            return condition
-        if not allow_interpolation:
-            raise ValueError(
-                "CGDRS condition spatial mismatch: "
-                f"condition={condition.shape[-2:]}, decoder={decoder_feature.shape[-2:]}"
-            )
-        return F.interpolate(
-            condition,
-            size=decoder_feature.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-
-    def forward(
-        self,
-        rgb_condition,
-        event_condition,
-        decoder_feature,
-        event_activity=None,
-        fusion_weight=None,
-        fusion_mode="both",
-    ):
-        if decoder_feature.ndim != 4:
-            raise ValueError(
-                f"CGDRS decoder feature must be BCHW, got {decoder_feature.shape}."
-            )
-        if fusion_mode not in {"both", "rgb", "event"}:
-            raise ValueError(f"Unsupported CGDRS fusion_mode={fusion_mode}.")
-        if rgb_condition is None or event_condition is None:
-            raise ValueError("CGDRS requires separate RGB and event conditions.")
-        for name, condition in (("rgb", rgb_condition), ("event", event_condition)):
-            if condition.ndim != 4 or condition.shape[1] != self.condition_channels:
-                raise ValueError(
-                    f"CGDRS {name} condition channel mismatch: "
-                    f"expected BCHW with C={self.condition_channels}, got {condition.shape}."
-                )
-            if condition.shape[0] != decoder_feature.shape[0]:
-                raise ValueError(
-                    f"CGDRS {name} condition batch mismatch: "
-                    f"{condition.shape[0]} vs {decoder_feature.shape[0]}."
-                )
-        rgb_condition = self._resize_like(
-            rgb_condition, decoder_feature, self.allow_interpolation
-        )
-        event_condition = self._resize_like(
-            event_condition, decoder_feature, self.allow_interpolation
-        )
-        if event_activity is None:
-            event_activity = torch.ones(
-                decoder_feature.shape[0],
-                1,
-                *decoder_feature.shape[-2:],
-                device=decoder_feature.device,
-                dtype=decoder_feature.dtype,
-            )
-        else:
-            event_activity = self._resize_like(
-                event_activity, decoder_feature, self.allow_interpolation
-            )
-            if event_activity.shape[1] != 1:
-                raise ValueError(
-                    f"CGDRS activity must have one channel, got {event_activity.shape}."
-                )
-            if event_activity.shape[0] != decoder_feature.shape[0]:
-                raise ValueError(
-                    "CGDRS activity batch mismatch: "
-                    f"{event_activity.shape[0]} vs {decoder_feature.shape[0]}."
-                )
-            event_activity = event_activity.to(
-                device=decoder_feature.device, dtype=decoder_feature.dtype
-            )
-
-        decoder_feature = decoder_feature
-        rgb_projected = self.rgb_projection(
-            rgb_condition.to(device=decoder_feature.device, dtype=decoder_feature.dtype)
-        )
-        event_projected = self.event_projection(
-            event_condition.to(device=decoder_feature.device, dtype=decoder_feature.dtype)
-        )
-        decoder_projected = self.decoder_projection(decoder_feature)
-        if fusion_mode == "rgb":
-            event_projected = torch.zeros_like(event_projected)
-            event_activity = torch.zeros_like(event_activity)
-        elif fusion_mode == "event":
-            rgb_projected = torch.zeros_like(rgb_projected)
-
-        rgb_delta = self.rgb_branch(torch.cat((decoder_projected, rgb_projected), dim=1))
-        event_delta = self.event_branch(
-            torch.cat((decoder_projected, rgb_projected, event_projected), dim=1)
-        )
-        gate_input = torch.cat(
-            (decoder_projected, rgb_projected, event_projected, event_activity), dim=1
-        )
-        gate = torch.sigmoid(self.gate_output(self.gate_body(gate_input)))
-        gate = gate * event_activity.clamp(0.0, 1.0)
-        if fusion_mode == "rgb" or not self.event_enabled:
-            event_delta = torch.zeros_like(event_delta)
-            gate = torch.zeros_like(gate)
-        if fusion_mode == "event":
-            rgb_delta = torch.zeros_like(rgb_delta)
-
-        weight = self.fusion_weight if fusion_weight is None else float(fusion_weight)
-        delta = self.alpha.to(dtype=decoder_feature.dtype) * (
-            rgb_delta + gate * event_delta
-        )
-        output = decoder_feature + weight * delta
-        self.forward_count += 1
-        with torch.no_grad():
-            decoder_norm = decoder_feature.detach().float().norm().clamp_min(1e-12)
-            self.last_stats = {
-                "decoder_before_mean": decoder_feature.detach().float().mean().item(),
-                "decoder_before_std": decoder_feature.detach().float().std(unbiased=False).item(),
-                "decoder_after_mean": output.detach().float().mean().item(),
-                "decoder_after_std": output.detach().float().std(unbiased=False).item(),
-                "gate_mean": gate.detach().float().mean().item(),
-                "gate_std": gate.detach().float().std(unbiased=False).item(),
-                "activity_mean": event_activity.detach().float().mean().item(),
-                "rgb_residual_ratio": (rgb_delta.detach().float().norm() / decoder_norm).item(),
-                "event_residual_ratio": (
-                    (gate * event_delta).detach().float().norm() / decoder_norm
-                ).item(),
-                "output_delta_ratio": (delta.detach().float().norm() / decoder_norm).item(),
-                "alpha": self.alpha.detach().float().item(),
-            }
-        return output
 
 
 def decoder_input_channels(block_out_channels):
@@ -427,10 +211,7 @@ class FeatureAwareDecoder(Decoder):
         condition_channels=(64, 128, 256, 512),
         fusion_weight=1.0,
         fusion_init="near_zero",
-        refinement_variant="legacy_fused",
-        cgdrs_event_levels=(1, 2, 3),
-        cgdrs_gate_bias=-2.0,
-        cgdrs_activity_mode="abs_mean",
+        refinement_variant="rgb_event_decoder_fusion",
         allow_condition_interpolation=True,
         **kwargs,
     ):
@@ -447,43 +228,18 @@ class FeatureAwareDecoder(Decoder):
         self.decoder_channels = decoder_channels
         self.fusion_weight = float(fusion_weight)
         self.refinement_variant = normalize_refinement_variant(refinement_variant)
-        self.cgdrs_event_levels = normalize_refinement_levels(cgdrs_event_levels)
-        if any(level < 0 or level >= len(condition_channels) for level in self.cgdrs_event_levels):
-            raise ValueError(
-                f"Invalid CGDRS event levels={self.cgdrs_event_levels}; "
-                f"expected [0, {len(condition_channels) - 1}]."
+        self.feature_fusion_blocks = nn.ModuleList(
+            DecoderFeatureFusionBlock(
+                condition_channels=cond_channels,
+                decoder_channels=dec_channels,
+                fusion_weight=fusion_weight,
+                init=fusion_init,
+                allow_interpolation=allow_condition_interpolation,
             )
-        self.cgdrs_gate_bias = float(cgdrs_gate_bias)
-        self.cgdrs_activity_mode = normalize_activity_mode(cgdrs_activity_mode)
-        if self.refinement_variant == "legacy_fused":
-            self.feature_fusion_blocks = nn.ModuleList(
-                DecoderFeatureFusionBlock(
-                    condition_channels=cond_channels,
-                    decoder_channels=dec_channels,
-                    fusion_weight=fusion_weight,
-                    init=fusion_init,
-                    allow_interpolation=allow_condition_interpolation,
-                )
-                for cond_channels, dec_channels in zip(
-                    reversed(condition_channels), decoder_channels
-                )
+            for cond_channels, dec_channels in zip(
+                reversed(condition_channels), decoder_channels
             )
-        else:
-            # decoder 从 deepest level 开始，condition 也需按同样顺序反转。
-            self.feature_fusion_blocks = nn.ModuleList(
-                ConfidenceGatedDualResidualSkipBlock(
-                    condition_channels=cond_channels,
-                    decoder_channels=dec_channels,
-                    fusion_weight=fusion_weight,
-                    gate_bias=cgdrs_gate_bias,
-                    event_enabled=level in self.cgdrs_event_levels,
-                    allow_interpolation=allow_condition_interpolation,
-                )
-                for level, (cond_channels, dec_channels) in zip(
-                    reversed(range(len(condition_channels))),
-                    zip(reversed(condition_channels), decoder_channels),
-                )
-            )
+        )
 
     @staticmethod
     def _checkpoint(module, *inputs):
@@ -498,7 +254,7 @@ class FeatureAwareDecoder(Decoder):
             return torch.utils.checkpoint.checkpoint(custom_forward, *inputs)
 
     def set_inference_fusion_levels(self, levels=None):
-        """测试时按 decoder 执行顺序选择 d0..d3；None 保留原始全层行为。
+        """训练/测试按 decoder 执行顺序选择 d0..d3；None 保留原始全层行为。
 
         禁用层直接旁路整个融合残差，不把条件置零；不改变模型参数或 checkpoint 结构。
         """
@@ -514,31 +270,14 @@ class FeatureAwareDecoder(Decoder):
     def _validate_conditions(self, fused_features, rgb_features, event_features, event_activity, fusion_enabled):
         if not fusion_enabled:
             return None
-        if self.refinement_variant == "legacy_fused":
-            if fused_features is None:
-                raise ValueError("legacy_fused requires fused_features.")
-            if len(fused_features) != len(self.feature_fusion_blocks):
-                raise ValueError(
-                    f"Expected {len(self.feature_fusion_blocks)} fused feature levels, "
-                    f"got {len(fused_features)}."
-                )
-            return {"fused": list(reversed(fused_features))}
-        for name, features in (("rgb", rgb_features), ("event", event_features)):
-            if features is None or len(features) != len(self.feature_fusion_blocks):
-                raise ValueError(
-                    f"cgdrs requires {len(self.feature_fusion_blocks)} {name} feature levels, "
-                    f"got {None if features is None else len(features)}."
-                )
-        if event_activity is None or len(event_activity) != len(self.feature_fusion_blocks):
+        if fused_features is None:
+            raise ValueError("rgb_event_decoder_fusion requires fused_features.")
+        if len(fused_features) != len(self.feature_fusion_blocks):
             raise ValueError(
-                f"cgdrs requires {len(self.feature_fusion_blocks)} activity levels, "
-                f"got {None if event_activity is None else len(event_activity)}."
+                f"Expected {len(self.feature_fusion_blocks)} fused feature levels, "
+                f"got {len(fused_features)}."
             )
-        return {
-            "rgb": list(reversed(rgb_features)),
-            "event": list(reversed(event_features)),
-            "activity": list(reversed(event_activity)),
-        }
+        return {"fused": list(reversed(fused_features))}
 
     def forward(
         self,
@@ -568,19 +307,9 @@ class FeatureAwareDecoder(Decoder):
             for index, up_block in enumerate(self.up_blocks):
                 if conditions is not None and (getattr(self, "inference_fusion_levels", None) is None
                                                or index in self.inference_fusion_levels):
-                    if self.refinement_variant == "legacy_fused":
-                        sample = self.feature_fusion_blocks[index](
-                            conditions["fused"][index], sample, fusion_weight=fusion_weight
-                        )
-                    else:
-                        sample = self.feature_fusion_blocks[index](
-                            conditions["rgb"][index],
-                            conditions["event"][index],
-                            sample,
-                            event_activity=conditions["activity"][index],
-                            fusion_weight=fusion_weight,
-                            fusion_mode=fusion_mode,
-                        )
+                    sample = self.feature_fusion_blocks[index](
+                        conditions["fused"][index], sample, fusion_weight=fusion_weight
+                    )
                 sample = self._checkpoint(up_block, sample, latent_embeds)
         else:
             sample = self.mid_block(sample, latent_embeds)
@@ -588,19 +317,9 @@ class FeatureAwareDecoder(Decoder):
             for index, up_block in enumerate(self.up_blocks):
                 if conditions is not None and (getattr(self, "inference_fusion_levels", None) is None
                                                or index in self.inference_fusion_levels):
-                    if self.refinement_variant == "legacy_fused":
-                        sample = self.feature_fusion_blocks[index](
-                            conditions["fused"][index], sample, fusion_weight=fusion_weight
-                        )
-                    else:
-                        sample = self.feature_fusion_blocks[index](
-                            conditions["rgb"][index],
-                            conditions["event"][index],
-                            sample,
-                            event_activity=conditions["activity"][index],
-                            fusion_weight=fusion_weight,
-                            fusion_mode=fusion_mode,
-                        )
+                    sample = self.feature_fusion_blocks[index](
+                        conditions["fused"][index], sample, fusion_weight=fusion_weight
+                    )
                 sample = up_block(sample, latent_embeds)
 
         if latent_embeds is None:
@@ -619,10 +338,6 @@ class FeatureAwareDecoder(Decoder):
             "fusion_init": "near_zero",
             "variant": self.refinement_variant,
             "config_version": 2,
-            "cgdrs_event_levels": list(self.cgdrs_event_levels),
-            "cgdrs_gate_bias": self.cgdrs_gate_bias,
-            "cgdrs_activity_mode": self.cgdrs_activity_mode,
-            "cgdrs_activity_clip": 4.0,
         }
 
     def debug_stats(self):

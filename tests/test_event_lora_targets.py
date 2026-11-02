@@ -86,7 +86,7 @@ class EventLoRATargetTests(unittest.TestCase):
                 with self.subTest(targets=targets):
                     unet = FakeUNet()
                     dropout = unet.down_blocks[0].attn1.to_out[1]
-                    config = EventLoRAConfig(targets=targets, variant="film_affine", rank=2, alpha=4)
+                    config = EventLoRAConfig(targets=targets, variant="residual_cross_attn", rank=2, alpha=4)
                     count, names = replace_self_attn_projections_with_event_lora(unet, config, {"2": 3})
                     self.assertEqual(count, 3 * len(targets))
                     self.assertEqual(len(names), count)
@@ -125,10 +125,9 @@ class EventLoRATargetTests(unittest.TestCase):
             clear_event_feats_for_all_event_lora(unet)
         self.assertIsNone(q.event_feats)
 
-    def test_five_variants_keep_zero_initialized_forward_and_backward(self):
+    def test_final_variant_keep_zero_initialized_forward_and_backward(self):
         for variant in (
-            "film_affine", "cbam_lowrank_residual", "cbam_output_gate",
-            "residual_cross_attn", "residual_cross_attn_bax",
+            "residual_cross_attn",
         ):
             for targets in (("q", "v"), ("q", "k", "v", "out")):
                 with self.subTest(variant=variant, targets=targets):
@@ -152,14 +151,14 @@ class EventLoRATargetTests(unittest.TestCase):
 
     def test_event_ab_freeze_is_independent_of_ordinary_adapter(self):
         unet = FakeUNet()
-        config = EventLoRAConfig(targets=("q", "v"), variant="film_affine", rank=2)
+        config = EventLoRAConfig(targets=("q", "v"), variant="residual_cross_attn", rank=2)
         replace_self_attn_projections_with_event_lora(unet, config, {"2": 3})
         ordinary = unet.down_blocks[0].attn1.to_k
         ordinary.lora_A[ordinary.adapter].requires_grad_(False)
         set_event_lora_trainable(unet, train_lora=False, train_modulation=True)
         for _, module in iter_event_lora_modules(unet):
             self.assertFalse(module.lora_down.weight.requires_grad)
-            self.assertTrue(any(param.requires_grad for param in module.modulator.parameters()))
+            self.assertTrue(any(param.requires_grad for param in module.shared_residual_heads.parameters()))
         self.assertFalse(ordinary.lora_A[ordinary.adapter].weight.requires_grad)
         set_event_lora_trainable(unet, train_lora=True, train_modulation=True)
         self.assertTrue(all(module.lora_down.weight.requires_grad

@@ -66,22 +66,6 @@ def _extract_peft_linear(module, adapter):
     raise TypeError(f"Unsupported self-attention projection type: {type(module)}")
 
 
-def _infer_bax_query_channels_by_size(unet, event_channels_by_size):
-    """按 UNet 从高到低的 block channels 推导各事件尺度 BAx 通道。"""
-    unet_config = getattr(unet, "config", None)
-    block_channels = getattr(unet_config, "block_out_channels", None)
-    if block_channels is None and isinstance(unet_config, dict):
-        block_channels = unet_config.get("block_out_channels")
-    if block_channels is None:
-        raise ValueError("residual_cross_attn_bax requires unet.config.block_out_channels.")
-    sizes = sorted((int(size) for size in event_channels_by_size), reverse=True)
-    block_channels = [int(channels) for channels in block_channels]
-    if len(sizes) != len(block_channels):
-        raise ValueError(
-            "Cannot map event sizes to UNet channels: "
-            f"sizes={sizes}, block_channels={block_channels}."
-        )
-    return {str(size): channels for size, channels in zip(sizes, block_channels)}
 
 
 def replace_self_attn_projections_with_event_lora(unet, config, event_channels_by_size):
@@ -111,27 +95,22 @@ def replace_self_attn_projections_with_event_lora(unet, config, event_channels_b
 
     shared = {}
     pending_heads = {}
-    if config.variant in {"residual_cross_attn", "residual_cross_attn_bax"}:
-        for target in targets:
-            rows = [item for item in candidates if item[2] == target]
-            ranks = {item[4].shape[0] if item[4] is not None else config.rank for item in rows}
-            out_channels = {item[3].out_features for item in rows}
-            if len(ranks) != 1:
-                raise ValueError(f"Shared head dimensions differ for {target}: ranks={ranks}, outputs={out_channels}.")
-            if target == "v":
-                attr = f"_event_lora_shared_heads_{config.variant}"
-            else:
-                attr = f"_event_lora_shared_heads_{config.variant}_{target}"
-            head_config = EventLoRAConfig(**{**config.to_dict(), "rank": ranks.pop()})
-            query_channels = None
-            if config.variant == "residual_cross_attn_bax":
-                query_channels = _infer_bax_query_channels_by_size(unet, event_channels_by_size)
-                if not set(out_channels).issubset(set(query_channels.values())):
-                    raise ValueError(f"BAx shared head cannot represent {target} outputs {out_channels}.")
-            head = SharedResidualEventHeads(head_config, event_channels_by_size, query_channels)
-            head.to(device=rows[0][3].weight.device, dtype=rows[0][3].weight.dtype)
-            pending_heads[attr] = head
-            shared[target] = head
+    for target in targets:
+        rows = [item for item in candidates if item[2] == target]
+        ranks = {item[4].shape[0] if item[4] is not None else config.rank for item in rows}
+        out_channels = {item[3].out_features for item in rows}
+        if len(ranks) != 1:
+            raise ValueError(f"Shared head dimensions differ for {target}: ranks={ranks}, outputs={out_channels}.")
+        if target == "v":
+            attr = f"_event_lora_shared_heads_{config.variant}"
+        else:
+            attr = f"_event_lora_shared_heads_{config.variant}_{target}"
+        head_config = EventLoRAConfig(**{**config.to_dict(), "rank": ranks.pop()})
+        query_channels = None
+        head = SharedResidualEventHeads(head_config, event_channels_by_size, query_channels)
+        head.to(device=rows[0][3].weight.device, dtype=rows[0][3].weight.dtype)
+        pending_heads[attr] = head
+        shared[target] = head
 
     prepared = []
     for name, original, target, base, lora_a, lora_b, alpha in candidates:
@@ -168,24 +147,6 @@ def replace_self_attn_to_v_with_event_lora(unet, config, event_channels_by_size)
     return replace_self_attn_projections_with_event_lora(unet, v_config, event_channels_by_size)
 
 
-def replace_self_attn_to_v_with_event_film_lora(
-    unet,
-    rank=4,
-    modulation_scale=0.1,
-    mod_channels=32,
-    event_channels_by_size=None,
-):
-    """旧接口兼容层：等价于 variant=film_affine。"""
-    config = EventLoRAConfig(
-        variant="film_affine",
-        rank=rank,
-        alpha=rank,
-        modulation_scale=modulation_scale,
-        mod_channels=mod_channels,
-    )
-    return replace_self_attn_to_v_with_event_lora(
-        unet, config, event_channels_by_size or {}
-    )
 
 
 def migrate_event_lora_state(unet, source_state, source_targets, destination_targets,

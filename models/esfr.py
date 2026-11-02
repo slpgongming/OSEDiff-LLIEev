@@ -1,4 +1,4 @@
-"""一阶修正的可微展开：外层图像损失可回传到 H1 和 decoder fusion。"""
+"""E-SFR 一步修正的可微展开：外层图像损失回传到结构头和 decoder fusion。"""
 import torch
 from models.event_structure_guidance import (FullFeatureCorrection, StructureObservation,
     freeze_observation_masks, observe_events, _losses)
@@ -18,7 +18,7 @@ def differentiable_guidance(render, observation, config, operator, *, create_gra
     渲染器须固定 RNG 与条件；验证使用同一接受规则但不保留二阶图。
     """
     if config.steps != 1:
-        raise ValueError('Joint pilot supports exactly one guidance step.')
+        raise ValueError('E-SFR supports exactly one guidance step.')
     observation.validate()
     correction = FullFeatureCorrection(observation.feature_mask)
     raw = render(correction)

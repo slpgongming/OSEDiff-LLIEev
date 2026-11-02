@@ -1,0 +1,62 @@
+最终版：final-code（基于 idea8）
+
+方法：residual_cross_attn cLoRA + rgb_event_decoder_fusion decoder refinement + E-SFR 联合微调。
+E-SFR = Event-guided Structure Feature Refinement（原 H1）。
+REDF = RGB-Event Decoder Fusion（RGB–事件解码器融合），配置名 rgb_event_decoder_fusion。
+旧配置名 legacy_fused 仅作为加载/命令行兼容别名，新 checkpoint 统一保存新名称。
+预训练金字塔编码器统一称为 RGBEventEncoder，其输出为 rgb_features/event_features/fused_features。
+保持原一步高阶梯度、无 GT 候选验收、固定教师置信度、外层图像与结构监督。
+
+保留的训练链
+1. train_osediff_lle.py：Stage1 RGB baseline。
+2. train_event_film_lora_osediff.py：Stage2/3 cLoRA，新训练 --mod_channels 默认 64。
+3. train_idea3_decoder_refinement.py：冻结 Stage3，预训练 rgb_event_decoder_fusion decoder。
+   --fusion_layers d0,d1,d2,d3 默认全层；可选任意非空子集。
+   若要沿用原联合实验，cLoRA 使用5bin，RGBEventEncoder仅bin0：--clora_event_active_bins 5 --rgb_event_active_bins 1。
+   可用 --frozen_backbone_fp32 --global_step_lr_schedule 保持原 FP32 骨干训练方式。
+4. train_event_structure_head.py：half 结构头的 structure/confidence 两阶段训练，
+   新训练默认 region_balanced（原 H1）；校准沿用结构阶段元数据和独立 calibration scenes。
+5. train_esfr.py：联合训练学生结构分支及所选 decoder 层；Stage3/RGBEventEncoder/完整教师冻结。
+
+E-SFR 联合训练（在仓库根目录执行；路径替换为当前服务器实际值）
+python train_esfr.py --stage4_run /path/to/stage4_run --structure_checkpoint /path/to/calibrated_H1.pt --scene_split /path/to/split.json --output_dir /path/to/esfr_run --fusion_layers d1,d2,d3
+
+Stage4 run 须含 run_config.json 及 checkpoints/model_final.pkl；可用 --stage4_checkpoint 指定其它文件。
+预训练模型、Stage1、Stage3、RGBEventEncoder 路径从该 run_config 继承；迁移服务器时先核对路径。
+不再限制某几个历史权重哈希或20000步；保存实际输入哈希供续训校验。
+旧 --h1_checkpoint 是 --structure_checkpoint 的兼容别名。
+joint 默认 d1,d2,d3；需要 d0 时显式 --fusion_layers all 或 d0,d2 等。
+默认 refinement_lr=1e-5、head_lr=1e-6、lambda_structure=0.01、max_steps=1000。
+内层恰好一步，骨干 FP32、refinement FP16；需要 CUDA。每进程1个样本，支持 torchrun。
+续训增加 --resume_from_checkpoint /path/to/checkpoint_last.pt，沿用全部训练配置及所选层。
+--smoke 可用于服务器短跑；正式训练前检查图像损失到结构头梯度、冻结权重及多卡同步。
+
+E-SFR 推理
+python test_esfr.py --joint_run /path/to/esfr_run --test_root /path/to/test --output_dir /path/to/results --shards 1
+python test_esfr.py --joint_run /path/to/esfr_run --test_root /path/to/test --output_dir /path/to/results --shards 1 --aggregate
+
+默认 checkpoint_best.pt；--checkpoint 可指定任意保存步，不再写死250步或2741张图。
+默认继承训练层；--fusion_layers d0,d2 或 none 可做推理消融。
+未选层直接旁路，且不改变四层权重 key/shape。训练未更新的层仍保持 Stage4 初始化值。
+每次同时评测 ESFR_on / ESFR_off；逐帧 PSNR(Y)、SSIM(Y)、LPIPS，aggregate 汇总整组 FID。
+多进程分片时各 shard 使用相同参数及输出目录，全部完成后 --aggregate。
+--expected_sha256 可选；始终记录实际哈希。--audit 重放对应步的验证记录，要求使用训练层。
+推理不读取训练集；仅 --audit 需要原验证集。
+
+兼容边界
+保留 residual_cross_attn、rgb_event_decoder_fusion、half H1 及 joint-h1-refinement-v1 权重结构。
+名称更新不改 checkpoint 中的历史 H1 字段；旧联合 run_config 缺层配置时默认 d123。
+Stage4 续训继承保存的 fusion_layers，并拒绝显式更改；旧 Stage4 无配置则默认全层。
+旧 residual 权重的 mod_channels=32 等配置仍有效，不能把旧张量强制改成64。
+普通 Stage2/3/4 入口载入旧32通道权重时显式 --mod_channels 32；联合入口自动沿用 Stage4 配置。
+CGDRS、FiLM/CBAM/BAx、full_detail 权重不属于保留架构，请回到 idea8 使用。
+删除了冻结 H1 的两条接法、Stage5、旧 sweep/oracle 入口和原始 SR/face 训练入口；Stage1 LLE 保留。
+历史本地 train_scripts/test_scripts 未修改，可能引用已删除入口；不要用于最终分支。
+
+验证
+使用本地 osediff 环境运行 CPU 小模型回归：
+python -m unittest discover -s tests -p test_final_configuration.py
+另有 test_decoder_refinement、test_event_lora_targets、test_event_lora_checkpoint、test_idea3_checkpoint 回归。
+本次未启动真实数据训练、完整GPU推理或多卡训练。
+
+编码器集成测试默认查找 checkpoints/rgb_event_encoder；实际权重位于其他目录时通过 RGB_EVENT_PRETRAINED_ROOT 指定。本次只清理代码命名，不移动已有权重目录。

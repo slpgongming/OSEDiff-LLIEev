@@ -17,8 +17,6 @@ from models.event_encoder import EventEncoder
 from models.event_film_lora import EventLoRAConfig, SpatialRGBEventLoRALinear, normalize_event_lora_variant, parse_event_lora_targets
 from models.rgb_event_encoder import RGBEventEncoder
 from models.decoder_refinement import (
-    normalize_activity_mode,
-    normalize_refinement_levels,
     normalize_refinement_variant,
 )
 from models.event_lora_utils import (
@@ -94,11 +92,11 @@ def _event_lora_config_from_args(args):
         else:
             targets = ("v",)
     return EventLoRAConfig(
-        variant=getattr(args, "event_lora_variant", "film_affine"),
+        variant=getattr(args, "event_lora_variant", "residual_cross_attn"),
         targets=targets,
         rank=args.lora_rank,
         alpha=float(args.lora_rank),
-        mod_channels=getattr(args, "mod_channels", 32),
+        mod_channels=getattr(args, "mod_channels", 64),
         modulation_scale=getattr(args, "modulation_scale", 0.1),
         cbam_reduction=getattr(args, "event_lora_cbam_reduction", 8),
         cbam_spatial_kernel=getattr(args, "event_lora_cbam_spatial_kernel", 7),
@@ -124,9 +122,7 @@ def _checkpoint_event_lora_config(checkpoint):
     config.setdefault("rank", rank)
     config.setdefault("alpha", float(rank))
     # idea2-1 的 residual checkpoint 只记录以下三个 cross-attention 字段。
-    config.setdefault("mod_channels", 64 if legacy_variant in {
-        "residual_cross_attn", "residual_cross_attn_bax"
-    } else 32)
+    config.setdefault("mod_channels", 64)
     return EventLoRAConfig(**config)
 
 
@@ -155,7 +151,7 @@ def _validate_checkpoint_target_evidence(checkpoint, config, state):
             raise ValueError(f"Checkpoint replaced_names contradict targets: {path}")
     metadata = checkpoint.get("event_lora_metadata") or {}
     expected_layout = ("per_projection_per_scale" if config.variant in {
-        "residual_cross_attn", "residual_cross_attn_bax"
+        "residual_cross_attn",
     } else "per_module")
     if metadata and metadata.get("shared_heads") != expected_layout:
         raise ValueError(f"Unsupported Event-LoRA shared-head layout: {metadata.get('shared_heads')}")
@@ -184,7 +180,7 @@ def _assert_event_checkpoint_keys(unet, state, replaced_names, new_targets=()):
     critical += [key for key in expected if "_event_lora_shared_heads_" in key and not any(
         key.startswith(f"_event_lora_shared_heads_{variant}_{target}.") or
         (target == "v" and key.startswith(f"_event_lora_shared_heads_{variant}."))
-        for target in new_targets for variant in ("residual_cross_attn", "residual_cross_attn_bax")
+        for target in new_targets for variant in ("residual_cross_attn",)
     )]
     missing = [key for key in critical if key not in state]
     mismatched = [key for key in critical if key in state and expected[key].shape != state[key].shape]
@@ -215,14 +211,14 @@ def resolve_decoder_refinement_variant(value, checkpoint_path=None):
     except TypeError:
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
     config = checkpoint.get("decoder_refinement_config") or {}
-    # 旧 checkpoint 没有 variant 字段时，历史实现就是 legacy_fused。
-    return normalize_refinement_variant(config.get("variant", "legacy_fused"))
+    # 旧 checkpoint 没有 variant 字段时，历史实现就是 rgb_event_decoder_fusion。
+    return normalize_refinement_variant(config.get("variant", "rgb_event_decoder_fusion"))
 
 
 def resolve_decoder_refinement_args(args, checkpoint_path):
     """``auto`` 时把 checkpoint 中的 CGDRS 结构参数一并带入运行参数。"""
     requested = normalize_refinement_variant(
-        getattr(args, "decoder_refinement_variant", "legacy_fused"), allow_auto=True
+        getattr(args, "decoder_refinement_variant", "rgb_event_decoder_fusion"), allow_auto=True
     )
     if requested != "auto":
         args.decoder_refinement_variant = requested
@@ -233,17 +229,8 @@ def resolve_decoder_refinement_args(args, checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
     config = checkpoint.get("decoder_refinement_config") or {}
     args.decoder_refinement_variant = normalize_refinement_variant(
-        config.get("variant", "legacy_fused")
+        config.get("variant", "rgb_event_decoder_fusion")
     )
-    if args.decoder_refinement_variant == "cgdrs":
-        if "cgdrs_event_levels" in config:
-            args.cgdrs_event_levels = ",".join(
-                str(level) for level in config["cgdrs_event_levels"]
-            )
-        if "cgdrs_gate_bias" in config:
-            args.cgdrs_gate_bias = float(config["cgdrs_gate_bias"])
-        if "cgdrs_activity_mode" in config:
-            args.cgdrs_activity_mode = config["cgdrs_activity_mode"]
     return args
 
 
@@ -374,14 +361,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             getattr(args, "decoder_refinement_enabled", False)
         )
         self.decoder_refinement_variant = normalize_refinement_variant(
-            getattr(args, "decoder_refinement_variant", "legacy_fused")
-        )
-        self.cgdrs_event_levels = normalize_refinement_levels(
-            getattr(args, "cgdrs_event_levels", (1, 2, 3))
-        )
-        self.cgdrs_gate_bias = float(getattr(args, "cgdrs_gate_bias", -2.0))
-        self.cgdrs_activity_mode = normalize_activity_mode(
-            getattr(args, "cgdrs_activity_mode", "abs_mean")
+            getattr(args, "decoder_refinement_variant", "rgb_event_decoder_fusion")
         )
         self.decoder_fusion_enabled = bool(
             getattr(args, "decoder_fusion_enabled", self.decoder_refinement_enabled)
@@ -417,9 +397,6 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             fusion_weight=self.decoder_fusion_weight,
             fusion_init=getattr(self.args, "decoder_fusion_init", "near_zero"),
             refinement_variant=self.decoder_refinement_variant,
-            cgdrs_event_levels=self.cgdrs_event_levels,
-            cgdrs_gate_bias=self.cgdrs_gate_bias,
-            cgdrs_activity_mode=self.cgdrs_activity_mode,
         )
         if self.rgb_event_encoder is None:
             self.rgb_event_encoder = RGBEventEncoder(
@@ -436,7 +413,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
                 encoder_e_path=encoder_e_path,
                 fusion_path=fusion_path,
                 strict=bool(getattr(self.args, "rgb_event_strict_load", True)),
-                load_fusion=self.decoder_refinement_variant == "legacy_fused",
+                load_fusion=self.decoder_refinement_variant == "rgb_event_decoder_fusion",
             )
         vae_parameter = next(self.vae.parameters())
         self.rgb_event_encoder.to(
@@ -451,13 +428,14 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         if not self.decoder_refinement_enabled or self.rgb_event_encoder is None:
             raise RuntimeError("Decoder refinement has not been installed.")
         self.requires_grad_(False)
-        self.vae.decoder.feature_fusion_blocks.requires_grad_(True)
+        from models.fusion_selection import select_fusion_layers
+        select_fusion_layers(self.vae.decoder, getattr(self.args, "fusion_layers", (0,1,2,3)), trainable=True)
         self.rgb_event_encoder.eval()
         self.event_encoder.eval()
         self.unet.eval()
         self.text_encoder.eval()
         self.vae.train()
-        trainable = list(self.vae.decoder.feature_fusion_blocks.parameters())
+        trainable = [p for p in self.vae.decoder.feature_fusion_blocks.parameters() if p.requires_grad]
         trainable_ids = {id(param) for param in trainable}
         stray = [
             name for name, param in self.named_parameters()
@@ -479,107 +457,6 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         self.active_unet_lora_parts = parts
         print(f"[UNet ordinary LoRA] active={','.join(parts) or 'none'}")
 
-    def set_train_stage5(self):
-        """Stage5 的联合微调解冻策略。
-
-        保持 Stable Diffusion UNet 主干、原始 VAE decoder 主体、文本编码器和
-        RGB/Event 辅助编码器冻结；只训练已有 LoRA、Event-FiLM 分支、EventEncoder、
-        VAE encoder LoRA，以及 refinement decoder 的 feature-fusion blocks。
-        """
-        if not self.decoder_refinement_enabled or self.rgb_event_encoder is None:
-            raise RuntimeError("Stage5 requires an installed decoder refinement module.")
-
-        # initialize_unet 注册了三组 PEFT adapter，但 add_adapter 不保证它们同时
-        # 处于 active 状态。未激活的 adapter 不会进入 forward，也不会得到梯度。
-        requested_active = getattr(self.args, "unet_lora_active_parts", None)
-        requested_trainable = getattr(self.args, "unet_lora_trainable_parts", None)
-        if requested_active is None and requested_trainable is None:
-            active_parts = trainable_parts = UNET_LORA_PARTS
-        else:
-            active_parts, trainable_parts = validate_unet_lora_training_parts(
-                UNET_LORA_PARTS if requested_active is None else requested_active,
-                () if requested_trainable is None else requested_trainable,
-            )
-        self.activate_lora_adapters(active_parts)
-        self.trainable_unet_lora_parts = trainable_parts
-
-        # 先统一冻结，避免 Stage1/Stage3 的 requires_grad 状态泄漏到 Stage5。
-        self.requires_grad_(False)
-        self.unet.train()
-        self.vae.train()
-        self.event_encoder.train()
-        self.text_encoder.eval()
-        self.rgb_event_encoder.eval()
-
-        # PEFT A/B follow the independent ordinary-LoRA selection.
-        selected_adapters = {_UNET_LORA_ADAPTERS[part] for part in trainable_parts}
-        for name, parameter in self.unet.named_parameters():
-            if "lora_A." in name or "lora_B." in name:
-                marker = "lora_A." if "lora_A." in name else "lora_B."
-                adapter = name.split(marker, 1)[1].split(".", 1)[0]
-                parameter.requires_grad_(adapter in selected_adapters)
-        set_event_lora_trainable(
-            self.unet,
-            train_lora=True,
-            train_modulation=True,
-        )
-        set_modulation_enabled_for_all_event_lora(self.unet, True)
-
-        # EventEncoder 是 Stage2/3 已训练的事件条件分支，Stage5 继续联合适配。
-        self.event_encoder.requires_grad_(bool(self.event_lora_config.targets))
-
-        # VAE 只开放 encoder LoRA；原始 decoder backbone 保持冻结。
-        for name, parameter in self.vae.named_parameters():
-            if "lora_" in name:
-                parameter.requires_grad_(True)
-        self.vae.decoder.feature_fusion_blocks.requires_grad_(True)
-
-        trainable = [parameter for parameter in self.parameters() if parameter.requires_grad]
-        allowed_ids = {
-            id(parameter)
-            for parameter in self.event_encoder.parameters()
-        }
-        allowed_ids.update(
-            id(parameter)
-            for parameter in self.vae.decoder.feature_fusion_blocks.parameters()
-        )
-        allowed_ids.update(
-            id(parameter)
-            for name, parameter in self.vae.named_parameters()
-            if "lora_" in name
-        )
-        # Event-LoRA 的 modulation/shared-head 参数名称不一定包含 lora_。
-        allowed_ids.update(
-            id(parameter)
-            for _, module in iter_event_lora_modules(self.unet)
-            for parameter in module.parameters()
-            if parameter.requires_grad
-        )
-        allowed_ids.update(
-            id(parameter)
-            for name, parameter in self.unet.named_parameters()
-            if "lora_" in name
-        )
-        allowed_prefixes = (
-            "event_encoder.",
-            "vae.decoder.feature_fusion_blocks.",
-        )
-        stray = []
-        for name, parameter in self.named_parameters():
-            if not parameter.requires_grad:
-                continue
-            if id(parameter) in allowed_ids and (
-                name.startswith(allowed_prefixes)
-                or name.startswith("vae.") and "lora_" in name
-                or name.startswith("unet.")
-            ):
-                continue
-            stray.append(name)
-        if stray:
-            raise RuntimeError(f"Unexpected Stage5 trainable parameters: {stray}")
-        print(f"[Stage5 LoRA] active={active_parts}, trainable={trainable_parts}, "
-              f"parameters={self.trainable_parameter_summary()}")
-        return trainable
 
     def install_event_lora(self):
         if self.event_film_installed:
@@ -602,7 +479,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         print(
             f"[Event-LoRA:{self.event_lora_config.variant}] "
             f"targets={','.join(self.event_lora_config.targets) or 'none'}; "
-            f"replaced={counts}; shared_heads={('per_projection_per_scale' if self.event_lora_config.variant in {'residual_cross_attn', 'residual_cross_attn_bax'} else 'per_module')}."
+            f"replaced={counts}; shared_heads={('per_projection_per_scale' if self.event_lora_config.variant in {'residual_cross_attn'} else 'per_module')}."
         )
         for name in names[:20]:
             print(f"[Event-LoRA]   {name}")
@@ -827,31 +704,9 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
                     events_refinement,
                     fusion_mode=fusion_mode,
                 )
-            if self.decoder_refinement_variant == "legacy_fused":
-                fused_features = [
-                    feature.detach() for feature in encoder_output.fused_features
-                ]
-            else:
-                rgb_features = [feature.detach() for feature in encoder_output.rgb_features]
-                event_features = [feature.detach() for feature in encoder_output.event_features]
-                # 沿 event-bin 聚合得到稳定的空间活动图，避免 gate 依赖具体 bin 分布。
-                activity_reduce = (
-                    events_refinement.detach().float().abs().sum
-                    if self.cgdrs_activity_mode == "abs_sum"
-                    else events_refinement.detach().float().abs().mean
-                )
-                activity = activity_reduce(dim=1, keepdim=True)
-                activity = activity / activity.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
-                activity = activity.clamp(0.0, 4.0).div(4.0)
-                event_activity = [
-                    F.interpolate(
-                        activity.to(device=feature.device),
-                        size=feature.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    ).to(dtype=feature.dtype).detach()
-                    for feature in event_features
-                ]
+            fused_features = [
+                feature.detach() for feature in encoder_output.fused_features
+            ]
             self.last_refinement_stats = {}
             for family, features in (
                 ("rgb", encoder_output.rgb_features),
@@ -980,7 +835,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
                 "version": 2,
                 "targets": tuple(self.event_lora_config.targets),
                 "shared_heads": ("per_projection_per_scale" if self.event_lora_config.variant in {
-                    "residual_cross_attn", "residual_cross_attn_bax"
+                    "residual_cross_attn",
                 } else "per_module"),
                 "replaced_by_target": getattr(self, "event_film_replaced_by_target", {}),
                 "layers": {
@@ -1033,12 +888,14 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
         if not self.decoder_refinement_enabled:
             self.install_decoder_refinement()
         runtime_config = self.vae.decoder.refinement_config()
-        checkpoint_config = checkpoint.get("decoder_refinement_config", {})
+        checkpoint_config = dict(checkpoint.get("decoder_refinement_config", {}))
         checkpoint_variant = normalize_refinement_variant(
-            checkpoint_config.get("variant", "legacy_fused")
+            checkpoint_config.get("variant", "rgb_event_decoder_fusion")
         )
+        # 先规范化旧名称再比较结构字段，不能把同一结构的改名判作不兼容。
+        checkpoint_config["variant"] = checkpoint_variant
         runtime_variant = normalize_refinement_variant(
-            runtime_config.get("variant", "legacy_fused")
+            runtime_config.get("variant", "rgb_event_decoder_fusion")
         )
         if checkpoint_variant != runtime_variant:
             raise ValueError(
@@ -1046,8 +903,8 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
                 f"runtime={runtime_variant}, checkpoint={checkpoint_variant}. "
                 "Start a new Stage4 run instead of cross-variant resume."
             )
-        # CGDRS 不需要 Merge 前向；显式关闭可避免无效计算。
-        self.rgb_event_encoder.fusion_enabled = runtime_variant == "legacy_fused"
+        # rgb_event_decoder_fusion 使用 RGB/event Merge 特征。
+        self.rgb_event_encoder.fusion_enabled = runtime_variant == "rgb_event_decoder_fusion"
         structural_keys = (
             "variant",
             "config_version",
@@ -1055,10 +912,6 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             "decoder_channels",
             "fusion_blocks",
             "fusion_init",
-            "cgdrs_event_levels",
-            "cgdrs_gate_bias",
-            "cgdrs_activity_mode",
-            "cgdrs_activity_clip",
         )
         mismatch = {
             key: (runtime_config.get(key), checkpoint_config.get(key))
@@ -1107,6 +960,11 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             and not ignore_mismatch
         ):
             raise ValueError("RGB-event pretrained manifest hash mismatch.")
+        from models.fusion_selection import select_fusion_layers
+        levels = getattr(self.args, "fusion_layers", None)
+        if levels is None:
+            levels = checkpoint.get("additional_info", {}).get("fusion_layers", (0,1,2,3))
+        select_fusion_layers(self.vae.decoder, levels)
         print(f"[Idea3 Load] decoder_refinement loaded={loaded}, skipped={skipped}")
         return loaded, skipped
 
@@ -1337,7 +1195,7 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
             raise ValueError("Regularizer checkpoint targets contradict its config.")
         if regularizer_metadata and self.event_lora_config is not None:
             layout = ("per_projection_per_scale" if self.event_lora_config.variant in {
-                "residual_cross_attn", "residual_cross_attn_bax"
+                "residual_cross_attn",
             } else "per_module")
             if regularizer_metadata.get("shared_heads") != layout:
                 raise ValueError("Regularizer Event-LoRA shared-head layout mismatch.")
@@ -1420,7 +1278,7 @@ class OSEDiffEventFiLMReg(torch.nn.Module):
                     "version": 2,
                     "targets": tuple(self.event_lora_config.targets),
                     "shared_heads": ("per_projection_per_scale" if self.event_lora_config.variant in {
-                        "residual_cross_attn", "residual_cross_attn_bax"
+                        "residual_cross_attn",
                     } else "per_module"),
                     "replaced_names": tuple(self.event_film_replaced_names),
                     "layers": {

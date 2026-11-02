@@ -202,51 +202,16 @@ train_scripts/train_event_film_lora_stage3.sh
 test_scripts/test_event_film_lora_stage3.sh
 ```
 
-## 当前 Event-FiLM LoRA 设计要点
+## 最终版架构（final-code）
 
-核心思想：
-
-- 只替换选中的 UNet self-attention 投影，不替换 text cross-attention 的 `attn2`。
-- 将普通 LoRA 的低秩特征 `z = A(x)` reshape 成空间特征图。
-- 使用事件编码器输出的多尺度 event features 预测空间相关的 `dgamma/dbeta`。
-- 在 LoRA 低秩空间中做 FiLM 调制：
-
-```text
-z_mod = (1 + s * tanh(dgamma)) * z + s * dbeta
-```
-
-- 再通过 LoRA up projection 得到 `lora_out`。
-- modulation head 最后一层应保持 zero-init，使 Stage 2 初始化时 Event-FiLM 近似等价于 Stage 1 普通 LoRA。
-
-实现注意：
-
-- event features 只用于当前 UNet 调用；通常在 forward 后清空，启用 gradient checkpointing 时须保留到 backward 重算完成再清空。
-- 当前实现默认 self-attention token 是正方形空间网格，通常通过 `sqrt(N)` 推断 `H=W`。支持非正方形输入前必须显式处理 `H,W`。
-- 从 Stage 1 checkpoint 的 PEFT LoRA A/B 迁移到 Event-LoRA 时，要检查投影路径、adapter 名称、rank、scaling 和张量形状。
-
-Event-LoRA 目标选择与 checkpoint 规则：
-
-- `--event_lora_targets auto` 从 Stage 1 新建时选择 `v`，加载 Event checkpoint 时继承其中的目标集。显式选择可用 `q,k,v,out` 子集，也支持 `all` 和 `none`。
-- `none` 保留全部原始 self-attention PEFT LoRA 结构；此时 EventEncoder 和事件头不训练，Stage 2/3 必须有其他可训练的生成器路径。
-- Stage 2 冻结 Event-LoRA A/B，训练事件调制分支；Stage 3 同时训练两者。`--unet_lora_active_parts` 和 `--unet_lora_trainable_parts` 分别控制剩余普通 LoRA 的 down/mid/up 分组，解冻组必须属于激活组。
-- 推理用 `--unet_lora_parts` 控制普通 LoRA。Stage 2/3 测试默认 `none`；idea3 测试入口保留原有默认值。
-- 断点恢复和普通推理要求目标集与 checkpoint 一致。若要更换目标集，用 `--init_from_event_checkpoint` 配合显式 targets 仅迁移权重，不恢复原优化器和步数。
-- 缺少 targets 元信息的旧 checkpoint 按 V-only 解释，并核对实际权重键；旧 V 共享头键名保持不变。
-- Stage 2 刚构建完成后应做 zero-init consistency check：Stage 1 输出与 Stage 2 未训练输出应几乎一致。
-
-## idea8 事件结构驱动的特征修正
-
-- 当前实现与启动方式见 `docs/idea8_structure_dps.txt`。ESG 专用代码已移除；7 个历史 baseline wrapper 已迁入 idea8 入口，关闭纠错，并保留普通 LoRA `down,mid,up`。
-- `test_idea8_structure_dps.py` 默认计算 PSNR(Y)、SSIM(Y)、LPIPS 和整组 FID。关闭 FID 或全部指标必须显式指定。新通用脚本默认 `GUIDANCE_STEPS=0`、普通 LoRA `none`、residual cross-attention、timestep 500，Event-LoRA targets 从 checkpoint 继承。
-- 正步数指导当前只支持无 decoder refinement 的 Stage3、batch=1、256 方形输入，且需要独立训练并完成置信度阶段的结构 checkpoint。只优化最后一个 UpBlock 前的临时完整通道特征 delta；生成器权重与 GT 不参与指导优化。
-- 先训练独立结构头，再在互斥校准场景训练置信度头。新训练默认 `idea4_compatible`：复用分片优先/相邻帧截取规则，共享空间裁剪后按首末事件分箱，正负计数分离为 10 通道，不改变原有 5 通道输入。可选 `fixed_window` 模式必须明确时间单位/窗口。checkpoint 保存预处理模式；缺少 mode 的旧 v1 checkpoint 仍按固定窗口解释，续训/校准禁止切换模式。不得由首/末事件推断录制覆盖范围。
-- 用户已选择新 idea8 脚本采用环境变量通用路径。历史 wrapper 保留各自账号默认路径。当前实现完整 UNet 重放，后段缓存属于后续优化，尚未实现。
-- 指导默认采用二次软保护，low/keep 权重为 1.0/0.5；硬预算仍按 L1 衡量，阈值保持 0.02/0.02。显式选择 `l1` 并设权重 2/1 可复现旧目标。默认保存逐候选历史和增量 JSONL 诊断。配对比较使用 `--reproducible_inference`；torch 2.0.1 不支持 replicate-padding 反向的严格确定性，因此采用明确的 warn-only 检查。`--sample_manifest` 可选择验证帧，同时保留全局索引和随机种子。
-- 根据用户 2026-10-25 的要求，`train_scripts/` 和 `test_scripts/` 为仅本地保留的忽略目录。保留本地文件，不要强制加入 Git；Python 训练/测试入口继续跟踪。
-- 结构/置信度训练支持单进程和 torchrun DDP（CUDA/NCCL，CPU/Gloo 用于测试）。whb/slpchen 脚本默认双卡、每卡 batch=4（全局 8），通用脚本默认单进程。分布式验证不得补齐/重复样本；只有 rank 0 写输出。checkpoint 保存各 rank RNG；epoch 续训须保持卡数、每卡 batch、workers、seed、设备类型不变，改变卡数使用仅权重初始化。
-- 离线目标替换必须显式使用 `--guidance_target_source gt_oracle`、正修正步数与 GT 评测，禁止配合 `--inference_only`。该诊断只用 checkpoint 同一结构算子替换目标，固定原事件产生的 W/M0/K0，并记录 `uses_gt_for_guidance=true`；默认 `event` 推理仍不使用 GT。观测新增可选独立掩码，省略时保留原行为；latent/权重/掩码哈希及可选浮点输出用于配对核查。Oracle 结果不能作为可部署方法性能。
-- 训练/验证 step 进度由 `--log_interval` / `LOG_INTERVAL` 控制（默认 50，正整数）。仅 rank 0 打印；step loss 是本 rank 指标，epoch JSON 仍全卡汇总。不得为日志在不等长验证循环内增加通信。续训允许修改日志间隔。
-- 结构头 H0/H1 训练见 `docs/idea8_structure_training.txt`：默认 `smooth_l1` 保留原损失；显式 `region_balanced` 按每样本/尺度分别平均 GT 平坦、弱边缘、强边缘区域，跳过空区域。阈值 0.05/0.2 仅为待确认初值，正式对照前固定相同阈值。保存 last/best，结构阶段统一按区域平衡验证 MAE 选模，置信度阶段按验证 MSE，并记录逐尺度/逐场景误差、偏差、平坦区响应和边缘匹配。续训继承并核验监督/选模配置及历史 best；旧权重续训明确开启新的选择窗口。新增验证通信必须位于不等长循环之外。本次不含全分辨率架构改动。
+- 基于 idea8，只保留 residual_cross_attn cLoRA；新训练 mod_channels 默认 64，加载兼容旧权重时保持其保存的宽度。
+- Decoder refinement 命名为 REDF（RGB-Event Decoder Fusion，RGB–事件解码器融合），配置名 rgb_event_decoder_fusion，使用 RGBEventEncoder 金字塔。删除 CGDRS、FiLM/CBAM/BAx cLoRA、H2/H3 full_detail、Stage5 全量微调、冻结 H1 的 Stage4 接法及 Stage3-only/oracle 引导入口。
+- H1 命名为 E-SFR（Event-guided Structure Feature Refinement，事件引导结构特征修正）。使用 train_esfr.py / test_esfr.py 和 models/esfr.py。保留 H1 half 结构头，新结构训练默认 region_balanced 监督。
+- 联合训练冻结 Stage3、RGBEventEncoder 和完整初始结构教师，仅训练学生结构分支及所选 decoder 融合层。置信度/掩码由固定教师提供；一步高阶梯度引导和候选验收不读取 GT，GT 仅用于外层监督。
+- --fusion_layers 接受 d0,d1,d2,d3（由深到浅）、对应数字、all 或 none。Stage4 默认全部；联合 E-SFR 为兼容历史实验默认 d1,d2,d3。训练至少选择一层；推理可全关，默认继承权重设置。仅所选层执行并获得梯度，仍保存四层参数。
+- 保持 joint-h1-refinement-v1 格式及历史 H1 元数据键以兼容权重。旧联合配置无 fusion_layers 时为 d1,d2,d3；旧 Stage4 权重无层配置时为全部。续训必须保持层、优化器结构和实验签名。已删除架构必须明确报错，不得静默转换权重。
+- 保留 Stage1 RGB baseline、Stage2/3 cLoRA 训练、Stage4 decoder 预训练、独立结构/置信度预训练、数据/指标及最终路径测试。历史 shell 目录仅本地保留，未确认账号不重写、不强制加入 Git。当前用法见 docs/final_code.txt，旧实验脚本请在 idea8 运行。
+- 验证层选择的前向/梯度行为、权重重载、图像损失到结构头的梯度、冻结教师一致性和一步推理数值一致性。正式运行前仍需使用真实模型/数据验证完整 GPU 训练、多卡同步和断点续训。
 
 ## 代码开发要求
 
@@ -419,13 +384,3 @@ references/eglol.py               事件预处理参考
 - 如果用户要求解释参数，例如 `modulation_scale`、`lambda_edge`、`lambda_mod`、`lambda_smooth`、`control_*`，必须从当前实现路径解释，不要只按名字猜。
 - 如果用户说不要运行代码，就只修改文件并给出可复制的命令，不主动训练/推理。
 - 回答代码问题时优先引用具体文件和函数。
-
-- H2/H3 显式使用 `--head_variant full_detail`：stride=1 浅层事件分支与上采样的半分辨率上下文融合，在全分辨率上预测。H2 保留 Smooth L1，H3 使用区域平衡。默认 `half` 与旧权重输出保持兼容；checkpoint 记录结构版本，加载时继承并拒绝显式不匹配。保持预处理/结构算子、共同初始化、训练预算及场景划分不变；分别从新结构 best 重新校准置信度。
-
-- H1 Stage4 通过 `train_idea3_decoder_refinement.py --h1_structure_checkpoint` 显式启用：冻结 FP32 的逐样本 H1 引导在关闭 refinement 时只捕获接受的 latent，再 detach 后训练外层 decoder fusion。Stage3/H1/HDRev 均冻结；cLoRA 用5bin，HDRev 用bin0，H1保持原10通道视图。保存并在续训时核验流水线元信息及H1权重包；后续推理必须沿用 H1→refinement 顺序。见 `docs/idea8_h1_stage4.txt`。
-
-- 无H1 Stage4消融不提供结构权重，显式使用 `--frozen_backbone_fp32 --global_step_lr_schedule --h1_guidance_steps 0`。新训练通过 `--decoder_refinement_init_checkpoint` 加载共同fusion初始化，核验Stage3/HDRev/结构/seed并恢复初始化后的RNG；禁止同时resume。保持在跑H1组的源码快照不变。
-
-- 完整 decoder H1 Stage4 训练显式使用 `--h1_decoder_path full_refinement`：逐样本内层通过完整 decoder 求解时暂时冻结全部当前权重，接受 latent detach 后恢复 fusion 梯度，供外层 GT 损失更新。训练启用全部四层，内外层 refinement 精度/强度一致；禁用内层 autocast 权重缓存。记录 v2 流水线并拒绝旧优化器续训；测试入口的 `auto` 模式继承训练引导路径。见 `docs/idea8_h1_stage4.txt`。
-
-- H1/refinement 联合微调用独立入口 `train_joint_h1_refinement.py`。冻结 Stage3/HDRev/d0 和完整的初始 H1 教师，只更新 d123 与学生结构分支。固定置信度/掩码由包含共享特征的教师提供；保留一步高阶梯度及无 GT 候选验收，GT 仅用于外层图像/结构监督。保存同时包含学生、教师的 `joint-h1-refinement-v1`，禁止作为普通 Stage4 或单头 checkpoint 加载。启动前验证图像损失对 H1 的梯度、冻结参数一致、双卡同步和断点恢复。见 `docs/idea8_joint_h1_refinement.txt`。

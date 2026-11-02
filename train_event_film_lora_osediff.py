@@ -142,41 +142,15 @@ def parse_args():
     parser.add_argument(
         "--mod_channels",
         type=int,
-        default=32,
+        default=64,
         help="Event/RGB 融合头的中间通道数；越大表达力越强，但 3x3 融合卷积开销近似平方增长。",
     )
     parser.add_argument("--modulation_scale", type=float, default=0.1)
     parser.add_argument(
         "--event_lora_variant",
         type=str,
-        default="film_affine",
-        choices=[
-            "film_affine",
-            "film",
-            "cbam_lowrank_residual",
-            "cbam_output_gate",
-            "residual_cross_attn",
-            "residual_cross_attn_bax",
-        ],
-    )
-    parser.add_argument(
-        "--event_lora_cbam_reduction",
-        type=int,
-        default=8,
-        help="CBAM channel attention 的压缩比例；越大越省参数，但通道关系表达更弱。",
-    )
-    parser.add_argument(
-        "--event_lora_cbam_spatial_kernel",
-        type=int,
-        default=7,
-        choices=[3, 7],
-        help="CBAM spatial attention 卷积核；7 的感受野更大，3 更轻量。",
-    )
-    parser.add_argument(
-        "--event_lora_output_gate_channels",
-        type=str,
-        default="spatial",
-        choices=["spatial", "channel_spatial"],
+        default="residual_cross_attn",
+        choices=["residual_cross_attn"],
     )
     parser.add_argument("--mod_num_heads", type=int, default=4)
     parser.add_argument("--mod_window_size", type=int, default=8)
@@ -561,14 +535,7 @@ def main(args):
                         "loss/regularizer_diff": loss_d.detach().item(),
                     }
                     logs.update({f"event_lora/{k}": v for k, v in debug_stats.items()})
-                    logs["event_lora/variant_id"] = {
-                        "film_affine": 0,
-                        "film": 0,
-                        "cbam_lowrank_residual": 1,
-                        "cbam_output_gate": 2,
-                        "residual_cross_attn": 3,
-                        "residual_cross_attn_bax": 4,
-                    }[args.event_lora_variant]
+                    logs["event_lora/variant_id"] = 3
                     progress_bar.set_postfix({
                         "loss": f"{logs['loss/total']:.4f}",
                         "eta": format_duration(eta_seconds),

@@ -10,7 +10,7 @@ class RGBEventEncoderTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.pretrained_root = os.environ.get(
-            "RGB_EVENT_PRETRAINED_ROOT", "checkpoints/HDRev"
+            "RGB_EVENT_PRETRAINED_ROOT", "checkpoints/rgb_event_encoder"
         )
 
     def test_strict_pretrained_load_and_shapes(self):

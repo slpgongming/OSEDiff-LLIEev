@@ -92,7 +92,7 @@ def _dataset(root):
     (root / "split.json").write_text(json.dumps(dict(train=["a"],calibration=["b"],validation=["c"])),encoding="utf-8")
 
 
-@pytest.mark.parametrize("head_variant", ["half", "full_detail"])
+@pytest.mark.parametrize("head_variant", ["half"])
 @pytest.mark.parametrize("loss_mode", ["smooth_l1", "region_balanced"])
 def test_two_process_training_resume_and_validation(tmp_path, monkeypatch, loss_mode, head_variant):
     if not dist.is_available() or not dist.is_gloo_available():

@@ -31,7 +31,7 @@ def test_shared_fusion_initialization_validates_weights_and_restores_rng(tmp_pat
         def __init__(self):
             super().__init__();self.vae=nn.Module();self.vae.decoder=nn.Module()
             self.vae.decoder.feature_fusion_blocks=nn.Linear(3,3)
-            self.vae.decoder.refinement_config=lambda:dict(variant='legacy_fused')
+            self.vae.decoder.refinement_config=lambda:dict(variant='rgb_event_decoder_fusion')
             self.rgb_event_encoder=SimpleNamespace(pretrained_manifest=dict(sha256={'a':'b'}))
     model=Fake();source=tmp_path/'stage3.pt';source.write_bytes(b'stage3')
     expected={k:v.clone()+1 for k,v in model.vae.decoder.feature_fusion_blocks.state_dict().items()}

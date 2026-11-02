@@ -38,37 +38,6 @@ class _TinyUNet(nn.Module):
 
 
 class Idea3CheckpointTest(unittest.TestCase):
-    def test_local_legacy_film_checkpoint_remaps_without_skips(self):
-        checkpoint_path = os.path.join(
-            "checkpoints",
-            "OSEDiff_clora_stage2_6-8-2320",
-            "checkpoints",
-            "model_final.pkl",
-        )
-        if not os.path.isfile(checkpoint_path):
-            self.skipTest("Local legacy Event-FiLM checkpoint is not available.")
-        checkpoint = torch.load(
-            checkpoint_path, map_location="cpu", weights_only=False
-        )
-        state = remap_legacy_event_film_state_dict(checkpoint["state_dict_unet"])
-        prefix = "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_v."
-        layer_state = {
-            key[len(prefix):]: value
-            for key, value in state.items()
-            if key.startswith(prefix)
-        }
-        rank, in_features = layer_state["lora_down.weight"].shape
-        out_features = layer_state["lora_up.weight"].shape[0]
-        module = SpatialRGBEventLoRALinear(
-            nn.Linear(in_features, out_features, bias=False),
-            EventLoRAConfig(
-                variant="film_affine", rank=rank, alpha=rank, mod_channels=32
-            ),
-            {"32": 64, "16": 96, "8": 128, "4": 128},
-        )
-        loaded, skipped = copy_compatible_state_dict(module, layer_state)
-        self.assertEqual(skipped, 0)
-        self.assertEqual(loaded, len(layer_state))
 
     def test_all_event_lora_variants_forward_backward_and_reload(self):
         events = {

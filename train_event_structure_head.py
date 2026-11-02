@@ -43,14 +43,14 @@ def parse_args(argv=None):
     p.add_argument("--structure_manifest")
     p.add_argument("--image_size", type=int, default=256)
     p.add_argument("--base_channels", type=int, default=32)
-    p.add_argument("--head_variant", choices=("half", "full_detail"),
-                   help="新训练默认 half；H2/H3 用 full_detail；加载 checkpoint 时继承且禁止跨结构加载。")
+    p.add_argument("--head_variant", choices=("half",),
+                   help="E-SFR 使用原 H1 half 结构；加载 checkpoint 时继承配置。")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch_size", type=int, default=4, help="每个进程/GPU 的 batch size；全局 batch 为此值乘 world_size。")
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--confidence_tau", type=float, default=0.1)
     p.add_argument("--structure_loss", choices=("smooth_l1", "region_balanced"),
-                   help="H0 用 smooth_l1（新训练默认）；H1 用 region_balanced；续训默认继承权重元信息。")
+                   help="新训练默认 region_balanced（E-SFR）；smooth_l1 仅兼容历史监督配置，续训继承元信息。")
     p.add_argument("--region_thresholds", type=float, nargs=2, metavar=("WEAK", "STRONG"),
                    help="固定 GT 结构分区阈值，初值 0.05/0.2；正式对照前按训练集统计确认。")
     p.add_argument("--region_weights", type=float, nargs=3, metavar=("FLAT", "WEAK", "STRONG"),
@@ -76,7 +76,7 @@ def parse_args(argv=None):
     if args.image_size != 256:
         p.error("Initial idea8 preprocessing/checkpoints use image_size=256.")
     try:
-        StructureSupervisionConfig(mode=args.structure_loss or "smooth_l1",
+        StructureSupervisionConfig(mode=args.structure_loss or "region_balanced",
                                    thresholds=args.region_thresholds or (0.05, 0.2),
                                    region_weights=args.region_weights or (1., 1., 1.))
         SelectionConfig(metric="validation_loss" if args.phase == "confidence" else "balanced_mae",
@@ -106,7 +106,8 @@ class SelectionConfig:
 def resolve_training_configs(args, checkpoint):
     """显式参数覆盖仅权重初始化；完整续训及置信度阶段不能静默改变结构监督定义。"""
     checkpoint = checkpoint or {}
-    original = StructureSupervisionConfig(**checkpoint.get("supervision_config", {}))
+    # 旧权重缺失字段仍按历史监督解释；全新训练采用 H1 的区域平衡监督。
+    original = StructureSupervisionConfig(**checkpoint.get("supervision_config", {})) if checkpoint else StructureSupervisionConfig(mode="region_balanced")
     supervision = replace(original,
                           mode=args.structure_loss or original.mode,
                           thresholds=tuple(args.region_thresholds) if args.region_thresholds is not None else original.thresholds,

@@ -33,7 +33,6 @@ from diffusers.models.autoencoders.vae import Decoder, DecoderOutput, DiagonalGa
 from models.decoder_refinement import (
     FeatureAwareDecoder,
     normalize_refinement_variant,
-    normalize_activity_mode,
 )
 
 class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
@@ -165,29 +164,18 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
         condition_channels=(64, 128, 256, 512),
         fusion_weight=1.0,
         fusion_init="near_zero",
-        refinement_variant="legacy_fused",
-        cgdrs_event_levels=(1, 2, 3),
-        cgdrs_gate_bias=-2.0,
-        cgdrs_activity_mode="abs_mean",
+        refinement_variant="rgb_event_decoder_fusion",
     ):
         """用单一条件 decoder 替换标准 decoder，并严格迁移全部 backbone 权重。"""
         if isinstance(self.decoder, FeatureAwareDecoder):
             requested_variant = normalize_refinement_variant(refinement_variant)
             current_variant = normalize_refinement_variant(
-                self.decoder.refinement_config().get("variant", "legacy_fused")
+                self.decoder.refinement_config().get("variant", "rgb_event_decoder_fusion")
             )
             if current_variant != requested_variant:
                 raise ValueError(
                     "FeatureAwareDecoder is already installed with variant="
                     f"{current_variant}, requested={requested_variant}."
-                )
-            current_activity_mode = self.decoder.refinement_config().get(
-                "cgdrs_activity_mode", "abs_mean"
-            )
-            if normalize_activity_mode(cgdrs_activity_mode) != current_activity_mode:
-                raise ValueError(
-                    "FeatureAwareDecoder is already installed with "
-                    f"activity_mode={current_activity_mode}, requested={cgdrs_activity_mode}."
                 )
             return self.decoder
         old_decoder = self.decoder
@@ -204,9 +192,6 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
             fusion_weight=fusion_weight,
             fusion_init=fusion_init,
             refinement_variant=normalize_refinement_variant(refinement_variant),
-            cgdrs_event_levels=cgdrs_event_levels,
-            cgdrs_gate_bias=cgdrs_gate_bias,
-            cgdrs_activity_mode=normalize_activity_mode(cgdrs_activity_mode),
         )
         load_result = new_decoder.load_state_dict(
             old_decoder.state_dict(), strict=False

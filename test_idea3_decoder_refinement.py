@@ -1,3 +1,5 @@
+from models.fusion_selection import parse_fusion_layers, select_fusion_layers
+from models.decoder_refinement import normalize_refinement_variant
 """idea3 Phase 1 A-F 因果实验；同 event mode 的实验严格复用同一 z0。"""
 
 import argparse
@@ -60,11 +62,8 @@ def build_parser(include_experiments=True):
     )
     parser.add_argument(
         "--event_lora_variant",
-        default="cbam_lowrank_residual",
-        choices=(
-            "film_affine", "film", "cbam_lowrank_residual", "cbam_output_gate",
-            "residual_cross_attn", "residual_cross_attn_bax",
-        ),
+        default="residual_cross_attn",
+        choices=("residual_cross_attn",),
     )
     parser.add_argument("--lora_rank", type=int, default=4)
     parser.add_argument("--event_channels", type=int, default=5)
@@ -78,19 +77,17 @@ def build_parser(include_experiments=True):
         help="RGB-event encoder 输入使用的前置有效 event bin 数；1 将全部事件聚集到 bin 0，通道数仍为 5。",
     )
     parser.add_argument("--event_base_channels", type=int, default=32)
-    parser.add_argument("--mod_channels", type=int, default=32)
+    parser.add_argument("--mod_channels", type=int, default=64)
     parser.add_argument("--modulation_scale", type=float, default=0.1)
     parser.add_argument("--mod_num_heads", type=int, default=4)
     parser.add_argument("--mod_window_size", type=int, default=8)
-    parser.add_argument("--event_lora_cbam_reduction", type=int, default=8)
-    parser.add_argument("--event_lora_cbam_spatial_kernel", type=int, default=7)
-    parser.add_argument("--event_lora_output_gate_channels", default="spatial")
     parser.add_argument("--decoder_fusion_weight", type=float, default=1.0)
     parser.add_argument("--decoder_fusion_init", default="near_zero")
     parser.add_argument(
         "--decoder_refinement_variant",
+        type=lambda value: normalize_refinement_variant(value, allow_auto=True),
         default="auto",
-        choices=("auto", "legacy_fused", "cgdrs"),
+        choices=("auto", "rgb_event_decoder_fusion"),
         help="Refinement path; auto inherits the checkpoint configuration.",
     )
     parser.add_argument(
@@ -98,11 +95,6 @@ def build_parser(include_experiments=True):
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable the trained decoder-refinement path. Disable for Stage3 checkpoints without its weights.",
-    )
-    parser.add_argument("--cgdrs_event_levels", default="1,2,3")
-    parser.add_argument("--cgdrs_gate_bias", type=float, default=-2.0)
-    parser.add_argument(
-        "--cgdrs_activity_mode", choices=("abs_mean", "abs_sum"), default="abs_mean"
     )
     if include_experiments:
         parser.add_argument("--experiments", default="A,B,C,D,E,F")
@@ -115,6 +107,7 @@ def build_parser(include_experiments=True):
     parser.add_argument("--calculate_fid", action="store_true")
     parser.add_argument("--save_images", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume_ignore_mismatch", action="store_true")
+    parser.add_argument("--fusion_layers", type=parse_fusion_layers, default=None)
     return parser
 
 
