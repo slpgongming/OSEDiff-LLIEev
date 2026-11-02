@@ -1,0 +1,15 @@
+conda create -n osediff python=3.10 -y
+conda activate osediff
+pip install torch==2.0.1 torchvision==0.15.2 \
+    --index-url https://download.pytorch.org/whl/cu118
+pip install numpy==1.24.4 --no-deps
+pip install --no-deps \
+    diffusers==0.25.0 \
+    huggingface_hub==0.25.0 \
+    transformers==4.35.2
+pip install ftfy regex tqdm safetensors accelerate
+pip install lpips
+然后从GitHub下载CLIP-main中的CLIP到OSEDiff文件夹下，并安装：
+pip install ftfy regex tqdm
+pip install peft==0.7.1
+pip install einops
