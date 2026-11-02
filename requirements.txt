@@ -1,14 +1,57 @@
-diffusers==0.25.0
+# 根据用户提供的 conda/pip 安装记录整理；Python 3.10，CUDA 11.8。
+# 未指定版本的包保持不锁定，因此本文件不是完整环境锁文件。
+# 本文件按本次提供的安装记录整理，替换原仓库依赖清单。
+#
+# 在 OSEDiff 目录中依次执行（每条命令为一行）：
+# conda create -n osediff python=3.10 -y
+# conda activate osediff
+# python -m pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
+# python -m pip install --no-deps numpy==1.24.4 diffusers==0.25.0 huggingface_hub==0.25.0 transformers==4.35.2
+# python -m pip install -c requirements.txt ftfy regex tqdm safetensors accelerate lpips peft==0.7.1 einops opencv-python-headless wandb scikit-image
+# python -m pip install --no-deps -r requirements.txt
+#
+# 上面的普通安装步骤允许安装传递依赖，同时通过 -c 保持已指定版本。
+# 最后一步补齐 pyiqa、pandas 等，并保留原记录跳过其依赖解析的行为。
+# 不要只在空环境中运行最后一步，否则会缺少传递依赖。
+# requirements 格式不支持给单个包设置 --no-deps，故使用分步命令。
+# 如需清华镜像，可在后两条 pip 命令末尾加：
+# -i https://pypi.tuna.tsinghua.edu.cn/simple
+# PyTorch 使用上面独立的 cu118 下载源。
+#
+# 手工操作：将 GitHub CLIP-main 中的完整 clip 文件夹放到 OSEDiff/clip/，
+# 保留其中的 tokenizer 资源文件；这里不添加 PyPI 上的同名 clip 包。
+# 使用 W&B 在线记录时，另行执行：wandb login --relogin
+# 安装后可执行 python -m pip check 查看依赖问题；--no-deps 不保证依赖完整。
+# 本清单未经过实际安装或训练/推理验证。
+
+# PyTorch（先使用上面的 cu118 源安装）
 torch==2.0.1
-transformers==4.28.1
-xformers==0.0.20
-einops==0.7.0
-open-clip-torch==2.20.0
-peft==0.9.0
-Pillow==9.5.0
-PyYAML==6.0
-pyiqa==0.1.10
+torchvision==0.15.2
+
+# 固定版本的基础依赖
+numpy==1.24.4
+diffusers==0.25.0
 huggingface_hub==0.25.0
-basicsr
-loralib
-fairscale
+transformers==4.35.2
+peft==0.7.1
+
+# CLIP、训练与图像处理
+ftfy
+regex
+tqdm
+safetensors
+accelerate
+lpips
+einops
+opencv-python-headless
+
+# 实验记录与 SSIM
+wandb
+scikit-image
+
+# Idea2 cLoRA 测试/推理：按原记录使用 --no-deps 安装
+pyiqa
+pandas
+pytz
+python-dateutil
+six
