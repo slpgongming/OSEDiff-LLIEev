@@ -1,4 +1,4 @@
-"""按 10k 整数倍批量评测 checkpoint，仅保留总体四项指标。"""
+"""按 10k 整数倍批量评测 checkpoint，仅保留Y/RGB 总体指标。"""
 
 import argparse
 import csv
@@ -10,7 +10,8 @@ import sys
 import tempfile
 
 
-METRICS = ("psnr", "ssim", "lpips", "fid")
+from my_utils.quality_metrics import METRIC_NAMES
+METRICS = (*METRIC_NAMES, "fid")
 FIELDS = ("step", "checkpoint", "mode", "count", *METRICS)
 
 

@@ -72,7 +72,7 @@ class CheckpointRangeTests(unittest.TestCase):
                     writer = csv.DictWriter(handle, fieldnames=["mode", "count", *evaluation.METRICS])
                     writer.writeheader()
                     for mode in ("correct", "zero"):
-                        writer.writerow(dict(mode=mode, count=3, psnr=25, ssim=.8, lpips=.2, fid=12))
+                        writer.writerow(dict(mode=mode, count=3, psnr_y=25, ssim_y=.8, psnr_rgb=23, ssim_rgb=.7, lpips=.2, fid=12))
                 if len(commands) == 2:
                     raise subprocess.CalledProcessError(1, command)
 

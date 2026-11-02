@@ -18,7 +18,8 @@ from osediff_event_film import OSEDiffEventFiLMTest, parse_unet_lora_parts
 from models.event_film_lora import parse_event_lora_targets
 
 
-METRIC_NAMES = ("psnr", "ssim", "lpips")
+from my_utils.quality_metrics import METRIC_NAMES, build_quality_metrics, format_quality_metrics
+from my_utils.quality_metrics import compute_quality_metrics
 FID_INCEPTION_WEIGHTS_NAME = "pt_inception-2015-12-05-6726825d.pth"
 
 
@@ -162,19 +163,6 @@ def build_ablation_event(events, mode):
     if mode == "zero":
         return torch.zeros_like(events)
     raise ValueError(f"Unknown ablation mode: {mode}")
-
-
-def compute_quality_metrics(pred, gt, psnr_metric, ssim_metric, lpips_metric):
-    # pyiqa full-reference metrics expect image tensors in [0, 1].  The model
-    # path uses the OSEDiff convention [-1, 1], so clamp before remapping to
-    # avoid out-of-range values dominating PSNR/SSIM/LPIPS.
-    pred_01 = pred.float().clamp(-1, 1) * 0.5 + 0.5
-    gt_01 = gt.float().clamp(-1, 1) * 0.5 + 0.5
-    return {
-        "psnr": psnr_metric(pred_01, gt_01).item(),
-        "ssim": ssim_metric(pred_01, gt_01).item(),
-        "lpips": lpips_metric(pred_01, gt_01).item(),
-    }
 
 
 def write_csv(path, rows, fieldnames):
@@ -405,9 +393,7 @@ def main(args):
     dataset = SDEEventFilmDataset(split="test", args=args, root_dir=args.input_image)
     model = OSEDiffEventFiLMTest(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    psnr_metric = pyiqa.create_metric("psnr", test_y_channel=True, color_space="ycbcr").to(device)
-    ssim_metric = pyiqa.create_metric("ssim", test_y_channel=True, color_space="ycbcr").to(device)
-    lpips_metric = pyiqa.create_metric("lpips", device=device).to(device)
+    metrics = build_quality_metrics(device)
     modes = parse_ablation_modes(args.ablation_modes)
     fid_evaluator = FIDEvaluator(modes, device) if args.calculate_fid else None
 
@@ -448,7 +434,7 @@ def main(args):
                 fid_evaluator.add_prediction(mode, idx, pred_pil)
 
             with torch.inference_mode():
-                metric_values = compute_quality_metrics(pred, gt, psnr_metric, ssim_metric, lpips_metric)
+                metric_values = compute_quality_metrics(pred, gt, metrics)
             active_l1 = event_active_l1(pred.float(), gt.float(), event_input.float())
             debug_stats = model.debug_stats()
             scene_stats[mode][scene_name].update(metric_values)
@@ -462,9 +448,7 @@ def main(args):
                 "scene": scene_name,
                 "prefix": prefix,
                 "frame_id": sample["frame_id"],
-                "psnr": metric_values["psnr"],
-                "ssim": metric_values["ssim"],
-                "lpips": metric_values["lpips"],
+                **metric_values,
                 "event_active_l1": active_l1,
                 "dgamma_abs_mean": debug_stats.get("dgamma_abs_mean", 0.0),
                 "dbeta_abs_mean": debug_stats.get("dbeta_abs_mean", 0.0),
@@ -474,8 +458,7 @@ def main(args):
             })
             print(
                 f"[{idx + 1}/{len(dataset)}] {mode}/{scene_name}/{prefix} | "
-                f"PSNR={metric_values['psnr']:.4f} | SSIM={metric_values['ssim']:.4f} | "
-                f"LPIPS={metric_values['lpips']:.4f} | event_L1={active_l1:.6f}"
+                f"{format_quality_metrics(metric_values)} | event_L1={active_l1:.6f}"
             )
 
     metrics_dir = args.output_dir
@@ -488,7 +471,7 @@ def main(args):
     scene_csv = os.path.join(metrics_dir, "metrics_event_film_ablation_scene.csv")
     overall_csv = os.path.join(metrics_dir, "metrics_event_film_ablation_overall.csv")
     per_image_fields = [
-        "mode", "scene", "prefix", "frame_id", "psnr", "ssim", "lpips",
+        "mode", "scene", "prefix", "frame_id", *METRIC_NAMES,
         "event_active_l1", "dgamma_abs_mean", "dbeta_abs_mean",
         "delta_z_abs_mean", "gate_mean", "result_path",
     ]
@@ -517,8 +500,7 @@ def main(args):
         fid_text = f" | FID={row['fid']:.4f}" if args.calculate_fid else ""
         print(
             f"{row['mode']} (n={row['count']}): "
-            f"PSNR={row['psnr']:.4f} | SSIM={row['ssim']:.4f} | "
-            f"LPIPS={row['lpips']:.4f}{fid_text}"
+            f"{format_quality_metrics(row)}{fid_text}"
         )
 
     print(f"[Done] Per-image metrics: {per_image_csv}")

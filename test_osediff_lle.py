@@ -1,3 +1,7 @@
+from my_utils.quality_metrics import build_quality_metrics, format_quality_metrics
+from my_utils.quality_metrics import DISTORTION_NAMES
+from collections import defaultdict
+import csv
 import os
 import sys
 sys.path.append(os.getcwd())
@@ -218,15 +222,11 @@ if __name__ == "__main__":
 
     # Initialize metrics
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    psnr_metric = pyiqa.create_metric('psnr', test_y_channel=True, color_space='ycbcr').to(device)
-    ssim_metric = pyiqa.create_metric('ssim', test_y_channel=True, color_space='ycbcr').to(device)
-
-    # Accumulators for per-scene and overall metrics
-    scene_psnr = {}
-    scene_ssim = {}
-    scene_counts = {}
-    overall_psnr = 0.0
-    overall_ssim = 0.0
+    metrics = build_quality_metrics(device, include_lpips=False)
+    scene_sums = defaultdict(lambda: defaultdict(float))
+    scene_counts = defaultdict(int)
+    overall_sums = defaultdict(float)
+    per_image_rows = []
     total_count = 0
 
     # Get prompt
@@ -298,41 +298,33 @@ if __name__ == "__main__":
             gt_tensor = img2tensor(gt_img_cv, bgr2rgb=True, float32=True).unsqueeze(0).to(device).contiguous() / 255.0
 
             with torch.no_grad():
-                psnr_val = psnr_metric(sr_tensor, gt_tensor).item()
-                ssim_val = ssim_metric(sr_tensor, gt_tensor).item()
-
-            # Accumulate per-scene
-            if scene_name not in scene_psnr:
-                scene_psnr[scene_name] = 0.0
-                scene_ssim[scene_name] = 0.0
-                scene_counts[scene_name] = 0
-            scene_psnr[scene_name] += psnr_val
-            scene_ssim[scene_name] += ssim_val
+                # 同一份保存后的 RGB 图像同时计算两种口径，保持原 Stage1 的量化流程。
+                values = {name: float(metric(sr_tensor, gt_tensor).item()) for name, metric in metrics.items()}
+            for name, value in values.items():
+                scene_sums[scene_name][name] += value
+                overall_sums[name] += value
             scene_counts[scene_name] += 1
-
-            # Accumulate overall
-            overall_psnr += psnr_val
-            overall_ssim += ssim_val
             total_count += 1
+            per_image_rows.append(dict(scene=scene_name, frame=prefix, **values, result_path=result_path))
+            text = format_quality_metrics(values)
+            logger.info(f"{scene_name}/{prefix} | {text} | Time: {inference_time:.2f}s")
+            print(f"  {text} | Saved: {result_path}")
 
-            logger.info(f"{scene_name}/{prefix} | PSNR: {psnr_val:.4f} | SSIM: {ssim_val:.4f} | Time: {inference_time:.2f}s")
-            print(f"  PSNR: {psnr_val:.4f} | SSIM: {ssim_val:.4f} | Saved: {lowlight_path}, {result_path}, {gt_path}")
-
-    # Log per-scene averages
-    logger.info("\n===== Per-Scene Average Metrics =====")
-    for scene_name in sorted(scene_psnr.keys()):
-        cnt = scene_counts[scene_name]
-        avg_psnr = scene_psnr[scene_name] / cnt
-        avg_ssim = scene_ssim[scene_name] / cnt
-        logger.info(f"  {scene_name}: PSNR={avg_psnr:.4f} | SSIM={avg_ssim:.4f} (n={cnt})")
-
-    # Log overall average
-    avg_psnr_all = overall_psnr / total_count
-    avg_ssim_all = overall_ssim / total_count
-    logger.info(f"\n===== Overall Average Metrics =====")
-    logger.info(f"  PSNR: {avg_psnr_all:.4f} | SSIM: {avg_ssim_all:.4f} (n={total_count})")
-
-    print(f"\n[Done] Processed {total_count} image(s).")
-    print(f"  Overall PSNR: {avg_psnr_all:.4f} | SSIM: {avg_ssim_all:.4f}")
-    print(f"  Output: {os.path.abspath(args.output_dir)}")
-    print(f"  Log: {os.path.abspath(args.output_dir)}")
+    # 逐图、逐场景和总体均落盘，字段名明确区分亮度与 RGB。
+    scene_rows = [dict(scene=scene, count=scene_counts[scene],
+        **{name: scene_sums[scene][name] / scene_counts[scene] for name in DISTORTION_NAMES})
+        for scene in sorted(scene_counts)]
+    overall = dict(count=total_count, **{name: overall_sums[name] / total_count for name in DISTORTION_NAMES})
+    for filename, rows, fields in [
+        ('metrics_per_image.csv', per_image_rows, ('scene','frame',*DISTORTION_NAMES,'result_path')),
+        ('metrics_per_scene.csv', scene_rows, ('scene','count',*DISTORTION_NAMES)),
+        ('metrics_overall.csv', [overall], ('count',*DISTORTION_NAMES)),
+    ]:
+        with open(os.path.join(args.output_dir, filename), 'w', newline='', encoding='utf-8') as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader(); writer.writerows(rows)
+    for row in scene_rows:
+        logger.info(f"{row['scene']} (n={row['count']}): {format_quality_metrics(row)}")
+    logger.info(f"Overall (n={total_count}): {format_quality_metrics(overall)}")
+    print(f"[Done] {total_count} images | {format_quality_metrics(overall)}")
+    print(f"Output: {os.path.abspath(args.output_dir)}")

@@ -1,3 +1,4 @@
+from my_utils.quality_metrics import build_quality_metrics
 # Image Quality Assessment Script
 # Evaluates metrics like PSNR, SSIM, LPIPS, FID, DISTS, etc., for a set of images.
 
@@ -125,8 +126,7 @@ def main():
     # Initialize IQA metrics excluding FID
     logger.info("Initializing IQA metrics...")
     iqa_metrics = {
-        'PSNR': pyiqa.create_metric('psnr', test_y_channel=True, color_space='ycbcr').to(device),
-        'SSIM': pyiqa.create_metric('ssim', test_y_channel=True, color_space='ycbcr').to(device),
+        **build_quality_metrics(device, include_lpips=False),
         'LPIPS': pyiqa.create_metric('lpips', device=device),
         'DISTS': pyiqa.create_metric('dists', device=device),
         'CLIPIQA': pyiqa.create_metric('clipiqa', device=device),

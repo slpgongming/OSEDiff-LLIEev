@@ -1,4 +1,6 @@
 """E-SFR 联合权重完整测试：恢复学生与固定教师，逐帧配对结构修正开/关。"""
+from my_utils.quality_metrics import METRIC_NAMES, build_quality_metrics
+from my_utils.quality_metrics import METRIC_PROTOCOL
 import argparse,json,math,time
 from pathlib import Path
 import torch
@@ -65,15 +67,14 @@ def infer(a):
         joint_signature=bundle['signature'],numeric_settings=numerics,seed=a.seed,test_root=a.test_root,
         dataset_count=len(dataset),limit=a.limit,shards=a.shards,settings=settings,teacher='frozen_initial_full_head',
         backbone_dtype='float32',refinement_autocast='float16',uses_gt_for_guidance=False,
-        metric_protocol='PSNR(Y)/SSIM(Y) ycbcr; LPIPS float RGB; whole-set FID from PNG')
+        metric_protocol=METRIC_PROTOCOL)
     # JSON规范化tuple/list，避免恢复时只因序列类型不同拒绝同一配置。
     manifest=json.loads(json.dumps(manifest))
     mp=out/f'manifest_shard{a.shard}.json'
     if mp.exists():assert json.loads(mp.read_text())==manifest,'Resume manifest mismatch'
     else:atomic_json(mp,manifest)
     del bundle
-    metrics=dict(psnr=pyiqa.create_metric('psnr',test_y_channel=True,color_space='ycbcr').cuda(),
-        ssim=pyiqa.create_metric('ssim',test_y_channel=True,color_space='ycbcr').cuda(),lpips=pyiqa.create_metric('lpips',device='cuda').cuda())
+    metrics=build_quality_metrics('cuda')
     def predict(sample,seed,enabled):
         # 显式剔除GT，保证完整decoder引导接口只收到图像、事件和提示词。
         inputs={k:sample[k] for k in ['conditioning_pixel_values','events','events_refinement','events_structure','prompt','neg_prompt']}
@@ -89,7 +90,10 @@ def infer(a):
             for enabled in [False,True]:
                 image,_=predict(sample,a.seed+200000+index,enabled)
                 with torch.no_grad():values=quality_metrics(image,sample['output_pixel_values'][None].cuda(),metrics)
-                diffs={k:abs(values[k]-previous['on' if enabled else 'off'][k]) for k in values}
+                reference=previous['on' if enabled else 'off']
+                # 新验证记录使用显式 RGB 字段；历史无后缀记录仍按 Y 重放。
+                pairs=[('psnr_rgb','psnr_rgb'),('ssim_rgb','ssim_rgb'),('lpips','lpips')] if 'psnr_rgb' in reference else [('psnr','psnr_y'),('ssim','ssim_y'),('lpips','lpips')]
+                diffs={label:abs(values[new]-reference[key]) for label,(key,new) in zip(['psnr','ssim','lpips'],pairs)}
                 assert diffs['psnr']<.02 and diffs['ssim']<1e-4 and diffs['lpips']<1e-4,diffs
                 audits.append(dict(index=index,guidance=enabled,absolute_metric_differences=diffs))
         atomic_json(out/'load_audit.json',dict(step=checkpoint_step,all_loaded_tensors_exact=True,frozen_hash_matched=True,validation_replay=audits))
@@ -98,7 +102,7 @@ def infer(a):
         rp=out/'records'/f'{index:06d}.json'
         if rp.exists():
             record=json.loads(rp.read_text())
-            if set(record['results'])==set(settings) and all(Path(x['result_path']).is_file() for x in record['results'].values()):continue
+            if set(record['results'])==set(settings) and all(set(METRIC_NAMES).issubset(x) and Path(x['result_path']).is_file() for x in record['results'].values()):continue
         set_seed(a.seed+index);sample=dataset[index]
         stem=f'{index:06d}_{sample["scene_name"]}_{sample["frame_index"]+1:03d}'
         refs=out/'references';refs.mkdir(exist_ok=True)

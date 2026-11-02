@@ -10,7 +10,7 @@
 不会额外测试 `model_final.pkl`。
 
 默认测试 `correct,zero`，每个 checkpoint、每个事件模式输出一行总体
-PSNR、SSIM、LPIPS、FID，汇总到输出目录的 `checkpoint_metrics.csv`。
+PSNR-Y、SSIM-Y、PSNR-RGB、SSIM-RGB、LPIPS、FID，汇总到输出目录的 `checkpoint_metrics.csv`。
 CSV 另含 step、checkpoint 路径、mode 和样本数以标识结果。
 不保存增强图、输入图、GT 图、调制诊断、逐图或逐场景指标。
 FID 沿用原测试入口的整组图像算法及量化方式，临时图像会在计算后清理。

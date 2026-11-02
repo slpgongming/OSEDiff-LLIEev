@@ -212,6 +212,8 @@ test_scripts/test_event_film_lora_stage3.sh
 - 保持 joint-h1-refinement-v1 格式及历史 H1 元数据键以兼容权重。旧联合配置无 fusion_layers 时为 d1,d2,d3；旧 Stage4 权重无层配置时为全部。续训必须保持层、优化器结构和实验签名。已删除架构必须明确报错，不得静默转换权重。
 - 保留 Stage1 RGB baseline、Stage2/3 cLoRA 训练、Stage4 decoder 预训练、独立结构/置信度预训练、数据/指标及最终路径测试。历史 shell 目录仅本地保留，未确认账号不重写、不强制加入 Git。当前用法见 docs/final_code.txt，旧实验脚本请在 idea8 运行。
 - 验证层选择的前向/梯度行为、权重重载、图像损失到结构头的梯度、冻结教师一致性和一步推理数值一致性。正式运行前仍需使用真实模型/数据验证完整 GPU 训练、多卡同步和断点续训。
+- 所有测试入口明确输出 psnr_y、ssim_y、psnr_rgb、ssim_rgb，并保留原有 LPIPS/FID。通道配置共用 my_utils/quality_metrics.py，两种口径使用相同图像对，保持各入口已有 PNG/浮点预处理。E-SFR 验证输出 PSNR-RGB/SSIM-RGB，并按 PSNR-RGB 选择最佳权重。续训旧 Y 选模 checkpoint 时重置最佳分数历史，对恢复的权重重新进行 RGB 验证；结构/置信度预训练保留各自的损失选模规则。E-SFR 双口径评测使用新协议并拒绝旧输出目录的 manifest，请使用新输出目录。
+
 
 ## 代码开发要求
 

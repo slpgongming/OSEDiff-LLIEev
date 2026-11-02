@@ -38,7 +38,7 @@ python test_esfr.py --joint_run /path/to/esfr_run --test_root /path/to/test --ou
 默认 checkpoint_best.pt；--checkpoint 可指定任意保存步，不再写死250步或2741张图。
 默认继承训练层；--fusion_layers d0,d2 或 none 可做推理消融。
 未选层直接旁路，且不改变四层权重 key/shape。训练未更新的层仍保持 Stage4 初始化值。
-每次同时评测 ESFR_on / ESFR_off；逐帧 PSNR(Y)、SSIM(Y)、LPIPS，aggregate 汇总整组 FID。
+每次同时评测 ESFR_on / ESFR_off；逐帧 PSNR-Y、SSIM-Y、PSNR-RGB、SSIM-RGB、LPIPS，aggregate 汇总整组 FID。
 多进程分片时各 shard 使用相同参数及输出目录，全部完成后 --aggregate。
 --expected_sha256 可选；始终记录实际哈希。--audit 重放对应步的验证记录，要求使用训练层。
 推理不读取训练集；仅 --audit 需要原验证集。
@@ -60,3 +60,15 @@ python -m unittest discover -s tests -p test_final_configuration.py
 本次未启动真实数据训练、完整GPU推理或多卡训练。
 
 编码器集成测试默认查找 checkpoints/rgb_event_encoder；实际权重位于其他目录时通过 RGB_EVENT_PRETRAINED_ROOT 指定。本次只清理代码命名，不移动已有权重目录。
+
+测试指标双口径
+所有测试入口默认同时输出 psnr_y、ssim_y、psnr_rgb、ssim_rgb，不需要新增开关。
+Y 使用 test_y_channel=True / color_space=ycbcr；RGB 显式 test_y_channel=False。
+两种口径使用完全相同的图像对；Stage1/离线图片保持原PNG流程，事件路径保持原浮点流程。
+Stage1 新增 metrics_per_image.csv、metrics_per_scene.csv、metrics_overall.csv；其它入口的原有 CSV/JSON 增加明确通道字段，替代含义不明确的 psnr/ssim 字段。
+原 LPIPS、FID 保留；checkpoint 批量评测也汇总全部六项指标。
+E-SFR 训练验证输出 psnr_rgb、ssim_rgb、lpips，按结构修正开启时的 PSNR-RGB 最大值选择 checkpoint_best.pt。
+新 checkpoint、run_config 和验证记录明确保存 selection_metric=psnr_rgb。
+旧 Y checkpoint 可继续恢复权重、优化器和步数，但会清空旧最佳分数，重新验证当前权重并建立 RGB 排名基准；不会追溯重评所有历史权重。
+Stage1/2/3/4 当前没有内置 PSNR 选模；结构/置信度预训练继续按原有结构误差/验证损失选模。
+E-SFR 使用新评测协议；不要续用旧的仅Y指标输出目录，请另建输出目录重新评测。

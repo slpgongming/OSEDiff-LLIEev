@@ -1,4 +1,5 @@
-"""只计算并保存总体 PSNR、SSIM、LPIPS、FID；不保存输出图像。"""
+"""只计算并保存总体 Y/RGB 双口径 PSNR、SSIM 及 LPIPS、FID；不保存输出图像。"""
+from my_utils.quality_metrics import METRIC_NAMES, build_quality_metrics
 
 from pathlib import Path
 import os
@@ -18,7 +19,7 @@ from test_event_film_lora_osediff import (
 
 
 CSV_NAME = "metrics_event_film_ablation_overall.csv"
-FIELDS = ("mode", "count", "psnr", "ssim", "lpips", "fid")
+FIELDS = ("mode", "count", *METRIC_NAMES, "fid")
 
 
 def worker_command(mode):
@@ -92,9 +93,7 @@ def evaluate(args, modes):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset = SDEEventFilmDataset(split="test", args=args, root_dir=args.input_image)
     model = OSEDiffEventFiLMTest(args)
-    psnr = pyiqa.create_metric("psnr", test_y_channel=True, color_space="ycbcr").to(device)
-    ssim = pyiqa.create_metric("ssim", test_y_channel=True, color_space="ycbcr").to(device)
-    lpips = pyiqa.create_metric("lpips", device=device).to(device)
+    metrics = build_quality_metrics(device)
     stats = {mode: MetricAccumulator() for mode in modes}
     fid = FIDEvaluator(modes, device)
     try:
@@ -108,7 +107,7 @@ def evaluate(args, modes):
                 event_input = build_ablation_event(events, mode)
                 with torch.inference_mode():
                     pred = model(lq, event_input, prompt=args.fixed_prompt)
-                    values = compute_quality_metrics(pred, gt, psnr, ssim, lpips)
+                    values = compute_quality_metrics(pred, gt, metrics)
                 stats[mode].update(values)
                 # FID 沿用原入口的量化及指标定义，暂存文件由 finally 清理。
                 fid.add_prediction(mode, index, tensor_to_pil(pred[0]))

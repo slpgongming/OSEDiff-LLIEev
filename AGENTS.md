@@ -212,6 +212,8 @@ test_scripts/test_event_film_lora_stage3.sh
 - Keep joint-h1-refinement-v1 format and historical H1 metadata keys for checkpoint compatibility. Old joint configs without fusion_layers mean d1,d2,d3; old Stage4 checkpoints without layers mean all. Resume must retain layers, optimizer structure and experiment signature. Deleted architectures must fail explicitly; do not silently reinterpret their weights.
 - Keep Stage1 RGB baseline, Stage2/3 cLoRA training, Stage4 decoder pretraining, independent structure/confidence pretraining, dataset/metrics and final-path tests. Historical shell directories are local-only; do not force-add or rewrite them without account context. See docs/final_code.txt for current usage; old experiment scripts should be run on idea8.
 - Validate selected-layer forward/gradient behavior, checkpoint reload, image-loss-to-structure gradients, frozen teacher consistency, and one-step inference parity. Full GPU training, multi-GPU synchronization and resume still require real model/data validation before formal runs.
+- All test entries report psnr_y, ssim_y, psnr_rgb, ssim_rgb explicitly, alongside existing LPIPS/FID. Use my_utils/quality_metrics.py for channel settings; both channel variants receive the same image pair. Preserve existing PNG/float preprocessing per entry. E-SFR validation reports PSNR-RGB/SSIM-RGB and selects the best checkpoint by PSNR-RGB. Resuming legacy Y-selected checkpoints resets the best-score history and revalidates the resumed weights in RGB; structure/confidence pretraining keeps its task-specific loss selection. E-SFR dual-channel evaluation uses a new metric protocol and rejects old output manifests; use a fresh output directory.
+
 
 ## Code Development Requirements
 

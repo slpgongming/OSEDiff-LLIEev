@@ -1,4 +1,5 @@
 """最终方案的原子记录、权重摘要与完整数据集指标汇总。"""
+from my_utils.quality_metrics import METRIC_NAMES, METRIC_PROTOCOL
 import os,json,hashlib,math
 from pathlib import Path
 from collections import defaultdict
@@ -23,6 +24,8 @@ def aggregate(cli):
     output=Path(cli.output_dir)
     manifests=[json.loads((output/f'manifest_shard{s}.json').read_text()) for s in range(cli.shards)]
     assert all(m==manifests[0] for m in manifests)
+    if manifests[0].get('metric_protocol') != METRIC_PROTOCOL:
+        raise ValueError('Old metric protocol: rerun dual-channel evaluation in a new output directory.')
     count=manifests[0]['limit'] or manifests[0]['dataset_count']
     indices=[]
     for s in range(cli.shards):indices+=json.loads((output/f'done_shard{s}.json').read_text())['indices']
@@ -38,21 +41,21 @@ def aggregate(cli):
         result_dir=output/name
         finished=result_dir/'summary.json'
         if finished.exists():
-            existing=json.loads(finished.read_text());assert existing['count']==count
+            existing=json.loads(finished.read_text());assert existing['count']==count and set(METRIC_NAMES).issubset(existing)
             summaries.append(existing);continue
         per_image=[dict(index=r['index'],scene=r['scene'],frame_id=r['frame_id'],
-                        **{k:r['results'][name][k] for k in ('psnr','ssim','lpips','result_path')}) for r in records]
+                        **{k:r['results'][name][k] for k in (*METRIC_NAMES,'result_path')}) for r in records]
         assert len(list((result_dir/'images').glob('*.png')))==count
         with torch.inference_mode():fid_score=float(fid(str(result_dir/'images'),str(gt)).item())
         assert math.isfinite(fid_score)
-        summary=dict(experiment=name,count=count,**{k:sum(r[k] for r in per_image)/count for k in ('psnr','ssim','lpips')},fid=fid_score)
-        write_csv(str(result_dir/'per_image.csv'),per_image,('index','scene','frame_id','psnr','ssim','lpips','result_path'))
+        summary=dict(experiment=name,count=count,**{k:sum(r[k] for r in per_image)/count for k in METRIC_NAMES},fid=fid_score)
+        write_csv(str(result_dir/'per_image.csv'),per_image,('index','scene','frame_id',*METRIC_NAMES,'result_path'))
         scenes=defaultdict(list)
         for row in per_image:scenes[row['scene']].append(row)
-        scene_rows=[dict(scene=scene,count=len(rows),**{k:sum(r[k] for r in rows)/len(rows) for k in ('psnr','ssim','lpips')}) for scene,rows in sorted(scenes.items())]
-        write_csv(str(result_dir/'per_scene.csv'),scene_rows,('scene','count','psnr','ssim','lpips'))
+        scene_rows=[dict(scene=scene,count=len(rows),**{k:sum(r[k] for r in rows)/len(rows) for k in METRIC_NAMES}) for scene,rows in sorted(scenes.items())]
+        write_csv(str(result_dir/'per_scene.csv'),scene_rows,('scene','count',*METRIC_NAMES))
         atomic_json(finished,summary);summaries.append(summary);print(json.dumps(summary),flush=True)
-    write_csv(str(output/'summary.csv'),summaries,('experiment','count','psnr','ssim','lpips','fid'))
+    write_csv(str(output/'summary.csv'),summaries,('experiment','count',*METRIC_NAMES,'fid'))
     atomic_json(output/'complete.json',dict(count=count,settings=len(summaries),complete=True,summary=summaries))
 
 def configure_inference_numerics(reproducible):

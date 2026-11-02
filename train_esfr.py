@@ -24,6 +24,17 @@ from train_event_structure_head import read_scene_split
 from train_idea3_decoder_refinement import event_edge_loss
 from my_utils.evaluation import atomic_json,file_hash
 from models.fusion_selection import parse_fusion_layers, select_fusion_layers
+from my_utils.quality_metrics import build_quality_metrics
+
+
+def restore_best_psnr(checkpoint):
+    """旧 Y 选模分数不能参与 RGB 排名；保留训练状态，重新验证建立基准。"""
+    metric = checkpoint.get('selection_metric', 'psnr_y')
+    if metric == 'psnr_y':
+        return float('-inf'), True
+    if metric != 'psnr_rgb':
+        raise ValueError(f'Unsupported selection metric: {metric}')
+    return checkpoint['best_psnr_rgb'], False
 
 
 def parse_args():
@@ -115,25 +126,29 @@ def main():
     scaler=torch.cuda.amp.GradScaler(init_scale=1024.)
     import pyiqa
     lpips=pyiqa.create_metric('lpips',device='cuda',as_loss=True).eval().requires_grad_(False)
-    metrics={k:pyiqa.create_metric(k,device='cuda',**({'test_y_channel':True,'color_space':'ycbcr'} if k in ['psnr','ssim'] else {})).eval().requires_grad_(False) for k in ['psnr','ssim','lpips']}
+    # 验证显式采用 RGB；测试入口仍同时输出 Y/RGB。
+    metrics=build_quality_metrics('cuda', channels=('rgb',))
+    for metric in metrics.values():metric.requires_grad_(False)
     guidance=GuidanceConfig(steps=1)
     supervision=StructureSupervisionConfig(**meta['supervision_config']) if 'supervision_config' in meta else StructureSupervisionConfig(mode='region_balanced')
     initial_hash=frozen_hash(gen,teacher,head)
     initial_ref={n:p.detach().cpu().clone() for n,p in gen.named_parameters() if p.requires_grad} if a.smoke else None
     initial_head={n:p.detach().cpu().clone() for n,p in head.named_parameters() if p.requires_grad} if a.smoke else None
     signature=dict(format='joint-h1-refinement-v1',stage4_sha256=file_hash(Path(a.stage4_run)/a.stage4_checkpoint),stage3_sha256=file_hash(base_config['event_lora_checkpoint']),h1_sha256=file_hash(a.h1_checkpoint),levels=list(a.fusion_layers),weight=1.,confidence='frozen_initial_full_head',guidance=asdict(guidance),structure_supervision=asdict(supervision),world_size=world,global_batch_size=world,seed=a.seed,split=read_scene_split(a.scene_split),validation_indices=validation,refinement_lr=a.refinement_lr,head_lr=a.head_lr,lambda_structure=a.lambda_structure,max_steps=a.max_steps)
-    step0=0;best=float('-inf')
+    step0=0;best=float('-inf');reset_selection=False
     if a.resume_from_checkpoint:
         c=torch.load(a.resume_from_checkpoint,map_location='cpu',weights_only=False);assert c['signature']==signature and c['frozen_sha256']==initial_hash
         gen.vae.decoder.feature_fusion_blocks.load_state_dict(c['fusion']);head.load_state_dict(c['head']);teacher.load_state_dict(c['teacher'])
-        optimizer.load_state_dict(c['optimizer']);scaler.load_state_dict(c['scaler']);step0=c['step'];best=c['best_psnr'];del c
-    if rank==0:atomic_json(out/'run_config.json',dict(**vars(a),signature=signature,base_train_config=base_config,train_count=len(trainset),validation_count=len(validation),frozen_initial_sha256=initial_hash,gradient_mode='exact_one_step_unroll_piecewise_acceptance',refinement_precision='fp16',backbone_precision='fp32',trainable_refinement=sum(p.numel() for p in rp),trainable_head=sum(p.numel() for p in hp)))
+        optimizer.load_state_dict(c['optimizer']);scaler.load_state_dict(c['scaler']);step0=c['step']
+        best,reset_selection=restore_best_psnr(c);del c
+        if reset_selection and rank==0:print('旧 Y 通道选模记录已重置；将重新验证当前权重，建立 PSNR-RGB 基准。',flush=True)
+    if rank==0:atomic_json(out/'run_config.json',dict(**vars(a),selection_metric='psnr_rgb',signature=signature,base_train_config=base_config,train_count=len(trainset),validation_count=len(validation),frozen_initial_sha256=initial_hash,gradient_mode='exact_one_step_unroll_piecewise_acceptance',refinement_precision='fp16',backbone_precision='fp32',trainable_refinement=sum(p.numel() for p in rp),trainable_head=sum(p.numel() for p in hp)))
     def save(step,label):
         if rank==0:
             path=out/(label+'.pt');temp=path.with_suffix('.tmp')
             torch.save(dict(format=signature['format'],step=step,signature=signature,frozen_sha256=initial_hash,
                 fusion=gen.vae.decoder.feature_fusion_blocks.state_dict(),head=head.state_dict(),teacher=teacher.state_dict(),
-                head_metadata=meta,optimizer=optimizer.state_dict(),scaler=scaler.state_dict(),best_psnr=best),temp)
+                head_metadata=meta,optimizer=optimizer.state_dict(),scaler=scaler.state_dict(),selection_metric='psnr_rgb',best_psnr_rgb=best),temp)
             os.replace(temp,path)
         if world>1:dist.barrier()
     def validate(step):
@@ -153,12 +168,12 @@ def main():
         if world>1:
             gathered=[None]*world;dist.all_gather_object(gathered,rows);rows=[r for part in gathered for r in part]
         assert len(rows)==len(validation) and len({r['index'] for r in rows})==len(rows)
-        result=dict(step=step,count=len(rows),on={k:float(np.mean([r['on'][k] for r in rows])) for k in metrics},off={k:float(np.mean([r['off'][k] for r in rows])) for k in metrics},structure_loss=float(np.mean([r['structure_loss'] for r in rows])),rows=sorted(rows,key=lambda r:r['index']))
+        result=dict(step=step,selection_metric='psnr_rgb',count=len(rows),on={k:float(np.mean([r['on'][k] for r in rows])) for k in metrics},off={k:float(np.mean([r['off'][k] for r in rows])) for k in metrics},structure_loss=float(np.mean([r['structure_loss'] for r in rows])),rows=sorted(rows,key=lambda r:r['index']))
         if rank==0:atomic_json(out/f'validation_{step:06d}.json',result);print('VALIDATION',step,result['on'],result['off'],flush=True)
         optimizer.zero_grad(set_to_none=True)
-        return result['on']['psnr']
-    if not a.smoke and step0==0:
-        best=validate(0);save(0,'checkpoint_best');save(0,'checkpoint_last')
+        return result['on']['psnr_rgb']
+    if not a.smoke and (step0==0 or reset_selection):
+        best=validate(step0);save(step0,'checkpoint_best');save(step0,'checkpoint_last')
     started=time.time();order=None;epoch=-1
     for step in range(step0+1,a.max_steps+1):
         position=(step-1)*world+rank;current_epoch=position//len(trainset)
@@ -217,7 +232,7 @@ def main():
         assert len(set(digests))==1,'Ranks diverged after gradient synchronization'
         if rank==0:atomic_json(out/'smoke_audit.json',dict(frozen_bitwise_unchanged=True,changed_refinement=changed_ref,changed_head=changed_head,image_loss_head_grad_norm=image_head_norm if a.max_steps==1 else 'verified_step1',synchronized_parameter_sha256=digests,max_memory_gib=torch.cuda.max_memory_allocated()/2**30))
     save(a.max_steps,'checkpoint_final')
-    if rank==0:atomic_json(out/'complete.json',dict(step=a.max_steps,frozen_bitwise_unchanged=True,best_validation_psnr=best if np.isfinite(best) else None))
+    if rank==0:atomic_json(out/'complete.json',dict(step=a.max_steps,frozen_bitwise_unchanged=True,selection_metric='psnr_rgb',best_validation_psnr_rgb=best if np.isfinite(best) else None))
     if world>1:dist.destroy_process_group()
 
 

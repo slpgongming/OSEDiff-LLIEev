@@ -1,6 +1,8 @@
+"""idea3 Phase 1 A-F 因果实验；同 event mode 的实验严格复用同一 z0。"""
+from my_utils.quality_metrics import METRIC_NAMES, build_quality_metrics, format_quality_metrics
+from my_utils.quality_metrics import compute_quality_metrics as quality_metrics
 from models.fusion_selection import parse_fusion_layers, select_fusion_layers
 from models.decoder_refinement import normalize_refinement_variant
-"""idea3 Phase 1 A-F 因果实验；同 event mode 的实验严格复用同一 z0。"""
 
 import argparse
 import csv
@@ -124,13 +126,6 @@ def parse_args():
     return finalize_args(build_parser().parse_args())
 
 
-def quality_metrics(prediction, target, metrics):
-    prediction = prediction.float().clamp(-1, 1) * 0.5 + 0.5
-    target = target.float().clamp(-1, 1) * 0.5 + 0.5
-    return {
-        name: float(metric(prediction, target).item())
-        for name, metric in metrics.items()
-    }
 
 
 def write_csv(path, rows, fields):
@@ -164,15 +159,7 @@ def main(args):
     model = OSEDiffEventFiLMTest(args)
     device = model.device
     dtype = model.weight_dtype
-    metrics = {
-        "psnr": pyiqa.create_metric(
-            "psnr", test_y_channel=True, color_space="ycbcr"
-        ).to(device),
-        "ssim": pyiqa.create_metric(
-            "ssim", test_y_channel=True, color_space="ycbcr"
-        ).to(device),
-        "lpips": pyiqa.create_metric("lpips", device=device).to(device),
-    }
+    metrics = build_quality_metrics(device)
     fid = FIDEvaluator(experiments, device) if args.calculate_fid else None
     rows = []
     sums = defaultdict(lambda: defaultdict(float))
@@ -255,8 +242,7 @@ def main(args):
             })
             print(
                 f"[{index + 1}/{next(iter(lengths))}] {experiment} "
-                f"PSNR={values['psnr']:.4f} SSIM={values['ssim']:.4f} "
-                f"LPIPS={values['lpips']:.4f}"
+                f"{format_quality_metrics(values)}"
             )
 
     fid_scores = {}
@@ -273,7 +259,7 @@ def main(args):
             "count": counts[experiment],
             **{
                 name: sums[experiment][name] / max(counts[experiment], 1)
-                for name in ("psnr", "ssim", "lpips")
+                for name in METRIC_NAMES
             },
         }
         if fid_scores:
@@ -287,22 +273,22 @@ def main(args):
                 "count": scene_count,
                 **{
                     name: scene_sums[experiment][scene_name][name] / scene_count
-                    for name in ("psnr", "ssim", "lpips")
+                    for name in METRIC_NAMES
                 },
             })
 
     write_csv(
         os.path.join(args.output_dir, "idea3_phase1_per_image.csv"),
         rows,
-        ("experiment", "scene", "frame_id", "psnr", "ssim", "lpips", "result_path"),
+        ("experiment", "scene", "frame_id", *METRIC_NAMES, "result_path"),
     )
-    summary_fields = ["experiment", "count", "psnr", "ssim", "lpips"]
+    summary_fields = ["experiment", "count", *METRIC_NAMES]
     if fid_scores:
         summary_fields.append("fid")
     write_csv(
         os.path.join(args.output_dir, "idea3_phase1_scene.csv"),
         scene_summary,
-        ("experiment", "scene", "count", "psnr", "ssim", "lpips"),
+        ("experiment", "scene", "count", *METRIC_NAMES),
     )
     write_csv(
         os.path.join(args.output_dir, "idea3_phase1_summary.csv"),
