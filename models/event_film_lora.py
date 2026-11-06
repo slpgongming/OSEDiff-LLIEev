@@ -175,9 +175,13 @@ class WindowRGBEventCrossAttentionCore(nn.Module):
         query = query.reshape(window_count, token_count, self.num_heads, head_dim).transpose(1, 2)
         key = key.reshape(window_count, token_count, self.num_heads, head_dim).transpose(1, 2)
         value = value.reshape(window_count, token_count, self.num_heads, head_dim).transpose(1, 2)
-        attention = torch.matmul(query.float(), key.float().transpose(-2, -1)) * (head_dim ** -0.5)
-        attention = attention.softmax(dim=-1).to(dtype=value.dtype)
-        attended = torch.matmul(attention, value)
+        # AMP 会把 matmul 的 float 输入重新降精度；显式关闭，避免 QK 点积
+        # 在 softmax 之前发生 FP16 溢出。加权求和也保留 FP32，再恢复分支 dtype。
+        with torch.autocast(device_type=query.device.type, enabled=False):
+            attention = torch.matmul(query.float(), key.float().transpose(-2, -1)) * (head_dim ** -0.5)
+            attention = attention.softmax(dim=-1)
+            attended = torch.matmul(attention, value.float())
+        attended = attended.to(dtype=value.dtype)
         attended = attended.transpose(1, 2).reshape(window_count, token_count, dim)
         attended = self.attn_out(attended)
         attended = self._reverse(attended, window_size, bsz, padded_h, padded_w)
@@ -288,6 +292,11 @@ class SpatialRGBEventLoRALinear(nn.Module):
     def clear_event_feats(self):
         self.event_feats = None
 
+    def clear_regularization_cache(self):
+        # 在反向结束后释放正则和可视化缓存的计算图；数值 debug 统计仍保留。
+        self.last_z_delta = None
+        self.last_aux = {}
+
     def set_modulation_enabled(self, enabled):
         self.modulation_enabled = bool(enabled)
 
@@ -310,7 +319,8 @@ class SpatialRGBEventLoRALinear(nn.Module):
 
         delta_z = self.shared_residual_heads(z_map, self.event_feats)
         z_mod = z_map + self.config.modulation_scale * delta_z
-        self.last_z_delta = (z_mod - z_map).detach()
+        # 正则保留到事件分支的梯度；仅日志统计允许 detach。
+        self.last_z_delta = z_mod - z_map
         z_tokens = z_mod.flatten(2).transpose(1, 2).contiguous()
         lora_out = self.lora_up(z_tokens) * self.scaling
         result = {"aux": {"z_event": delta_z, "delta_z": z_mod - z_map}}

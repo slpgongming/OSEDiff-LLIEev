@@ -854,7 +854,7 @@ class OSEDiffEventFiLMGen(torch.nn.Module):
             "epoch": epoch,
         }
         if stage in {2, 3, "2", "3"}:
-            sd["event_regularization_mode"] = "legacy_detached_delta_and_head_l2"
+            sd["event_regularization_mode"] = "differentiable_delta_and_head_l2_v2"
         if optimizer is not None:
             sd["optimizer_state_dict"] = optimizer.state_dict()
         if lr_scheduler is not None:

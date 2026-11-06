@@ -254,7 +254,7 @@ def _total_variation(x):
 
 
 def collect_event_lora_regularization(unet, device):
-    """旧版正则：detach 后的调制增量统计，加可反传的事件头 L2。"""
+    """可反传的调制增量平方/TV，加事件头 L2；保留原有聚合尺度。"""
     smooth = torch.zeros((), device=device)
     mod = torch.zeros((), device=device)
     count = 0

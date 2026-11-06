@@ -1,0 +1,24 @@
+Stage 2/3 数值稳定性修复
+
+调制增量平方和空间 TV 保留计算图，事件头参数 L2 与原聚合分母不变。
+这会改变训练梯度，因此不能直接与旧版本使用相同参数的实验视为同一目标。
+checkpoint 标记 differentiable_delta_and_head_l2_v2。旧版本（或未标记）
+权重可用 --init_from_event_checkpoint 初始化新实验，但拒绝直接恢复优化器。
+从 Stage 1 重新开始也可；现有损失权重是起点，不保证无需重新调参。
+
+当前正则启用时禁止 --gradient_checkpointing：旧 diffusers 的 reentrant
+重计算会使前向缓存的正则失去梯度。当前 indoor88 脚本未开启此选项。
+默认显存需求可能因可反传正则而增加，必要时降低每卡 batch。
+
+注意力 QK 点积、softmax 和与 V 的加权和显式关闭 autocast 并使用 FP32。
+这不保证此前投影层/其他网络层永不溢出，因此仍需数值检查。
+
+训练检查输入、GT、事件、输出图像、latent、各损失、生成器/regularizer
+梯度及解缩放后的梯度范数。发现非有限值时通过全卡归约让所有 rank 报错，
+异常包含阶段、step、rank、本地异常项与样本路径，不再静默训练 NaN。
+采用严格终止策略，AMP 缩放梯度溢出也会停止，而不是等待 GradScaler 跳步恢复。
+新增 grad/generator_norm 日志记录裁剪前、解缩放后的范数。
+
+测试：python -m unittest tests.test_event_training_stability tests.test_event_lora_targets
+覆盖 final-code residual_cross_attn 的独立 mod/smooth 梯度、冻结参数、缓存生命周期、FP16 大值
+点积回归、有限值/NaN/Inf 分支，以及 CPU Gloo 双进程一致失败。

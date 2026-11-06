@@ -18,6 +18,8 @@ from tqdm.auto import tqdm
 from dataloaders.sde_event_film_dataset import SDEEventFilmDataset
 from models.event_lora_utils import collect_event_lora_regularization, clear_event_feats_for_all_event_lora
 from models.event_film_lora import parse_event_lora_targets
+from models.training_finite_checks import require_finite
+from models.event_lora_utils import iter_event_lora_modules
 from osediff_event_film import (
     OSEDiffEventFiLMGen,
     OSEDiffEventFiLMReg,
@@ -216,6 +218,10 @@ def parse_args():
 
 
 def main(args):
+    # reentrant checkpoint 首次前向不记录图，外部读取的调制正则将失去梯度。
+    # 当前 diffusers 版本接口不统一，明确拒绝而不是静默退回无效正则。
+    if args.gradient_checkpointing and (args.lambda_mod != 0 or args.lambda_smooth != 0):
+        raise ValueError("Differentiable mod/smooth requires --gradient_checkpointing to be disabled.")
     active_parts, trainable_parts = validate_unet_lora_training_parts(
         args.unet_lora_active_parts, args.unet_lora_trainable_parts
     )
@@ -237,7 +243,7 @@ def main(args):
     # 后仍有 bucket 未完成归约，第二步 forward 会报
     # "Expected to have finished reduction in the prior iteration"。
     #
-    # 旧版 smooth/mod 的调制增量已 detach；mod 中事件头 L2 仍是独立参数梯度路径。
+    # 调制增量正则保留梯度，事件头 L2 仍是独立参数梯度路径。
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -307,6 +313,11 @@ def main(args):
     if resume_path is not None:
         logging.info(f"[Resume] Loading checkpoint: {resume_path}")
         resume_checkpoint = torch.load(resume_path, map_location="cpu")
+        if resume_checkpoint.get("event_regularization_mode") != "differentiable_delta_and_head_l2_v2":
+            raise ValueError(
+                "Legacy regularization checkpoint cannot resume optimizer state. "
+                "Use --init_from_event_checkpoint with a new output directory instead."
+            )
         for key, runtime in (
             ("train_unet_lora_active_parts", args.unet_lora_active_parts),
             ("train_unet_lora_trainable_parts", args.unet_lora_trainable_parts),
@@ -451,6 +462,8 @@ def main(args):
                 x_src = batch["conditioning_pixel_values"]
                 x_tgt = batch["output_pixel_values"]
                 events = batch["events"]
+                require_finite(accelerator, [("input", x_src), ("gt", x_tgt), ("events", events)],
+                               phase="input", step=global_step + 1, batch=batch)
                 bsz = x_src.shape[0]
                 batch["prompt"] = [args.fixed_prompt] * bsz
                 batch["neg_prompt"] = [args.neg_prompt] * bsz
@@ -494,10 +507,22 @@ def main(args):
                 else:
                     loss_d = torch.zeros((), device=x_src.device)
 
+                require_finite(accelerator, [
+                    ("prediction", x_pred), ("latent", latents_pred), ("total", loss),
+                    ("l2", loss_l2), ("lpips", loss_lpips), ("edge", loss_edge),
+                    ("smooth", loss_smooth), ("mod", loss_mod), ("vsd", loss_kl),
+                    ("regularizer_diff", loss_d),
+                ], phase="forward", step=global_step + 1, batch=batch)
                 accelerator.backward(loss)
                 clear_event_feats_for_all_event_lora(accelerator.unwrap_model(model_gen).unet)
+                for _, module in iter_event_lora_modules(accelerator.unwrap_model(model_gen).unet):
+                    module.clear_regularization_cache()
+                require_finite(accelerator, ((n, p.grad) for n, p in model_gen.named_parameters() if p.requires_grad),
+                               phase="generator_gradient", step=global_step + 1, batch=batch)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_([p for g in optimizer.param_groups for p in g["params"]], args.max_grad_norm)
+                    grad_norm = accelerator.clip_grad_norm_([p for g in optimizer.param_groups for p in g["params"]], args.max_grad_norm)
+                    require_finite(accelerator, [("grad_norm", grad_norm)],
+                                   phase="generator_unscaled_norm", step=global_step + 1, batch=batch)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
@@ -505,8 +530,14 @@ def main(args):
                 if args.lambda_vsd_lora > 0:
                     accelerator.backward(loss_d)
                     clear_event_feats_for_all_event_lora(accelerator.unwrap_model(model_reg).unet_update)
+                    for _, module in iter_event_lora_modules(accelerator.unwrap_model(model_reg).unet_update):
+                        module.clear_regularization_cache()
+                    require_finite(accelerator, ((n, p.grad) for n, p in reg_runner.named_parameters() if p.requires_grad),
+                                   phase="regularizer_gradient", step=global_step + 1, batch=batch)
                     if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_([p for p in reg_runner.parameters() if p.requires_grad], args.max_grad_norm)
+                        reg_grad_norm = accelerator.clip_grad_norm_([p for p in reg_runner.parameters() if p.requires_grad], args.max_grad_norm)
+                        require_finite(accelerator, [("grad_norm", reg_grad_norm)],
+                                       phase="regularizer_unscaled_norm", step=global_step + 1, batch=batch)
                     optimizer_reg.step()
                     lr_scheduler_reg.step()
                     optimizer_reg.zero_grad(set_to_none=args.set_grads_to_none)
@@ -526,6 +557,7 @@ def main(args):
                         "time/s_per_step": s_per_step,
                         "time/eta_seconds": eta_seconds,
                         "loss/total": loss.detach().item(),
+                        "grad/generator_norm": grad_norm.detach().item(),
                         "loss/l2": loss_l2.detach().item(),
                         "loss/lpips": loss_lpips.detach().item(),
                         "loss/edge": loss_edge.detach().item(),
