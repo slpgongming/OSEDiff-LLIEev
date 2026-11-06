@@ -1,3 +1,4 @@
+from my_utils.experiment_tracking import build_trackers, normalize_report_to
 from models.fusion_selection import parse_fusion_layers
 from models.decoder_refinement import normalize_refinement_variant
 """idea3 Phase 1B：只训练 VAE decoder feature-fusion blocks。"""
@@ -152,15 +153,16 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpointing_steps", type=int, default=500)
     parser.add_argument("--log_steps", type=int, default=10)
-    parser.add_argument("--report_to", default=None)
+    parser.add_argument("--report_to", type=normalize_report_to, default=None)
     parser.add_argument("--tracker_project_name", default="idea3-decoder-refinement")
     parser.add_argument(
         "--run_name",
+        "--swanlab_run_name",
         "--wandb_run_name",
         dest="run_name",
         type=str,
         default=None,
-        help="Tracker run name (legacy --wandb_run_name alias is retained).",
+        help="SwanLab experiment name; legacy run-name alias is retained.",
     )
 
     parser.add_argument("--lambda_l2", type=float, default=1.0)
@@ -300,7 +302,7 @@ def main(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
+        log_with=build_trackers(args),
         project_dir=os.path.join(args.output_dir, "logs"),
         # 仅选中融合层参与训练，兼容不同输入的条件分支。
         kwargs_handlers=[
@@ -427,12 +429,7 @@ def main(args):
             tracker_config = {key: value if isinstance(value, (int, float, str, bool))
                               else json.dumps(value, ensure_ascii=False)
                               for key, value in tracker_config.items()}
-        init_kwargs = {}
-        if "wandb" in args.report_to or args.report_to == "all":
-            init_kwargs["wandb"] = {}
-            if args.run_name:
-                init_kwargs["wandb"]["name"] = args.run_name
-        accelerator.init_trackers(args.tracker_project_name, config=tracker_config, init_kwargs=init_kwargs)
+        accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
     start_epoch = int(resume_checkpoint.get("epoch", 0)) if resume_checkpoint else 0
     global_step = int(resume_checkpoint.get("global_step", 0)) if resume_checkpoint else 0

@@ -1,3 +1,4 @@
+from my_utils.experiment_tracking import build_trackers, normalize_report_to
 import argparse
 import logging
 import os
@@ -26,12 +27,6 @@ from osediff_event_film import (
     parse_unet_lora_parts,
     validate_unet_lora_training_parts,
 )
-
-
-def setup_wandb_ssl_bypass():
-    # 远程 Linux 服务器可能有自签证书问题；必须在 tracker 初始化前设置。
-    os.environ.setdefault("WANDB_INSECURE", "true")
-    os.environ.setdefault("WANDB_INSECURE_DISABLE_SSL", "true")
 
 
 def parse_timestep_spec(value):
@@ -207,10 +202,10 @@ def parse_args():
     parser.add_argument("--lora_rank", type=int, default=4)
 
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
-    parser.add_argument("--report_to", type=str, default="wandb")
+    parser.add_argument("--report_to", type=normalize_report_to, default="swanlab")
     parser.add_argument("--tracker_project_name", type=str, default="event_film_lora_osediff")
-    parser.add_argument("--wandb_run_name", type=str, default=None,
-        help="Optional W&B run name. If omitted, W&B will auto-generate a run name.")
+    parser.add_argument("--run_name", "--swanlab_run_name", "--wandb_run_name", dest="run_name", type=str, default=None,
+        help="SwanLab experiment name; the old run-name flag remains an alias.")
     parser.add_argument("--logging_dir", type=str, default="logs")
     parser.add_argument("--allow_tf32", action="store_true")
     parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true")
@@ -233,8 +228,6 @@ def main(args):
             f"got {args.generator_train_timestep} vs {args.regularizer_train_timestep}"
         )
 
-    if "wandb" in args.report_to or args.report_to == "all":
-        setup_wandb_ssl_bypass()
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
     # 每个 Event-LoRA 层都保存多个 event 尺度对应的 1x1 projection，但一次
@@ -248,7 +241,7 @@ def main(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
+        log_with=build_trackers(args),
         project_config=accelerator_project_config,
         kwargs_handlers=[ddp_kwargs],
     )
@@ -430,16 +423,7 @@ def main(args):
 
     if accelerator.is_main_process:
         tracker_config = {k: str(v) if isinstance(v, tuple) else v for k, v in vars(args).items()}
-        init_kwargs = {}
-        if "wandb" in args.report_to or args.report_to == "all":
-            try:
-                import wandb
-                init_kwargs["wandb"] = {"settings": wandb.Settings(insecure_disable_ssl=True)}
-                if args.wandb_run_name:
-                    init_kwargs["wandb"]["name"] = args.wandb_run_name
-            except Exception:
-                init_kwargs = {}
-        accelerator.init_trackers(args.tracker_project_name, config=tracker_config, init_kwargs=init_kwargs)
+        accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
         logging.info("=" * 60)
         for k, v in sorted(vars(args).items()):
             logging.info(f"{k}: {v}")

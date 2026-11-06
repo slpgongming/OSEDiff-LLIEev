@@ -1,3 +1,4 @@
+from my_utils.experiment_tracking import build_trackers, normalize_report_to
 import os
 import gc
 import lpips
@@ -144,8 +145,9 @@ def parse_args(input_args=None):
     parser.add_argument("--adam_epsilon", type=float, default=1e-08)
     parser.add_argument("--max_grad_norm", default=1.0, type=float)
     parser.add_argument("--allow_tf32", action="store_true")
-    parser.add_argument("--report_to", type=str, default="tensorboard",
-        help='Supported: "tensorboard", "wandb", "comet_ml", "all"')
+    parser.add_argument("--run_name", "--swanlab_run_name", dest="run_name", default=None)
+    parser.add_argument("--report_to", type=normalize_report_to, default="tensorboard",
+        help='Supported: "tensorboard", "swanlab", "comet_ml", "all", "none"')
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true",
         help="Whether or not to use xformers.")
@@ -226,7 +228,7 @@ def main(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
+        log_with=build_trackers(args),
         project_config=accelerator_project_config,
         kwargs_handlers=[ddp_kwargs],
     )

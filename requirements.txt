@@ -7,7 +7,7 @@
 # conda activate osediff
 # python -m pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
 # python -m pip install --no-deps numpy==1.24.4 diffusers==0.25.0 huggingface_hub==0.25.0 transformers==4.35.2
-# python -m pip install -c requirements.txt ftfy regex tqdm safetensors accelerate lpips peft==0.7.1 einops opencv-python-headless wandb scikit-image
+# python -m pip install -c requirements.txt ftfy regex tqdm safetensors accelerate lpips peft==0.7.1 einops opencv-python-headless swanlab scikit-image
 # python -m pip install --no-deps -r requirements.txt
 #
 # 上面的普通安装步骤允许安装传递依赖，同时通过 -c 保持已指定版本。
@@ -20,7 +20,7 @@
 #
 # 手工操作：将 GitHub CLIP-main 中的完整 clip 文件夹放到 OSEDiff/clip/，
 # 保留其中的 tokenizer 资源文件；这里不添加 PyPI 上的同名 clip 包。
-# 使用 W&B 在线记录时，另行执行：wandb login --relogin
+# 使用 SwanLab 在线记录时，另行执行：swanlab login
 # 安装后可执行 python -m pip check 查看依赖问题；--no-deps 不保证依赖完整。
 # 本清单未经过实际安装或训练/推理验证。
 
@@ -46,7 +46,7 @@ einops
 opencv-python-headless
 
 # 实验记录与 SSIM
-wandb
+swanlab
 scikit-image
 
 # Idea2 cLoRA 测试/推理：按原记录使用 --no-deps 安装

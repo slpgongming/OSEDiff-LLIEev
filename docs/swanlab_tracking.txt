@@ -1,0 +1,29 @@
+SwanLab 实验记录（final-code）
+
+安装：python -m pip install swanlab
+在线记录前在训练环境执行：swanlab login
+不要把 API key 写入脚本或提交到 Git。
+
+Stage 2/3 默认 --report_to swanlab。
+Stage 1 保留默认 tensorboard；Stage 4 保留默认不启用 tracker。
+三个入口均支持 --report_to swanlab --run_name 实验名称。
+--swanlab_run_name 是 --run_name 的别名。
+--report_to tensorboard 保留本地 TensorBoard；--report_to none 关闭记录。
+--report_to all 明确选择 SwanLab + TensorBoard（需另装 tensorboard），
+不再自动启用机器上安装的其他后端。
+
+旧 --report_to wandb 会发出迁移提示并使用 SwanLab；原有两个入口的
+--wandb_run_name 继续作为名称别名。不会导入或初始化 W&B。
+历史本地 shell 脚本不修改路径；其中旧 W&B 选项经兼容入口迁移。
+WANDB_MODE 等旧环境变量不控制 SwanLab。
+
+离线记录使用环境变量 SWANLAB_MODE=offline；完全关闭 SDK 记录可用
+SWANLAB_MODE=disabled。在线/离线默认行为交由 SwanLab 环境配置控制。
+记录目录为 output_dir/logging_dir/swanlab；无 logging_dir 参数时使用 logs。
+实验名传入 experiment_name，训练参数传入 config，指标名称和 step 保持不变。
+只在全局主进程创建实验和写日志；训练结束通过 accelerator.end_training 关闭。
+继续训练会创建新的记录实验，不保证自动接回此前云端 run。
+
+兼容接入使用 Accelerate GeneralTracker，不要求为日志升级 Accelerate。
+官方参考：https://docs.swanlab.cn/guide_cloud/integration/integration-huggingface-accelerate.html
+SDK 参数：https://docs.swanlab.cn/api/py-init.html
